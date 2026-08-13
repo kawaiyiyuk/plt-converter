@@ -75,6 +75,26 @@ docker compose up --build
 
 默认部署为 1 个 API、1 个 RQ Worker 和 1 个 Redis。转换并发由 Worker 副本数控制；提高副本数前需要同步评估 CPU、内存和队列容量。文件只用于临时处理，不进入缝纫记忆主业务数据库。
 
+### 与 Appsbox 合并部署
+
+服务器目录为 `/opt/appsbox-backend` 和 `/opt/plt-converter` 时，可以在保留两个独立 Git 仓库的同时，将它们作为同一个 `appsbox` Compose 项目运行：
+
+```bash
+cp /opt/plt-converter/.env.production.example /opt/plt-converter/.env.production
+# 将示例令牌替换为 openssl rand -hex 32 的输出
+
+docker compose \
+  --project-directory /opt/appsbox-backend \
+  --env-file /opt/appsbox-backend/.env \
+  --env-file /opt/plt-converter/.env.production \
+  -f /opt/appsbox-backend/compose.yaml \
+  -f /opt/appsbox-backend/compose.prod.yaml \
+  -f /opt/plt-converter/compose.appsbox.yaml \
+  config
+```
+
+转换 API 只绑定宿主机 `127.0.0.1:8091`，供宿主机 Nginx 反向代理；转换服务 Redis 不开放宿主机端口。
+
 ## 防护配置
 
 ```text
