@@ -94,6 +94,7 @@ docker compose \
 ```
 
 转换 API 只绑定宿主机 `127.0.0.1:8091`，供宿主机 Nginx 反向代理；转换服务 Redis 不开放宿主机端口。
+镜像构建默认使用腾讯云 PyPI；可在 `.env.production` 中设置 `PLT_PIP_INDEX_URL=https://pypi.org/simple` 覆盖。
 
 ## 防护配置
 

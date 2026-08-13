@@ -1,6 +1,9 @@
 services:
   plt-converter:
-    build: .
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
     container_name: plt_converter
     restart: unless-stopped
     healthcheck:
@@ -41,7 +44,10 @@ services:
         condition: service_healthy
 
   plt-worker:
-    build: .
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
     container_name: plt_converter_worker
     restart: unless-stopped
     command: ["python", "worker.py"]

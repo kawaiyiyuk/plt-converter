@@ -2,6 +2,8 @@ services:
   plt-converter-api:
     build:
       context: ../plt-converter
+      args:
+        PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
     restart: unless-stopped
     environment:
       PORT: 80
@@ -43,6 +45,8 @@ services:
   plt-converter-worker:
     build:
       context: ../plt-converter
+      args:
+        PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
     restart: unless-stopped
     command: ["python", "worker.py"]
     environment:
