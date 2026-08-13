@@ -70,6 +70,8 @@ services:
       PDF_MAX_TOTAL_PIXELS: 200000000
       PDF_MAX_DRAWINGS: 250000
       PDF_MAX_OUTPUT_SEGMENTS: 300000
+      WX_BACKEND_URL: ${WX_BACKEND_URL:-http://host.docker.internal:5001}
+      CONVERSION_SERVICE_TOKEN: ${CONVERSION_SERVICE_TOKEN:-development-conversion-service-token}
     volumes:
       - converter-temp:/tmp/plt-converter
     depends_on:
