@@ -383,6 +383,20 @@ def get_pdf_to_plt_job(job_id):
     return jsonify({'error': '任务不存在或已过期'}), 404
 
 
+@pdf_bp.get('/preview/jobs/<job_id>')
+def get_pdf_preview_job(job_id):
+    """Return the status and preview pages for a PDF preview task."""
+    record = load_job(job_id)
+    if record and (
+        record.get('job_type') != 'pdf_preview'
+        or record.get('user_key') != request_user_key()
+    ):
+        record = None
+    if record:
+        return jsonify(job_response(record))
+    return jsonify({'error': '任务不存在或已过期'}), 404
+
+
 @pdf_bp.delete('/jobs/<job_id>')
 def cancel_pdf_to_plt_job(job_id):
     try:

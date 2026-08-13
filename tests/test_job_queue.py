@@ -350,6 +350,38 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(allowed.status_code, 200)
 
+    def test_pdf_preview_job_route_returns_status_for_client_key(self):
+        record = submit_job(
+            'pdf_preview',
+            b'%PDF preview source',
+            'sample.pdf',
+            {},
+            'user-a',
+            connection=self.redis,
+        )
+        completed = load_job(record['job_id'], self.redis)
+        completed['status'] = 'done'
+        completed['result'] = {'pages': [{'index': 0, 'label': '1'}]}
+        from app.job_queue import save_job
+        save_job(completed, self.redis)
+
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis):
+            client = app.test_client()
+            allowed = client.get(
+                f"/api/v1/pdf/preview/jobs/{record['job_id']}",
+                headers={'X-Client-Key': 'user-a'},
+            )
+            denied = client.get(
+                f"/api/v1/pdf/preview/jobs/{record['job_id']}",
+                headers={'X-Client-Key': 'user-b'},
+            )
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.get_json()['status'], 'preview_ready')
+        self.assertEqual(denied.status_code, 404)
+
     def test_routes_accept_chinese_upload_filenames(self):
         app = create_app()
         with patch('app.routes.redis_connection', return_value=self.redis), \

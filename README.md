@@ -59,6 +59,7 @@ GET  /api/v1/plt/jobs/<job_id>
 DELETE /api/v1/plt/jobs/<job_id>
 
 POST /api/v1/pdf/preview
+GET  /api/v1/pdf/preview/jobs/<job_id>
 POST /api/v1/pdf/jobs
 GET  /api/v1/pdf/jobs/<job_id>
 DELETE /api/v1/pdf/jobs/<job_id>
