@@ -1,36 +1,40 @@
 name: plt-converter
 
+x-converter-environment: &converter-environment
+  REDIS_URL: redis://redis:6379/0
+  PLT_TEMP_FOLDER: /tmp/plt-converter
+  PLT_MAX_UPLOAD_MB: 20
+  PLT_QUEUE_MAX_PENDING: 20
+  PLT_JOB_TIMEOUT_SECONDS: 90
+  PLT_JOB_RETENTION_SECONDS: 1800
+  PLT_RATE_LIMIT_PER_MINUTE: 3
+  PLT_PREVIEW_RATE_LIMIT_PER_MINUTE: 12
+  PLT_UPLOAD_RATE_LIMIT_PER_MINUTE: 10
+  PLT_UPLOAD_IP_RATE_LIMIT_PER_MINUTE: 30
+  PLT_USER_MAX_ACTIVE_JOBS: 2
+  PLT_MAX_POINTS: 500000
+  PLT_MAX_PATHS: 100000
+  PLT_MAX_OUTPUT_PAGES: 80
+  PLT_MAX_DIMENSION_MM: 10000
+  PLT_MAX_COMMANDS: 250000
+  PLT_MAX_TEXT_CHARS: 100000
+  PDF_MAX_TOTAL_PIXELS: 200000000
+  PDF_MAX_DRAWINGS: 250000
+  PDF_MAX_OUTPUT_SEGMENTS: 300000
+  WX_BACKEND_URL: ${WX_BACKEND_URL:?Set WX_BACKEND_URL in /opt/plt-converter/.env.production}
+  CONVERSION_SERVICE_TOKEN: ${CONVERSION_SERVICE_TOKEN:?Set CONVERSION_SERVICE_TOKEN in /opt/plt-converter/.env.production}
+
 services:
   api:
+    image: plt-converter-api:production
     build:
       context: .
       args:
         PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
     restart: unless-stopped
-    environment: &converter-environment
-      REDIS_URL: redis://redis:6379/0
-      PLT_TEMP_FOLDER: /tmp/plt-converter
-      PLT_MAX_UPLOAD_MB: 20
-      PLT_QUEUE_MAX_PENDING: 20
-      PLT_JOB_TIMEOUT_SECONDS: 90
-      PLT_JOB_RETENTION_SECONDS: 1800
-      PLT_RATE_LIMIT_PER_MINUTE: 3
-      PLT_PREVIEW_RATE_LIMIT_PER_MINUTE: 12
-      PLT_UPLOAD_RATE_LIMIT_PER_MINUTE: 10
-      PLT_UPLOAD_IP_RATE_LIMIT_PER_MINUTE: 30
-      PLT_USER_MAX_ACTIVE_JOBS: 2
-      PLT_MAX_POINTS: 500000
-      PLT_MAX_PATHS: 100000
-      PLT_MAX_OUTPUT_PAGES: 80
-      PLT_MAX_DIMENSION_MM: 10000
-      PLT_MAX_COMMANDS: 250000
-      PLT_MAX_TEXT_CHARS: 100000
-      PDF_MAX_TOTAL_PIXELS: 200000000
-      PDF_MAX_DRAWINGS: 250000
-      PDF_MAX_OUTPUT_SEGMENTS: 300000
+    environment:
+      <<: *converter-environment
       PLT_METRICS_TOKEN: ${PLT_METRICS_TOKEN:?Set PLT_METRICS_TOKEN in /opt/plt-converter/.env.production}
-      WX_BACKEND_URL: ${WX_BACKEND_URL:?Set WX_BACKEND_URL in /opt/plt-converter/.env.production}
-      CONVERSION_SERVICE_TOKEN: ${CONVERSION_SERVICE_TOKEN:?Set CONVERSION_SERVICE_TOKEN in /opt/plt-converter/.env.production}
     ports:
       - "127.0.0.1:8091:80"
     volumes:
@@ -47,6 +51,7 @@ services:
         condition: service_healthy
 
   worker:
+    image: plt-converter-worker:production
     build:
       context: .
       args:

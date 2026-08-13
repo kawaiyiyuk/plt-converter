@@ -94,6 +94,15 @@ docker compose \
   up -d --build
 ```
 
+首次部署完成后，后续更新统一使用一键部署脚本：
+
+```bash
+cd /opt/plt-converter
+./scripts/deploy-production.sh
+```
+
+脚本固定使用 `plt-converter` 项目及本仓库生产配置，会校验端口归属、服务边界和 Redis 状态。新镜像在线构建完成后，脚本会暂停 API 接收新任务，等待旧 Worker 排空队列，再更新容器并执行健康检查及主后台服务密钥验证。部署失败时会使用更新前的 API 和 Worker 镜像自动回滚；不会操作其他 Compose 项目、重建 Redis 或删除数据卷。
+
 转换 API 只绑定宿主机 `127.0.0.1:8091`，供宿主机 Nginx 反向代理；转换服务 Redis 不开放宿主机端口。
 生产数据卷使用固定名称 `plt_converter_redis_data` 和 `plt_converter_temp`，不会随 Compose 项目名变化。
 镜像构建默认使用腾讯云 PyPI；可在 `.env.production` 中设置 `PLT_PIP_INDEX_URL=https://pypi.org/simple` 覆盖。
