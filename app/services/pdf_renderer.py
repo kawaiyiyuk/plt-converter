@@ -1,5 +1,6 @@
 import math
 import os
+import zlib
 
 
 MM_TO_PT = 72 / 25.4
@@ -334,7 +335,12 @@ def build_pdf_document(page_contents, page_width_pt, page_height_pt):
 
 
 def stream_object(content):
-    return f'<< /Length {len(content.encode("utf-8"))} >>\nstream\n{content}\nendstream'
+    compressed = zlib.compress(content.encode('utf-8'), level=9)
+    return (
+        f'<< /Length {len(compressed)} /Filter /FlateDecode >>\nstream\n'.encode('ascii')
+        + compressed
+        + b'\nendstream'
+    )
 
 
 def add_object(objects, content):
@@ -343,14 +349,17 @@ def add_object(objects, content):
 
 
 def build_pdf(objects, catalog):
-    chunks = ['%PDF-1.4\n']
+    chunks = [b'%PDF-1.4\n']
     offsets = [0]
-    offset = len(chunks[0].encode('utf-8'))
+    offset = len(chunks[0])
     for index in range(1, len(objects)):
-        body = f'{index} 0 obj\n{objects[index]}\nendobj\n'
+        content = objects[index]
+        if isinstance(content, str):
+            content = content.encode('utf-8')
+        body = f'{index} 0 obj\n'.encode('ascii') + content + b'\nendobj\n'
         offsets.append(offset)
         chunks.append(body)
-        offset += len(body.encode('utf-8'))
+        offset += len(body)
     xref_offset = offset
     xref = f'xref\n0 {len(objects)}\n0000000000 65535 f \n'
     xref += ''.join(f'{item:010d} 00000 n \n' for item in offsets[1:])
@@ -358,7 +367,7 @@ def build_pdf(objects, catalog):
         f'trailer\n<< /Size {len(objects)} /Root {catalog} 0 R >>\n'
         f'startxref\n{xref_offset}\n%%EOF\n'
     )
-    return ''.join(chunks + [xref, trailer]).encode('utf-8')
+    return b''.join(chunks + [xref.encode('ascii'), trailer.encode('ascii')])
 
 
 def utf16be_hex(text):

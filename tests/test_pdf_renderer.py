@@ -1,11 +1,24 @@
+import re
 import unittest
+import zlib
 from unittest.mock import patch
+
+import pymupdf
 
 from app.services.pdf_renderer import render_pdf, utf16be_hex
 from app.services.plt_parser import parse_plt
 
 
 class PdfRendererTest(unittest.TestCase):
+    @staticmethod
+    def decoded_streams(pdf):
+        streams = re.findall(
+            rb'<< /Length \d+ /Filter /FlateDecode >>\nstream\n(.*?)\nendstream',
+            pdf,
+            flags=re.DOTALL,
+        )
+        return b'\n'.join(zlib.decompress(stream) for stream in streams)
+
     def test_renders_tiled_pdf_and_selected_pages(self):
         document = parse_plt(
             b'IN;PU0,0;PD1016,0,1016,2032,0,2032,0,0;'
@@ -21,12 +34,18 @@ class PdfRendererTest(unittest.TestCase):
         self.assertEqual(pdf[:8], b'%PDF-1.4')
         self.assertIn(b'/Type /Catalog', pdf)
         self.assertIn(b'/MediaBox', pdf)
-        self.assertIn(f'<{utf16be_hex("1-1")}> Tj'.encode(), pdf)
-        self.assertIn(f'<{utf16be_hex("A4 100% | 1-1 | 1/1 | plt-guide-v1")}> Tj'.encode(), pdf)
-        self.assertIn(b'/F1 48.000 Tf', pdf)
-        self.assertIn(b'1 0 0 RG', pdf)
-        self.assertIn(f'<{utf16be_hex("5 cm / 50 mm")}> Tj'.encode(), pdf)
-        self.assertNotIn(b'(1-1) Tj', pdf)
+        self.assertIn(b'/Filter /FlateDecode', pdf)
+        content = self.decoded_streams(pdf)
+        self.assertIn(f'<{utf16be_hex("1-1")}> Tj'.encode(), content)
+        self.assertIn(f'<{utf16be_hex("A4 100% | 1-1 | 1/1 | plt-guide-v1")}> Tj'.encode(), content)
+        self.assertIn(b'/F1 48.000 Tf', content)
+        self.assertIn(b'1 0 0 RG', content)
+        self.assertIn(f'<{utf16be_hex("5 cm / 50 mm")}> Tj'.encode(), content)
+        self.assertNotIn(b'(1-1) Tj', content)
+        with pymupdf.open(stream=pdf, filetype='pdf') as rendered:
+            self.assertEqual(rendered.page_count, 1)
+            self.assertAlmostEqual(rendered[0].rect.width, layout['page_width_pt'], places=2)
+            self.assertAlmostEqual(rendered[0].rect.height, layout['page_height_pt'], places=2)
 
     def test_rejects_page_count_before_rendering(self):
         document = parse_plt(b'IN;PU0,0;PD50000,50000;')
