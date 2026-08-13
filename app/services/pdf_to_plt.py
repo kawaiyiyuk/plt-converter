@@ -186,17 +186,17 @@ def _extract_page(page, units_per_inch, fitz, remaining_segments):
     for drawing in page.get_drawings():
         for item in drawing.get('items', []):
             points = drawing_item_points(item, fitz)
-            if len(points) > 1:
-                if len(points) - 1 > remaining_segments:
+            for visible_points in clip_page_polyline(points, page.rect.width, page.rect.height, fitz):
+                if len(visible_points) - 1 > remaining_segments:
                     raise ValueError('PDF 线条数量超过服务器限制')
                 shapes.append([
                     {
                         'x': point.x * units_per_inch / 72,
                         'y': (page.rect.height - point.y) * units_per_inch / 72,
                     }
-                    for point in points
+                    for point in visible_points
                 ])
-                remaining_segments -= len(points) - 1
+                remaining_segments -= len(visible_points) - 1
     if shapes:
         return {
             'width_units': page_width,
@@ -225,6 +225,65 @@ def drawing_item_points(item, fitz):
     if kind == 'c':
         return cubic_bezier(item[1], item[2], item[3], item[4], fitz)
     return []
+
+
+def clip_page_polyline(points, width, height, fitz):
+    if len(points) < 2:
+        return []
+    paths = []
+    current = []
+    for start, end in zip(points, points[1:]):
+        clipped = clip_page_segment(start, end, width, height, fitz)
+        if not clipped:
+            if len(current) > 1:
+                paths.append(current)
+            current = []
+            continue
+        clipped_start, clipped_end = clipped
+        if not current or not fitz_points_equal(current[-1], clipped_start):
+            if len(current) > 1:
+                paths.append(current)
+            current = [clipped_start]
+        current.append(clipped_end)
+    if len(current) > 1:
+        paths.append(current)
+    return paths
+
+
+def clip_page_segment(start, end, width, height, fitz):
+    x1, y1 = start.x, start.y
+    x2, y2 = end.x, end.y
+    dx = x2 - x1
+    dy = y2 - y1
+    lower = 0.0
+    upper = 1.0
+    for direction, distance in (
+        (-dx, x1),
+        (dx, width - x1),
+        (-dy, y1),
+        (dy, height - y1),
+    ):
+        if abs(direction) < 1e-12:
+            if distance < 0:
+                return None
+            continue
+        ratio = distance / direction
+        if direction < 0:
+            if ratio > upper:
+                return None
+            lower = max(lower, ratio)
+        else:
+            if ratio < lower:
+                return None
+            upper = min(upper, ratio)
+    return (
+        fitz.Point(x1 + lower * dx, y1 + lower * dy),
+        fitz.Point(x1 + upper * dx, y1 + upper * dy),
+    )
+
+
+def fitz_points_equal(first, second):
+    return abs(first.x - second.x) < 1e-7 and abs(first.y - second.y) < 1e-7
 
 
 def cubic_bezier(start, control_a, control_b, end, fitz, steps=12):

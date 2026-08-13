@@ -176,17 +176,37 @@ def build_page_content(
         '0 0 0 rg',
     ])
 
+    clip_min_x = margin_pt if margin_pt > 0 else 0
+    clip_min_y = margin_pt if margin_pt > 0 else 0
+    clip_max_x = clip_min_x + tile_width_pt
+    clip_max_y = clip_min_y + tile_height_pt
+
     path_content = []
     circles = []
     text_shapes = []
     for shape in shapes:
         if shape['type'] == 'path' and len(shape.get('points', [])) > 1:
-            first = transform_point(shape['points'][0], metrics, page, drawing_width_pt, drawing_height_pt, tile_width_pt, tile_height_pt, margin_pt)
-            path_content.append(f'{fmt(first[0])} {fmt(first[1])} m')
-            for point in shape['points'][1:]:
-                current = transform_point(point, metrics, page, drawing_width_pt, drawing_height_pt, tile_width_pt, tile_height_pt, margin_pt)
-                path_content.append(f'{fmt(current[0])} {fmt(current[1])} l')
-            path_content.append('')
+            points = [
+                transform_point(
+                    point,
+                    metrics,
+                    page,
+                    drawing_width_pt,
+                    drawing_height_pt,
+                    tile_width_pt,
+                    tile_height_pt,
+                    margin_pt,
+                )
+                for point in shape['points']
+            ]
+            append_clipped_paths(
+                path_content,
+                points,
+                clip_min_x,
+                clip_min_y,
+                clip_max_x,
+                clip_max_y,
+            )
         elif shape['type'] == 'circle':
             circles.append(shape)
         elif shape['type'] == 'text':
@@ -196,18 +216,36 @@ def build_page_content(
         content.append('S')
 
     for shape in circles:
-        points = approximate_circle(shape['center'], shape['radius'], 48)
-        if len(points) < 2:
-            continue
-        first = transform_point(points[0], metrics, page, drawing_width_pt, drawing_height_pt, tile_width_pt, tile_height_pt, margin_pt)
-        content.append(f'{fmt(first[0])} {fmt(first[1])} m')
-        for point in points[1:]:
-            current = transform_point(point, metrics, page, drawing_width_pt, drawing_height_pt, tile_width_pt, tile_height_pt, margin_pt)
-            content.append(f'{fmt(current[0])} {fmt(current[1])} l')
-        content.append('S')
+        points = [
+            transform_point(
+                point,
+                metrics,
+                page,
+                drawing_width_pt,
+                drawing_height_pt,
+                tile_width_pt,
+                tile_height_pt,
+                margin_pt,
+            )
+            for point in approximate_circle(shape['center'], shape['radius'], 48)
+        ]
+        circle_content = []
+        append_clipped_paths(
+            circle_content,
+            points,
+            clip_min_x,
+            clip_min_y,
+            clip_max_x,
+            clip_max_y,
+        )
+        if circle_content:
+            content.extend(circle_content)
+            content.append('S')
 
     for shape in text_shapes:
         point = transform_point(shape['point'], metrics, page, drawing_width_pt, drawing_height_pt, tile_width_pt, tile_height_pt, margin_pt)
+        if not point_in_rect(point, clip_min_x, clip_min_y, clip_max_x, clip_max_y):
+            continue
         text = utf16be_hex(shape.get('text', ''))
         if not text:
             continue
@@ -229,6 +267,62 @@ def build_page_content(
     if page_number == 1:
         append_scale_marker(content, page_width_pt, page_height_pt, margin_pt)
     return '\n'.join(content)
+
+
+def append_clipped_paths(content, points, min_x, min_y, max_x, max_y):
+    previous_end = None
+    for start, end in zip(points, points[1:]):
+        clipped = clip_segment(start, end, min_x, min_y, max_x, max_y)
+        if not clipped:
+            previous_end = None
+            continue
+        clipped_start, clipped_end = clipped
+        if previous_end is None or not points_equal(previous_end, clipped_start):
+            content.append(f'{fmt(clipped_start[0])} {fmt(clipped_start[1])} m')
+        content.append(f'{fmt(clipped_end[0])} {fmt(clipped_end[1])} l')
+        previous_end = clipped_end
+    if previous_end is not None:
+        content.append('')
+
+
+def clip_segment(start, end, min_x, min_y, max_x, max_y):
+    x1, y1 = start
+    x2, y2 = end
+    dx = x2 - x1
+    dy = y2 - y1
+    lower = 0.0
+    upper = 1.0
+    for direction, distance in (
+        (-dx, x1 - min_x),
+        (dx, max_x - x1),
+        (-dy, y1 - min_y),
+        (dy, max_y - y1),
+    ):
+        if abs(direction) < 1e-12:
+            if distance < 0:
+                return None
+            continue
+        ratio = distance / direction
+        if direction < 0:
+            if ratio > upper:
+                return None
+            lower = max(lower, ratio)
+        else:
+            if ratio < lower:
+                return None
+            upper = min(upper, ratio)
+    return (
+        (x1 + lower * dx, y1 + lower * dy),
+        (x1 + upper * dx, y1 + upper * dy),
+    )
+
+
+def point_in_rect(point, min_x, min_y, max_x, max_y):
+    return min_x <= point[0] <= max_x and min_y <= point[1] <= max_y
+
+
+def points_equal(first, second):
+    return abs(first[0] - second[0]) < 1e-7 and abs(first[1] - second[1]) < 1e-7
 
 
 def transform_point(point, metrics, page, drawing_width_pt, drawing_height_pt, tile_width_pt, tile_height_pt, margin_pt):

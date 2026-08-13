@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pymupdf
 
-from app.services.pdf_renderer import render_pdf, utf16be_hex
+from app.services.pdf_renderer import clip_segment, render_pdf, utf16be_hex
 from app.services.plt_parser import parse_plt
 
 
@@ -74,6 +74,13 @@ class PdfRendererTest(unittest.TestCase):
                 'single_page_output': True,
                 'enabled_pages': [],
             })
+
+    def test_clips_segments_to_page_bounds(self):
+        self.assertIsNone(clip_segment((-10, -10), (-1, -1), 0, 0, 100, 100))
+        self.assertEqual(
+            clip_segment((-10, 50), (110, 50), 0, 0, 100, 100),
+            ((0, 50), (100, 50)),
+        )
 
 
 if __name__ == '__main__':
