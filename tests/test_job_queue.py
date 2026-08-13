@@ -9,10 +9,12 @@ from unittest.mock import patch
 import fakeredis
 
 from app import create_app
+from app.billing import BillingRejected
 from app.job_queue import (
     JOB_OUTPUT_VERSIONS,
     QueueRejected,
     cleanup_expired_job_files,
+    confirm_job_billing,
     enforce_rate_limit,
     load_job,
     queue_position,
@@ -73,6 +75,27 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(int(self.redis.get(rate_keys[0])), 1)
         self.assertEqual(self.redis.llen('rq:queue:conversions'), 1)
         self.assertEqual(queue_position(first['job_id'], self.redis), 1)
+
+    def test_billed_job_waits_for_confirmation_and_confirmation_is_idempotent(self):
+        record = submit_job(
+            'plt_to_pdf',
+            b'IN;PU0,0;PD1016,1016;',
+            'sample.plt',
+            {'units_per_inch': 1016},
+            'user:42',
+            connection=self.redis,
+            billing_request_id='billing-request-1',
+        )
+
+        self.assertEqual(record['status'], 'billing_pending')
+        confirmed = confirm_job_billing(record['job_id'], 'user:42', self.redis)
+        from app.job_queue import update_job
+        update_job(record['job_id'], self.redis, status='done')
+        repeated = confirm_job_billing(record['job_id'], 'user:42', self.redis)
+
+        self.assertEqual(confirmed['status'], 'queued')
+        self.assertTrue(confirmed['billing_confirmed'])
+        self.assertEqual(repeated['status'], 'done')
 
     def test_output_version_invalidates_completed_deduplication(self):
         first = self.submit()
@@ -330,7 +353,12 @@ class JobQueueTest(unittest.TestCase):
     def test_routes_accept_chinese_upload_filenames(self):
         app = create_app()
         with patch('app.routes.redis_connection', return_value=self.redis), \
-                patch('app.job_queue.redis_connection', return_value=self.redis):
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authorize_job', return_value={
+                    'user_id': 1,
+                    'request_id': 'chinese-name-request',
+                }), \
+                patch('app.routes.commit_conversion', return_value={'success': True}):
             client = app.test_client()
             plt_response = client.post(
                 '/api/v1/plt/jobs',
@@ -349,7 +377,12 @@ class JobQueueTest(unittest.TestCase):
     def test_routes_reject_non_finite_numeric_options(self):
         app = create_app()
         with patch('app.routes.redis_connection', return_value=self.redis), \
-                patch('app.job_queue.redis_connection', return_value=self.redis):
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authorize_job', return_value={
+                    'user_id': 1,
+                    'request_id': 'invalid-number-request',
+                }), \
+                patch('app.routes.release_conversion'):
             client = app.test_client()
             response = client.post(
                 '/api/v1/plt/jobs',
@@ -362,6 +395,35 @@ class JobQueueTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
         self.assertIn('margin_mm', response.get_json()['error'])
+
+    def test_route_cancels_job_and_forwards_commit_balance_rejection(self):
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authorize_job', return_value={
+                    'user_id': 42,
+                    'request_id': 'commit-rejected-request',
+                }), \
+                patch('app.routes.commit_conversion', side_effect=BillingRejected(
+                    '布豆余额不足',
+                    400,
+                    {'required_points': 50, 'current_balance': 20},
+                )), \
+                patch('app.routes.release_conversion') as release:
+            client = app.test_client()
+            response = client.post(
+                '/api/v1/plt/jobs',
+                data={'file': (io.BytesIO(b'IN;PU0,0;PD1016,1016;'), 'sample.plt')},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['required_points'], 50)
+        self.assertEqual(response.get_json()['current_balance'], 20)
+        job_ids = self.redis.keys('plt-converter:job:*')
+        self.assertEqual(len(job_ids), 1)
+        job_id = job_ids[0].decode().rsplit(':', 1)[-1]
+        self.assertEqual(load_job(job_id, self.redis)['status'], 'cancelled')
+        release.assert_called_once_with(42, 'commit-rejected-request', job_id)
 
 
 if __name__ == '__main__':

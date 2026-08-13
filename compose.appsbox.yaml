@@ -27,6 +27,8 @@ services:
       PDF_MAX_DRAWINGS: 250000
       PDF_MAX_OUTPUT_SEGMENTS: 300000
       PLT_METRICS_TOKEN: ${PLT_METRICS_TOKEN:?Set PLT_METRICS_TOKEN in /opt/plt-converter/.env.production}
+      WX_BACKEND_URL: ${WX_BACKEND_URL:?Set WX_BACKEND_URL in /opt/plt-converter/.env.production}
+      CONVERSION_SERVICE_TOKEN: ${CONVERSION_SERVICE_TOKEN:?Set CONVERSION_SERVICE_TOKEN in /opt/plt-converter/.env.production}
     ports:
       - "127.0.0.1:8091:80"
     volumes:

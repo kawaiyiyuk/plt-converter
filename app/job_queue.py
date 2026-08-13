@@ -14,7 +14,7 @@ from rq.registry import StartedJobRegistry
 
 
 TERMINAL_STATUSES = {'done', 'failed', 'cancelled', 'expired'}
-ACTIVE_STATUSES = {'queued', 'processing', 'cancelling'}
+ACTIVE_STATUSES = {'billing_pending', 'queued', 'processing', 'cancelling'}
 JOB_OUTPUT_VERSIONS = {
     'plt_to_pdf': '3-page-clipped',
     'pdf_to_plt': '2-visible-clipped',
@@ -160,7 +160,7 @@ def completed_result_available(record):
     return bool(result_path and Path(result_path).exists())
 
 
-def submit_job(job_type, source, filename, options, user_key, connection=None):
+def submit_job(job_type, source, filename, options, user_key, connection=None, billing_request_id=None):
     connection = connection or redis_connection()
     cleanup_expired_job_files(connection)
     output_version = JOB_OUTPUT_VERSIONS.get(job_type, '1')
@@ -178,6 +178,22 @@ def submit_job(job_type, source, filename, options, user_key, connection=None):
     if not lock.acquire(blocking=True):
         raise QueueRejected('服务器正忙，请稍后重试', retry_after=2)
     try:
+        billing_key = None
+        if billing_request_id:
+            billing_key = f'plt-converter:billing-request:{user_key}:{billing_request_id}'
+            billing_job_id = connection.get(billing_key)
+            if isinstance(billing_job_id, bytes):
+                billing_job_id = billing_job_id.decode('utf-8')
+            billing_job = load_job(billing_job_id, connection) if billing_job_id else None
+            if billing_job and (
+                billing_job.get('status') in ACTIVE_STATUSES
+                or completed_result_available(billing_job)
+            ):
+                billing_job['deduplicated'] = True
+                return billing_job
+            if billing_job_id:
+                connection.delete(billing_key)
+
         existing_id = connection.get(fingerprint_key)
         if isinstance(existing_id, bytes):
             existing_id = existing_id.decode('utf-8')
@@ -185,6 +201,8 @@ def submit_job(job_type, source, filename, options, user_key, connection=None):
         if existing and existing.get('status') in ACTIVE_STATUSES | {'done'}:
             if existing.get('status') in ACTIVE_STATUSES or completed_result_available(existing):
                 existing['deduplicated'] = True
+                if billing_key:
+                    connection.setex(billing_key, job_record_ttl(existing), existing['job_id'])
                 connection.hincrby(metric_key(), 'deduplicated', 1)
                 return existing
 
@@ -207,7 +225,7 @@ def submit_job(job_type, source, filename, options, user_key, connection=None):
             'job_type': job_type,
             'output_version': output_version,
             'user_key': user_key,
-            'status': 'queued',
+            'status': 'billing_pending' if billing_request_id else 'queued',
             'progress': 0,
             'filename': filename,
             'options': options,
@@ -222,6 +240,8 @@ def submit_job(job_type, source, filename, options, user_key, connection=None):
             'deduplicated': False,
             'retry_count': 0,
             'rq_job_id': f'{job_id}:0',
+            'billing_request_id': billing_request_id,
+            'billing_confirmed': not bool(billing_request_id),
         }
         save_job(record, connection)
         retention = max(60, int(os.getenv('PLT_JOB_RETENTION_SECONDS', '1800')))
@@ -245,6 +265,8 @@ def submit_job(job_type, source, filename, options, user_key, connection=None):
                 on_failure=Callback(mark_job_failed),
                 on_stopped=Callback(mark_job_stopped),
             )
+            if billing_key:
+                connection.setex(billing_key, active_ttl, job_id)
         except Exception:
             update_job(job_id, connection, status='failed', error='任务入队失败', finished_at=time.time())
             connection.srem(user_jobs_key, job_id)
@@ -273,7 +295,7 @@ def cancel_job(job_id, user_key=None, connection=None):
             record = update_job(job_id, connection, status='cancelled', finished_at=time.time(), progress=0)
             release_user_job(record, connection)
             return record
-        if record.get('status') == 'queued':
+        if record.get('status') in {'billing_pending', 'queued'}:
             rq_job.cancel()
             conversion_queue(connection).remove(rq_job_id)
             record = update_job(job_id, connection, status='cancelled', finished_at=time.time(), progress=0)
@@ -308,6 +330,29 @@ def cancel_job(job_id, user_key=None, connection=None):
                 progress=previous_progress,
             )
             raise
+        return record
+    finally:
+        lock.release()
+
+
+def confirm_job_billing(job_id, user_key, connection=None):
+    connection = connection or redis_connection()
+    lock = acquire_job_lock(job_id, connection)
+    try:
+        record = load_job(job_id, connection)
+        if not record or record.get('user_key') != user_key:
+            raise PermissionError('转换任务不存在或归属不匹配')
+        if record.get('billing_confirmed'):
+            return record
+        if record.get('status') in TERMINAL_STATUSES:
+            raise QueueRejected('转换任务已结束，无法确认计费', retry_after=2)
+        if record.get('status') == 'billing_pending':
+            record = update_job(
+                job_id,
+                connection,
+                status='queued',
+                billing_confirmed=True,
+            )
         return record
     finally:
         lock.release()

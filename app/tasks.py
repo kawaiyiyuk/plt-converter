@@ -12,8 +12,10 @@ from .job_queue import (
     record_metric,
     redis_connection,
     release_user_job,
+    TERMINAL_STATUSES,
     update_job,
 )
+from .billing import release_conversion
 from .services.pdf_renderer import render_pdf
 from .services.pdf_to_plt import convert_pdf_to_plt, inspect_pdf
 from .services.plt_parser import parse_plt
@@ -21,10 +23,43 @@ from .services.plt_parser import parse_plt
 
 def execute_job(job_id):
     connection = redis_connection()
+    confirmation_deadline = time.monotonic() + max(
+        2,
+        int(os.getenv('CONVERSION_BILLING_CONFIRM_TIMEOUT_SECONDS', '12')),
+    )
+    while True:
+        pending = load_job(job_id, connection)
+        if not pending or pending.get('status') != 'billing_pending':
+            break
+        if time.monotonic() >= confirmation_deadline:
+            lock = acquire_job_lock(job_id, connection)
+            try:
+                latest = load_job(job_id, connection)
+                if latest and latest.get('status') == 'billing_pending':
+                    update_job(
+                        job_id,
+                        connection,
+                        status='failed',
+                        error='转换计费确认超时',
+                        finished_at=time.time(),
+                    )
+                    release_user_job(load_job(job_id, connection), connection)
+                    user_key = latest.get('user_key', '')
+                    if user_key.startswith('user:') and latest.get('billing_request_id'):
+                        release_conversion(
+                            int(user_key.split(':', 1)[1]),
+                            latest['billing_request_id'],
+                            job_id,
+                        )
+            finally:
+                lock.release()
+            return None
+        time.sleep(0.05)
+
     lock = acquire_job_lock(job_id, connection)
     try:
         record = load_job(job_id, connection)
-        if not record or record.get('status') == 'cancelled':
+        if not record or record.get('status') in TERMINAL_STATUSES:
             release_user_job(record, connection)
             return None
         if record.get('cancel_requested'):

@@ -6,10 +6,12 @@ from pathlib import Path
 from flask import Blueprint, jsonify, request, send_file, url_for
 from werkzeug.utils import secure_filename
 
+from .billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
 from .services.plt_metadata import inspect_plt
 from .job_queue import (
     QueueRejected,
     cancel_job,
+    confirm_job_billing,
     enforce_rate_limit,
     load_job,
     queue_position,
@@ -23,6 +25,56 @@ plt_bp = Blueprint('plt', __name__, url_prefix='/api/v1/plt')
 pdf_bp = Blueprint('pdf', __name__, url_prefix='/api/v1/pdf')
 ALLOWED_EXTENSIONS = {'plt', 'hpgl', 'txt'}
 PDF_ALLOWED_EXTENSIONS = {'pdf'}
+
+
+def conversion_request_id():
+    return (request.headers.get('X-Conversion-Request-ID') or '').strip()
+
+
+def conversion_allow_charge():
+    return (request.headers.get('X-Conversion-Allow-Charge') or '').lower() == 'true'
+
+
+def billing_error(error):
+    payload = {'error': str(error), 'status': 'billing_rejected'}
+    if error.data:
+        payload.update(error.data)
+    return jsonify(payload), error.status_code
+
+
+def authorize_job(conversion_type):
+    return authorize_conversion(
+        request.headers.get('Authorization'),
+        conversion_request_id(),
+        conversion_type,
+        conversion_allow_charge(),
+    )
+
+
+def rollback_conversion_submission(billing, record, billing_confirmed=False):
+    if billing_confirmed or not billing:
+        return
+    job_id = record.get('job_id') if record else None
+    if job_id:
+        try:
+            cancel_job(job_id, f"user:{billing['user_id']}")
+        except (RedisError, QueueRejected, PermissionError):
+            pass
+    release_conversion(billing['user_id'], billing['request_id'], job_id)
+
+
+def authenticated_user_key():
+    return identify_user(request.headers.get('Authorization'))
+
+
+def owned_job(job_id, expected_type=None):
+    user_key = authenticated_user_key()
+    record = load_job(job_id)
+    if not record or record.get('user_key') != user_key:
+        return None
+    if expected_type and record.get('job_type') != expected_type:
+        return None
+    return record
 
 
 def request_user_key():
@@ -162,7 +214,11 @@ def create_conversion_job():
     if validation_error:
         return validation_error
 
+    billing = None
+    record = None
+    billing_confirmed = False
     try:
+        billing = authorize_job('plt_to_pdf')
         source = uploaded.read()
         record = submit_job(
             'plt_to_pdf',
@@ -171,21 +227,37 @@ def create_conversion_job():
             parse_render_options(request.form) | {
                 'units_per_inch': parse_units_per_inch(request.form),
             },
-            request_user_key(),
+            f"user:{billing['user_id']}",
+            billing_request_id=billing['request_id'],
         )
+        commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
+        billing_confirmed = True
+        record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
+    except BillingRejected as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        return billing_error(error)
     except RedisError as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
         return redis_unavailable(error)
     except QueueRejected as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
         return queue_error(error)
     except ValueError as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
         return jsonify({'error': str(error)}), 422
+    except Exception:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        raise
     return jsonify(job_response(record)), 200
 
 
 @plt_bp.get('/jobs/<job_id>')
 def get_conversion_job(job_id):
-    record = load_job(job_id)
-    if record and record.get('user_key') == request_user_key():
+    try:
+        record = owned_job(job_id, 'plt_to_pdf')
+    except BillingRejected as error:
+        return billing_error(error)
+    if record:
         return jsonify(job_response(record))
     return jsonify({'error': '任务不存在或已过期'}), 404
 
@@ -193,7 +265,10 @@ def get_conversion_job(job_id):
 @plt_bp.delete('/jobs/<job_id>')
 def cancel_conversion_job(job_id):
     try:
-        record = cancel_job(job_id, request_user_key())
+        user_key = authenticated_user_key()
+        record = cancel_job(job_id, user_key)
+    except BillingRejected as error:
+        return billing_error(error)
     except PermissionError as error:
         return jsonify({'error': str(error)}), 403
     except QueueRejected as error:
@@ -207,10 +282,11 @@ def cancel_conversion_job(job_id):
 
 @plt_bp.get('/files/<job_id>.pdf')
 def download_pdf(job_id):
-    record = load_job(job_id)
-    if record and record.get('user_key') != request_user_key():
-        return jsonify({'error': '无权下载该任务文件'}), 403
-    if record and record.get('job_type') != 'plt_to_pdf':
+    try:
+        record = owned_job(job_id, 'plt_to_pdf')
+    except BillingRejected as error:
+        return billing_error(error)
+    if not record:
         return jsonify({'error': '文件不存在或已过期'}), 404
     output_path = Path(record.get('result_path')) if record and record.get('result_path') else None
     if output_path is None or not output_path.exists():
@@ -262,27 +338,47 @@ def create_pdf_to_plt_job():
     validation_error = validate_pdf_upload(uploaded)
     if validation_error:
         return validation_error
+    billing = None
+    record = None
+    billing_confirmed = False
     try:
+        billing = authorize_job('pdf_to_plt')
         record = submit_job(
             'pdf_to_plt',
             uploaded.read(),
             safe_uploaded_filename(uploaded.filename),
             parse_pdf_render_options(request.form),
-            request_user_key(),
+            f"user:{billing['user_id']}",
+            billing_request_id=billing['request_id'],
         )
+        commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
+        billing_confirmed = True
+        record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
+    except BillingRejected as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        return billing_error(error)
     except RedisError as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
         return redis_unavailable(error)
     except QueueRejected as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
         return queue_error(error)
     except ValueError as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
         return jsonify({'error': str(error)}), 422
+    except Exception:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        raise
     return jsonify(job_response(record)), 200
 
 
 @pdf_bp.get('/jobs/<job_id>')
 def get_pdf_to_plt_job(job_id):
-    record = load_job(job_id)
-    if record and record.get('user_key') == request_user_key():
+    try:
+        record = owned_job(job_id, 'pdf_to_plt')
+    except BillingRejected as error:
+        return billing_error(error)
+    if record:
         return jsonify(job_response(record))
     return jsonify({'error': '任务不存在或已过期'}), 404
 
@@ -290,7 +386,10 @@ def get_pdf_to_plt_job(job_id):
 @pdf_bp.delete('/jobs/<job_id>')
 def cancel_pdf_to_plt_job(job_id):
     try:
-        record = cancel_job(job_id, request_user_key())
+        user_key = authenticated_user_key()
+        record = cancel_job(job_id, user_key)
+    except BillingRejected as error:
+        return billing_error(error)
     except PermissionError as error:
         return jsonify({'error': str(error)}), 403
     except QueueRejected as error:
@@ -304,10 +403,11 @@ def cancel_pdf_to_plt_job(job_id):
 
 @pdf_bp.get('/files/<job_id>.plt')
 def download_plt(job_id):
-    record = load_job(job_id)
-    if record and record.get('user_key') != request_user_key():
-        return jsonify({'error': '无权下载该任务文件'}), 403
-    if record and record.get('job_type') != 'pdf_to_plt':
+    try:
+        record = owned_job(job_id, 'pdf_to_plt')
+    except BillingRejected as error:
+        return billing_error(error)
+    if not record:
         return jsonify({'error': 'PLT 文件不存在或已过期'}), 404
     output_path = Path(record.get('result_path')) if record and record.get('result_path') else None
     if output_path is None or not output_path.exists():

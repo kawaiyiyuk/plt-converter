@@ -33,6 +33,8 @@ services:
       PLT_UPLOAD_RATE_LIMIT_PER_MINUTE: 10
       PLT_UPLOAD_IP_RATE_LIMIT_PER_MINUTE: 30
       PLT_METRICS_TOKEN: ${PLT_METRICS_TOKEN:-}
+      WX_BACKEND_URL: ${WX_BACKEND_URL:-http://host.docker.internal:5001}
+      CONVERSION_SERVICE_TOKEN: ${CONVERSION_SERVICE_TOKEN:-development-conversion-service-token}
     ports:
       - "8091:80"
     volumes:
@@ -42,6 +44,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   plt-worker:
     build:
