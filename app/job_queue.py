@@ -15,6 +15,11 @@ from rq.registry import StartedJobRegistry
 
 TERMINAL_STATUSES = {'done', 'failed', 'cancelled', 'expired'}
 ACTIVE_STATUSES = {'queued', 'processing', 'cancelling'}
+JOB_OUTPUT_VERSIONS = {
+    'plt_to_pdf': '2-flate',
+    'pdf_to_plt': '1',
+    'pdf_preview': '1',
+}
 
 
 def redis_connection(blocking=False):
@@ -158,8 +163,11 @@ def completed_result_available(record):
 def submit_job(job_type, source, filename, options, user_key, connection=None):
     connection = connection or redis_connection()
     cleanup_expired_job_files(connection)
+    output_version = JOB_OUTPUT_VERSIONS.get(job_type, '1')
     fingerprint = hashlib.sha256(
         job_type.encode('utf-8')
+        + b'\0'
+        + output_version.encode('utf-8')
         + b'\0'
         + source
         + b'\0'
@@ -197,6 +205,7 @@ def submit_job(job_type, source, filename, options, user_key, connection=None):
         record = {
             'job_id': job_id,
             'job_type': job_type,
+            'output_version': output_version,
             'user_key': user_key,
             'status': 'queued',
             'progress': 0,

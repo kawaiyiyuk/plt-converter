@@ -10,6 +10,7 @@ import fakeredis
 
 from app import create_app
 from app.job_queue import (
+    JOB_OUTPUT_VERSIONS,
     QueueRejected,
     cleanup_expired_job_files,
     enforce_rate_limit,
@@ -72,6 +73,19 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(int(self.redis.get(rate_keys[0])), 1)
         self.assertEqual(self.redis.llen('rq:queue:conversions'), 1)
         self.assertEqual(queue_position(first['job_id'], self.redis), 1)
+
+    def test_output_version_invalidates_completed_deduplication(self):
+        first = self.submit()
+        from app.job_queue import update_job
+        result_path = Path(first['input_path']).parent / 'sample.pdf'
+        result_path.write_bytes(b'%PDF-1.4')
+        update_job(first['job_id'], self.redis, status='done', result_path=str(result_path))
+
+        with patch.dict(JOB_OUTPUT_VERSIONS, {'plt_to_pdf': 'next-version'}):
+            replacement = self.submit()
+
+        self.assertNotEqual(replacement['job_id'], first['job_id'])
+        self.assertEqual(replacement['output_version'], 'next-version')
 
     def test_transient_failure_retries_once(self):
         record = self.submit()
