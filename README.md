@@ -75,25 +75,27 @@ docker compose up --build
 
 默认部署为 1 个 API、1 个 RQ Worker 和 1 个 Redis。转换并发由 Worker 副本数控制；提高副本数前需要同步评估 CPU、内存和队列容量。文件只用于临时处理，不进入缝纫记忆主业务数据库。
 
-### 与 Appsbox 合并部署
+### 生产部署
 
-服务器目录为 `/opt/appsbox-backend` 和 `/opt/plt-converter` 时，可以在保留两个独立 Git 仓库的同时，将它们作为同一个 `appsbox` Compose 项目运行：
+转换服务必须作为独立的 `plt-converter` Compose 项目运行。它可以和其他项目共用一台 Docker 主机，但不共享 Compose 配置、环境文件、网络或数据卷。
 
 ```bash
 cp /opt/plt-converter/.env.production.example /opt/plt-converter/.env.production
-# 将示例令牌替换为 openssl rand -hex 32 的输出
+# 设置主后台地址、服务密钥和指标密钥
 
 docker compose \
-  --project-directory /opt/appsbox-backend \
-  --env-file /opt/appsbox-backend/.env \
   --env-file /opt/plt-converter/.env.production \
-  -f /opt/appsbox-backend/compose.yaml \
-  -f /opt/appsbox-backend/compose.prod.yaml \
-  -f /opt/plt-converter/compose.appsbox.yaml \
+  -f /opt/plt-converter/compose.production.yaml \
   config
+
+docker compose \
+  --env-file /opt/plt-converter/.env.production \
+  -f /opt/plt-converter/compose.production.yaml \
+  up -d --build
 ```
 
 转换 API 只绑定宿主机 `127.0.0.1:8091`，供宿主机 Nginx 反向代理；转换服务 Redis 不开放宿主机端口。
+生产数据卷使用固定名称 `plt_converter_redis_data` 和 `plt_converter_temp`，不会随 Compose 项目名变化。
 镜像构建默认使用腾讯云 PyPI；可在 `.env.production` 中设置 `PLT_PIP_INDEX_URL=https://pypi.org/simple` 覆盖。
 
 ## 防护配置
@@ -118,6 +120,8 @@ PDF_MAX_TOTAL_PIXELS=200000000
 PDF_MAX_DRAWINGS=250000
 PDF_MAX_OUTPUT_SEGMENTS=300000
 PLT_METRICS_TOKEN=<生产环境生成的随机令牌>
+WX_BACKEND_URL=https://api.fengrenjiyi.com
+CONVERSION_SERVICE_TOKEN=<与主后台相同的服务密钥>
 ```
 
 健康检查为 `/health`、`/health/redis`、`/health/worker`。指标接口为 `/api/v1/plt/metrics` 和 `/api/v1/pdf/metrics`；未设置 `PLT_METRICS_TOKEN` 时接口不启用，启用后请求必须携带 `X-Metrics-Token`。Redis 使用 128MB、AOF 和 `noeviction`，内存写满时会明确拒绝新任务，因此生产监控应同时关注 Redis 内存、接口 503 和队列拒绝数。

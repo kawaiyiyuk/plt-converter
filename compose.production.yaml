@@ -1,13 +1,15 @@
+name: plt-converter
+
 services:
-  plt-converter-api:
+  api:
     build:
-      context: ../plt-converter
+      context: .
       args:
         PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
     restart: unless-stopped
-    environment:
-      PORT: 80
-      REDIS_URL: redis://plt-converter-redis:6379/0
+    environment: &converter-environment
+      REDIS_URL: redis://redis:6379/0
+      PLT_TEMP_FOLDER: /tmp/plt-converter
       PLT_MAX_UPLOAD_MB: 20
       PLT_QUEUE_MAX_PENDING: 20
       PLT_JOB_TIMEOUT_SECONDS: 90
@@ -32,7 +34,7 @@ services:
     ports:
       - "127.0.0.1:8091:80"
     volumes:
-      - plt_converter_temp:/tmp/plt-converter
+      - temp_data:/tmp/plt-converter
     mem_limit: 1g
     cpus: 1.0
     healthcheck:
@@ -41,42 +43,27 @@ services:
       timeout: 5s
       retries: 5
     depends_on:
-      plt-converter-redis:
+      redis:
         condition: service_healthy
 
-  plt-converter-worker:
+  worker:
     build:
-      context: ../plt-converter
+      context: .
       args:
         PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
     restart: unless-stopped
     command: ["python", "worker.py"]
     environment:
-      REDIS_URL: redis://plt-converter-redis:6379/0
-      PLT_TEMP_FOLDER: /tmp/plt-converter
-      PLT_QUEUE_MAX_PENDING: 20
-      PLT_JOB_TIMEOUT_SECONDS: 90
-      PLT_JOB_RETENTION_SECONDS: 1800
-      PLT_MAX_POINTS: 500000
-      PLT_MAX_PATHS: 100000
-      PLT_MAX_OUTPUT_PAGES: 80
-      PLT_MAX_DIMENSION_MM: 10000
-      PLT_MAX_COMMANDS: 250000
-      PLT_MAX_TEXT_CHARS: 100000
-      PDF_MAX_TOTAL_PIXELS: 200000000
-      PDF_MAX_DRAWINGS: 250000
-      PDF_MAX_OUTPUT_SEGMENTS: 300000
-      WX_BACKEND_URL: ${WX_BACKEND_URL:?Set WX_BACKEND_URL in /opt/plt-converter/.env.production}
-      CONVERSION_SERVICE_TOKEN: ${CONVERSION_SERVICE_TOKEN:?Set CONVERSION_SERVICE_TOKEN in /opt/plt-converter/.env.production}
+      <<: *converter-environment
     volumes:
-      - plt_converter_temp:/tmp/plt-converter
+      - temp_data:/tmp/plt-converter
     mem_limit: 1g
     cpus: 1.0
     depends_on:
-      plt-converter-redis:
+      redis:
         condition: service_healthy
 
-  plt-converter-redis:
+  redis:
     image: redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
@@ -88,8 +75,10 @@ services:
       timeout: 3s
       retries: 10
     volumes:
-      - plt_converter_redis_data:/data
+      - redis_data:/data
 
 volumes:
-  plt_converter_temp:
-  plt_converter_redis_data:
+  temp_data:
+    name: plt_converter_temp
+  redis_data:
+    name: plt_converter_redis_data
