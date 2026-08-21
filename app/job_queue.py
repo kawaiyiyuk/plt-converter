@@ -175,6 +175,8 @@ def submit_job(job_type, source, filename, options, user_key, connection=None, b
         + b'\0'
         + output_version.encode('utf-8')
         + b'\0'
+        + filename.encode('utf-8')
+        + b'\0'
         + source
         + b'\0'
         + json.dumps(options, sort_keys=True, ensure_ascii=False).encode('utf-8')

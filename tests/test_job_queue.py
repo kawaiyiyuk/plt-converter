@@ -10,6 +10,7 @@ import fakeredis
 
 from app import create_app
 from app.billing import BillingRejected
+from app.routes import safe_uploaded_filename
 from app.job_queue import (
     JOB_OUTPUT_VERSIONS,
     QueueRejected,
@@ -75,6 +76,20 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(int(self.redis.get(rate_keys[0])), 1)
         self.assertEqual(self.redis.llen('rq:queue:conversions'), 1)
         self.assertEqual(queue_position(first['job_id'], self.redis), 1)
+
+    def test_filename_affects_deduplication(self):
+        first = self.submit()
+        renamed = submit_job(
+            'plt_to_pdf',
+            b'IN;PU0,0;PD1016,1016;',
+            '纸样.plt',
+            first['options'],
+            'user-a',
+            connection=self.redis,
+        )
+
+        self.assertNotEqual(first['job_id'], renamed['job_id'])
+        self.assertEqual(renamed['filename'], '纸样.plt')
 
     def test_billed_job_waits_for_confirmation_and_confirmation_is_idempotent(self):
         record = submit_job(
@@ -321,6 +336,21 @@ class JobQueueTest(unittest.TestCase):
         self.assertTrue(Path(result['result_path']).exists())
         self.assertFalse(self.redis.sismember('plt-converter:user-jobs:user-a', record['job_id']))
 
+    def test_worker_preserves_unicode_output_filename(self):
+        record = submit_job(
+            'plt_to_pdf',
+            b'IN;PU0,0;PD1016,1016;',
+            '春季 纸样.v1.plt',
+            {'units_per_inch': 1016},
+            'user-unicode-name',
+            connection=self.redis,
+        )
+        with patch('app.tasks.redis_connection', return_value=self.redis):
+            result = execute_job(record['job_id'])
+
+        self.assertEqual(result['filename'], '春季 纸样.v1.pdf')
+        self.assertEqual(Path(result['result_path']).name, '春季 纸样.v1.pdf')
+
     def test_job_and_preview_routes_are_owner_isolated(self):
         record = self.submit()
         completed = load_job(record['job_id'], self.redis)
@@ -437,7 +467,10 @@ class JobQueueTest(unittest.TestCase):
             plt_response = client.post(
                 '/api/v1/plt/jobs',
                 headers={'X-Client-Key': 'chinese-name-plt'},
-                data={'file': (io.BytesIO(b'IN;PU0,0;PD1016,1016;'), '纸样.plt')},
+                data={
+                    'original_filename': '春季 纸样.plt',
+                    'file': (io.BytesIO(b'IN;PU0,0;PD1016,1016;'), 'tmp.plt'),
+                },
             )
             pdf_response = client.post(
                 '/api/v1/pdf/preview',
@@ -447,6 +480,29 @@ class JobQueueTest(unittest.TestCase):
 
         self.assertEqual(plt_response.status_code, 200)
         self.assertEqual(pdf_response.status_code, 200)
+        record = load_job(plt_response.get_json()['job_id'], self.redis)
+        self.assertEqual(record['filename'], '春季 纸样.plt')
+
+    def test_safe_uploaded_filename_preserves_unicode_and_removes_paths(self):
+        self.assertEqual(safe_uploaded_filename('纸样.plt'), '纸样.plt')
+        self.assertEqual(safe_uploaded_filename('春季 连衣裙 01.PLT'), '春季 连衣裙 01.plt')
+        self.assertEqual(safe_uploaded_filename('../../裙子.v1.plt'), '裙子.v1.plt')
+        self.assertEqual(safe_uploaded_filename('..\\..\\裙子.plt'), '裙子.plt')
+        self.assertEqual(safe_uploaded_filename('.plt'), 'upload.plt')
+        self.assertLessEqual(len(safe_uploaded_filename('🧵' * 100 + '.plt').encode('utf-8')), 255)
+
+    def test_plt_preview_rejects_extension_that_only_sanitizes_to_plt(self):
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis):
+            response = app.test_client().post(
+                '/api/v1/plt/preview',
+                headers={'X-Client-Key': 'invalid-preview-extension'},
+                data={'file': (io.BytesIO(b'IN;PU0,0;PD1016,1016;'), 'sample.p-l-t')},
+            )
+
+        self.assertEqual(response.status_code, 415)
+        self.assertIn('只支持', response.get_json()['error'])
 
     def test_routes_reject_non_finite_numeric_options(self):
         app = create_app()

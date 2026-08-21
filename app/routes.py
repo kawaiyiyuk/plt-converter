@@ -1,10 +1,11 @@
 import json
 import math
 import os
+import re
+import unicodedata
 from pathlib import Path
 
 from flask import Blueprint, jsonify, request, send_file, url_for
-from werkzeug.utils import secure_filename
 
 from .billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
 from .services.plt_metadata import inspect_plt
@@ -183,13 +184,10 @@ def job_response(record):
 @plt_bp.post('/preview')
 def preview_plt():
     uploaded = request.files.get('file')
-    if uploaded is None or not uploaded.filename:
-        return jsonify({'error': '请选择 PLT 文件'}), 400
-
+    validation_error = validate_upload(uploaded)
+    if validation_error:
+        return validation_error
     filename = safe_uploaded_filename(uploaded.filename)
-    extension = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    if extension not in ALLOWED_EXTENSIONS:
-        return jsonify({'error': '只支持 .plt、.hpgl 或 .txt 文件'}), 415
 
     try:
         enforce_rate_limit(request_user_key(), scope='preview', limit_env='PLT_PREVIEW_RATE_LIMIT_PER_MINUTE')
@@ -230,7 +228,7 @@ def create_conversion_job():
         record = submit_job(
             'plt_to_pdf',
             source,
-            safe_uploaded_filename(uploaded.filename),
+            safe_uploaded_filename(request.form.get('original_filename') or uploaded.filename),
             parse_render_options(request.form) | {
                 'units_per_inch': parse_units_per_inch(request.form),
             },
@@ -496,11 +494,15 @@ def validate_pdf_upload(uploaded):
 
 
 def safe_uploaded_filename(filename):
-    raw = str(filename or '')
-    extension = raw.rsplit('.', 1)[-1].lower() if '.' in raw else ''
-    raw_stem = raw.rsplit('.', 1)[0] if extension else raw
-    stem = secure_filename(raw_stem) or 'upload'
-    return f'{stem}.{extension}' if extension else stem
+    """保留可读的 Unicode 文件名，同时移除路径和危险字符。"""
+    raw = unicodedata.normalize('NFC', str(filename or '')).replace('\\', '/')
+    name = raw.rsplit('/', 1)[-1].strip()
+    extension = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
+    raw_stem = name.rsplit('.', 1)[0] if extension else name
+    stem = re.sub(r'[\x00-\x1f\x7f/:*?"<>|\\]', '_', raw_stem)
+    stem = re.sub(r'\s+', ' ', stem).strip(' .')[:60].rstrip(' .') or 'upload'
+    safe_extension = re.sub(r'[^a-z0-9]', '', extension)[:10]
+    return f'{stem}.{safe_extension}' if safe_extension else stem
 
 
 def parse_units_per_inch(form):
