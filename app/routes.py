@@ -167,6 +167,13 @@ def job_response(record):
                         preview_id=preview_id,
                         page_index=page['index'],
                     ),
+                    **({
+                        'editor_preview_path': url_for(
+                            'pdf.editor_preview_image',
+                            preview_id=preview_id,
+                            page_index=page['index'],
+                        ),
+                    } if page.get('editor_preview_name') else {}),
                 }
                 for page in result.get('pages', [])
             ]
@@ -329,6 +336,23 @@ def preview_image(preview_id, page_index):
     image_path = Path(record.get('input_path', '')).parent / 'previews' / f'{preview_id}-{page_index}.png'
     if not image_path.exists():
         return jsonify({'error': '预览图不存在'}), 404
+    return send_file(image_path, mimetype='image/png', max_age=300)
+
+
+@pdf_bp.get('/previews/<preview_id>/<int:page_index>-editor.png')
+def editor_preview_image(preview_id, page_index):
+    record = load_job(preview_id)
+    if not record or record.get('job_type') != 'pdf_preview':
+        return jsonify({'error': '预览已过期'}), 404
+    if record.get('user_key') != request_user_key():
+        return jsonify({'error': '无权访问该预览'}), 403
+    pages = (record.get('result') or {}).get('pages') or []
+    page = next((item for item in pages if item.get('index') == page_index), None)
+    if not page or not page.get('editor_preview_name'):
+        return jsonify({'error': '高清预览不存在'}), 404
+    image_path = Path(record.get('input_path', '')).parent / 'previews' / page['editor_preview_name']
+    if not image_path.exists():
+        return jsonify({'error': '高清预览不存在'}), 404
     return send_file(image_path, mimetype='image/png', max_age=300)
 
 
@@ -534,6 +558,16 @@ def parse_pdf_render_options(form):
             raise ValueError(f'{name} 参数无效')
         return value
 
+    def non_negative_number(name, default=0):
+        raw_value = form.get(name, default)
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f'{name} 参数无效') from error
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f'{name} 必须是大于等于 0 的有限数值')
+        return value
+
     raw_enabled_pages = form.get('enabled_pages', '')
     enabled_pages = None
     if raw_enabled_pages:
@@ -557,6 +591,10 @@ def parse_pdf_render_options(form):
         'columns': max(1, min(24, int(number('columns', 1)))),
         'order': str(form.get('order', 'row')).lower(),
         'margin_mm': number('margin_mm', 0),
+        'crop_left_mm': non_negative_number('crop_left_mm'),
+        'crop_right_mm': non_negative_number('crop_right_mm'),
+        'crop_top_mm': non_negative_number('crop_top_mm'),
+        'crop_bottom_mm': non_negative_number('crop_bottom_mm'),
         'line_width_mm': number('line_width_mm', 0.265),
         'enabled_pages': enabled_pages,
         'page_slots': page_slots,

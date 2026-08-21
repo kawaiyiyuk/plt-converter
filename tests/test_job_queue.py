@@ -382,6 +382,48 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(allowed.get_json()['status'], 'preview_ready')
         self.assertEqual(denied.status_code, 404)
 
+    def test_pdf_preview_response_exposes_protected_editor_preview(self):
+        record = submit_job(
+            'pdf_preview',
+            b'%PDF preview source',
+            'sample.pdf',
+            {},
+            'user-a',
+            connection=self.redis,
+        )
+        completed = load_job(record['job_id'], self.redis)
+        completed['status'] = 'done'
+        completed['result'] = {
+            'pages': [{
+                'index': 0,
+                'label': '1',
+                'editor_preview_name': f"{record['job_id']}-0-editor.png",
+            }],
+        }
+        preview_root = Path(completed['input_path']).parent / 'previews'
+        preview_root.mkdir(exist_ok=True)
+        (preview_root / f"{record['job_id']}-0.png").write_bytes(b'png')
+        (preview_root / f"{record['job_id']}-0-editor.png").write_bytes(b'editor')
+        from app.job_queue import save_job
+        save_job(completed, self.redis)
+
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis):
+            client = app.test_client()
+            response = client.get(
+                f"/api/v1/pdf/preview/jobs/{record['job_id']}",
+                headers={'X-Client-Key': 'user-a'},
+            )
+            editor_path = response.get_json()['pages'][0]['editor_preview_path']
+            allowed = client.get(editor_path, headers={'X-Client-Key': 'user-a'})
+            denied = client.get(editor_path, headers={'X-Client-Key': 'user-b'})
+            allowed.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(denied.status_code, 403)
+
     def test_routes_accept_chinese_upload_filenames(self):
         app = create_app()
         with patch('app.routes.redis_connection', return_value=self.redis), \
@@ -427,6 +469,28 @@ class JobQueueTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
         self.assertIn('margin_mm', response.get_json()['error'])
+
+    def test_pdf_route_strictly_rejects_invalid_crop_options(self):
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authorize_job', return_value={
+                    'user_id': 1,
+                    'request_id': 'invalid-crop-request',
+                }), \
+                patch('app.routes.release_conversion'):
+            client = app.test_client()
+            for value in ('abc', '-1', 'NaN'):
+                response = client.post(
+                    '/api/v1/pdf/jobs',
+                    headers={'X-Client-Key': 'invalid-crop'},
+                    data={
+                        'file': (io.BytesIO(b'%PDF'), 'sample.pdf'),
+                        'crop_left_mm': value,
+                    },
+                )
+                self.assertEqual(response.status_code, 422)
+                self.assertIn('crop_left_mm', response.get_json()['error'])
 
     def test_route_cancels_job_and_forwards_commit_balance_rejection(self):
         app = create_app()

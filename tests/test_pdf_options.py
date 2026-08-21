@@ -35,6 +35,7 @@ class PdfOptionsTest(unittest.TestCase):
     def convert(self, options):
         with patch('app.services.pdf_to_plt.open_pdf_document', return_value=FakeDocument()), \
                 patch('app.services.pdf_to_plt.load_fitz', return_value=object()), \
+                patch('app.services.pdf_to_plt.build_crop_rect', return_value=None), \
                 patch('app.services.pdf_to_plt._extract_page', side_effect=lambda *args: extracted_page()):
             return convert_pdf_to_plt(b'%PDF', options)
 

@@ -1,11 +1,14 @@
+import math
 import os
 from pathlib import Path
 
 
 MAX_PDF_PAGES = 200
 PREVIEW_WIDTH_PX = 360
+EDITOR_PREVIEW_WIDTH_PX = 1080
 RASTER_DPI = 96
 MAX_RASTER_SEGMENTS = 60000
+MM_TO_PT = 72 / 25.4
 
 
 def inspect_pdf(source, preview_folder, preview_id):
@@ -29,13 +32,23 @@ def inspect_pdf(source, preview_folder, preview_id):
             pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
             preview_path = Path(preview_folder) / f'{preview_id}-{index}.png'
             pixmap.save(str(preview_path))
-            pages.append({
+            page_result = {
                 'index': index,
                 'label': f'{index + 1}',
                 'width_mm': round(rect.width * 25.4 / 72, 2),
                 'height_mm': round(rect.height * 25.4 / 72, 2),
                 'preview_name': preview_path.name,
-            })
+            }
+            if index == 0:
+                editor_scale = min(2, EDITOR_PREVIEW_WIDTH_PX / max(rect.width, 1))
+                editor_pixmap = page.get_pixmap(
+                    matrix=fitz.Matrix(editor_scale, editor_scale),
+                    alpha=False,
+                )
+                editor_preview_path = Path(preview_folder) / f'{preview_id}-{index}-editor.png'
+                editor_pixmap.save(str(editor_preview_path))
+                page_result['editor_preview_name'] = editor_preview_path.name
+            pages.append(page_result)
         return pages
     finally:
         document.close()
@@ -48,69 +61,50 @@ def convert_pdf_to_plt(source, options=None):
     units_per_inch = positive_int(options.get('units_per_inch', 1016), 'units_per_inch', 100000)
     line_width_mm = max(0.03, float(options.get('line_width_mm', 0.265)))
     margin_mm = clamp(float(options.get('margin_mm', 0)), 0, 100)
+    crop_margins = parse_crop_margins(options)
+    rows = positive_int(options.get('rows', 1), 'rows')
+    columns = positive_int(options.get('columns', 1), 'columns')
+    order = options.get('order', 'row') if options.get('order', 'row') in {'row', 'column'} else 'row'
 
     document = open_pdf_document(source, fitz)
     try:
         if document.page_count > MAX_PDF_PAGES:
             raise ValueError(f'PDF 页数过多，最多支持 {MAX_PDF_PAGES} 页')
+        page_count = document.page_count
         validate_pdf_complexity(document)
-        pages = []
+        placements, enabled_pages = resolve_page_placements(
+            page_count,
+            rows,
+            columns,
+            order,
+            options.get('page_slots'),
+            options.get('enabled_pages'),
+        )
+        pages = {}
         total_segments = 0
         maximum_segments = max(1000, int(os.getenv('PDF_MAX_OUTPUT_SEGMENTS', '300000')))
-        for index in range(document.page_count):
-            page = _extract_page(
-                document.load_page(index),
+        for index in enabled_pages:
+            page = document.load_page(index)
+            crop_rect = build_crop_rect(page, crop_margins, fitz, index + 1)
+            extracted_page = _extract_page(
+                page,
                 units_per_inch,
                 fitz,
                 maximum_segments - total_segments,
+                crop_rect,
             )
-            total_segments += sum(max(len(shape) - 1, 0) for shape in page['shapes'])
+            total_segments += sum(max(len(shape) - 1, 0) for shape in extracted_page['shapes'])
             if total_segments > maximum_segments:
                 raise ValueError(f'PDF 线条数量过多，最多支持 {maximum_segments} 条')
-            pages.append(page)
+            pages[index] = extracted_page
     finally:
         document.close()
 
     if not pages:
         raise ValueError('PDF 没有可转换的页面')
-    rows = positive_int(options.get('rows', 1), 'rows')
-    columns = positive_int(options.get('columns', 1), 'columns')
-    order = options.get('order', 'row') if options.get('order', 'row') in {'row', 'column'} else 'row'
-    page_slots = options.get('page_slots')
-    enabled_pages = options.get('enabled_pages')
-    capacity = rows * columns
-    if page_slots is not None:
-        if len(page_slots) > capacity:
-            raise ValueError('page_slots 数量不能超过行列总格数')
-        selected_slots = [int(value) for value in page_slots if value is not None]
-        if any(value < 0 or value >= len(pages) for value in selected_slots):
-            raise ValueError('page_slots 包含无效页面')
-        if len(selected_slots) != len(set(selected_slots)):
-            raise ValueError('page_slots 不能重复使用同一页面')
-        placements = [
-            (slot_index, int(page_index))
-            for slot_index, page_index in enumerate(page_slots)
-            if page_index is not None
-        ]
-        enabled_pages = [page_index for _, page_index in placements]
-    else:
-        if enabled_pages is None:
-            enabled_pages = list(range(len(pages)))
-        enabled_pages = [int(index) for index in enabled_pages]
-        if any(index < 0 or index >= len(pages) for index in enabled_pages):
-            raise ValueError('enabled_pages 包含无效页面')
-        enabled_pages = list(dict.fromkeys(enabled_pages))
-        if len(enabled_pages) > capacity:
-            raise ValueError('所选页面数量不能超过行列总格数')
-        placements = [
-            (output_index, page_index)
-            for output_index, page_index in enumerate(enabled_pages)
-        ]
-    if not enabled_pages:
-        raise ValueError('至少保留一个 PDF 页面')
 
-    tile_width = max(page['width_units'] for page in pages)
-    tile_height = max(page['height_units'] for page in pages)
+    tile_width = max(page['width_units'] for page in pages.values())
+    tile_height = max(page['height_units'] for page in pages.values())
     gap_units = round(margin_mm * units_per_inch / 25.4)
     output_paths = []
     output_width = columns * tile_width + max(columns - 1, 0) * gap_units
@@ -129,18 +123,57 @@ def convert_pdf_to_plt(source, options=None):
         raise ValueError('PDF 页面没有可转换的线条内容')
     plt = serialize_hpgl(output_paths, units_per_inch, line_width_mm)
     return plt, {
-        'page_count': len(pages),
+        'page_count': page_count,
         'selected_count': len(enabled_pages),
         'empty_cells': max(rows * columns - len(enabled_pages), 0),
         'rows': rows,
         'columns': columns,
         'order': order,
         'margin_mm': margin_mm,
+        'crop_left_mm': crop_margins['left'],
+        'crop_right_mm': crop_margins['right'],
+        'crop_top_mm': crop_margins['top'],
+        'crop_bottom_mm': crop_margins['bottom'],
         'width_mm': round(output_width * 25.4 / units_per_inch, 2),
         'height_mm': round(output_height * 25.4 / units_per_inch, 2),
-        'source_types': sorted({page['source_type'] for page in pages}),
-        'raster_fallback': any(page['source_type'] == 'raster' for page in pages),
+        'source_types': sorted({page['source_type'] for page in pages.values()}),
+        'raster_fallback': any(page['source_type'] == 'raster' for page in pages.values()),
     }
+
+
+def resolve_page_placements(page_count, rows, columns, order, page_slots, enabled_pages):
+    """校验页面布局，并且只返回真正参与转换的页面。"""
+    capacity = rows * columns
+    if page_slots is not None:
+        if len(page_slots) > capacity:
+            raise ValueError('page_slots 数量不能超过行列总格数')
+        selected_slots = [int(value) for value in page_slots if value is not None]
+        if any(value < 0 or value >= page_count for value in selected_slots):
+            raise ValueError('page_slots 包含无效页面')
+        if len(selected_slots) != len(set(selected_slots)):
+            raise ValueError('page_slots 不能重复使用同一页面')
+        placements = [
+            (slot_index, int(page_index))
+            for slot_index, page_index in enumerate(page_slots)
+            if page_index is not None
+        ]
+        enabled_pages = [page_index for _, page_index in placements]
+    else:
+        if enabled_pages is None:
+            enabled_pages = list(range(page_count))
+        enabled_pages = [int(index) for index in enabled_pages]
+        if any(index < 0 or index >= page_count for index in enabled_pages):
+            raise ValueError('enabled_pages 包含无效页面')
+        enabled_pages = list(dict.fromkeys(enabled_pages))
+        if len(enabled_pages) > capacity:
+            raise ValueError('所选页面数量不能超过行列总格数')
+        placements = [
+            (output_index, page_index)
+            for output_index, page_index in enumerate(enabled_pages)
+        ]
+    if not enabled_pages:
+        raise ValueError('至少保留一个 PDF 页面')
+    return placements, enabled_pages
 
 
 def load_fitz():
@@ -179,25 +212,65 @@ def validate_pdf_complexity(document):
             raise ValueError('PDF 矢量路径数量超过服务器限制')
 
 
-def _extract_page(page, units_per_inch, fitz, remaining_segments):
-    page_width = page.rect.width * units_per_inch / 72
-    page_height = page.rect.height * units_per_inch / 72
+def parse_crop_margins(options):
+    """规范化四边裁剪值，非法输入必须显式失败。"""
+    result = {}
+    for side in ('left', 'right', 'top', 'bottom'):
+        name = f'crop_{side}_mm'
+        try:
+            value = float(options.get(name, 0))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f'{name} 参数无效') from error
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f'{name} 必须是大于等于 0 的有限数值')
+        result[side] = value
+    return result
+
+
+def build_crop_rect(page, crop_margins, fitz, page_number=None):
+    """生成 PDF 可见裁剪矩形，并保证两个方向至少保留 1mm。"""
+    left = crop_margins['left'] * MM_TO_PT
+    right = crop_margins['right'] * MM_TO_PT
+    top = crop_margins['top'] * MM_TO_PT
+    bottom = crop_margins['bottom'] * MM_TO_PT
+    rect = fitz.Rect(left, top, page.rect.width - right, page.rect.height - bottom)
+    if rect.width < MM_TO_PT or rect.height < MM_TO_PT:
+        prefix = f'第 {page_number} 页' if page_number else 'PDF 页面'
+        raise ValueError(f'{prefix}裁边后必须至少保留 1mm × 1mm')
+    return rect
+
+
+def _extract_page(page, units_per_inch, fitz, remaining_segments, crop_rect=None):
+    crop_rect = crop_rect or fitz.Rect(0, 0, page.rect.width, page.rect.height)
+    page_width = crop_rect.width * units_per_inch / 72
+    page_height = crop_rect.height * units_per_inch / 72
     shapes = []
-    for drawing in page.get_drawings():
+    drawings = page.get_drawings()
+    rotation_matrix = getattr(page, 'rotation_matrix', None)
+    for drawing in drawings:
         for item in drawing.get('items', []):
             points = drawing_item_points(item, fitz)
-            for visible_points in clip_page_polyline(points, page.rect.width, page.rect.height, fitz):
+            # get_drawings 返回未旋转坐标，先转成与预览及 page.rect 一致的显示坐标。
+            if rotation_matrix is not None:
+                points = [point * rotation_matrix for point in points]
+            for visible_points in clip_page_polyline(
+                points,
+                page.rect.width,
+                page.rect.height,
+                fitz,
+                crop_rect,
+            ):
                 if len(visible_points) - 1 > remaining_segments:
                     raise ValueError('PDF 线条数量超过服务器限制')
                 shapes.append([
                     {
-                        'x': point.x * units_per_inch / 72,
-                        'y': (page.rect.height - point.y) * units_per_inch / 72,
+                        'x': (point.x - crop_rect.x0) * units_per_inch / 72,
+                        'y': (crop_rect.y1 - point.y) * units_per_inch / 72,
                     }
                     for point in visible_points
                 ])
                 remaining_segments -= len(visible_points) - 1
-    if shapes:
+    if drawings:
         return {
             'width_units': page_width,
             'height_units': page_height,
@@ -207,7 +280,7 @@ def _extract_page(page, units_per_inch, fitz, remaining_segments):
     return {
         'width_units': page_width,
         'height_units': page_height,
-        'shapes': rasterize_page(page, units_per_inch, fitz, remaining_segments),
+        'shapes': rasterize_page(page, units_per_inch, fitz, remaining_segments, crop_rect),
         'source_type': 'raster',
     }
 
@@ -227,13 +300,13 @@ def drawing_item_points(item, fitz):
     return []
 
 
-def clip_page_polyline(points, width, height, fitz):
+def clip_page_polyline(points, width, height, fitz, clip_rect=None):
     if len(points) < 2:
         return []
     paths = []
     current = []
     for start, end in zip(points, points[1:]):
-        clipped = clip_page_segment(start, end, width, height, fitz)
+        clipped = clip_page_segment(start, end, width, height, fitz, clip_rect)
         if not clipped:
             if len(current) > 1:
                 paths.append(current)
@@ -250,18 +323,22 @@ def clip_page_polyline(points, width, height, fitz):
     return paths
 
 
-def clip_page_segment(start, end, width, height, fitz):
+def clip_page_segment(start, end, width, height, fitz, clip_rect=None):
     x1, y1 = start.x, start.y
     x2, y2 = end.x, end.y
     dx = x2 - x1
     dy = y2 - y1
     lower = 0.0
     upper = 1.0
+    minimum_x = clip_rect.x0 if clip_rect is not None else 0
+    maximum_x = clip_rect.x1 if clip_rect is not None else width
+    minimum_y = clip_rect.y0 if clip_rect is not None else 0
+    maximum_y = clip_rect.y1 if clip_rect is not None else height
     for direction, distance in (
-        (-dx, x1),
-        (dx, width - x1),
-        (-dy, y1),
-        (dy, height - y1),
+        (-dx, x1 - minimum_x),
+        (dx, maximum_x - x1),
+        (-dy, y1 - minimum_y),
+        (dy, maximum_y - y1),
     ):
         if abs(direction) < 1e-12:
             if distance < 0:
@@ -304,9 +381,19 @@ def cubic_bezier(start, control_a, control_b, end, fitz, steps=12):
     return points
 
 
-def rasterize_page(page, units_per_inch, fitz, remaining_segments=MAX_RASTER_SEGMENTS):
+def rasterize_page(
+    page,
+    units_per_inch,
+    fitz,
+    remaining_segments=MAX_RASTER_SEGMENTS,
+    crop_rect=None,
+):
     scale = RASTER_DPI / 72
-    pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale),
+        alpha=False,
+        clip=crop_rect,
+    )
     channels = pixmap.n
     samples = pixmap.samples
     shapes = []

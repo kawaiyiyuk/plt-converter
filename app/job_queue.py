@@ -17,8 +17,8 @@ TERMINAL_STATUSES = {'done', 'failed', 'cancelled', 'expired'}
 ACTIVE_STATUSES = {'billing_pending', 'queued', 'processing', 'cancelling'}
 JOB_OUTPUT_VERSIONS = {
     'plt_to_pdf': '3-page-clipped',
-    'pdf_to_plt': '2-visible-clipped',
-    'pdf_preview': '1',
+    'pdf_to_plt': '3-page-cropped',
+    'pdf_preview': '2-editor-preview',
 }
 
 
@@ -152,10 +152,16 @@ def completed_result_available(record):
     if record.get('job_type') == 'pdf_preview':
         pages = (record.get('result') or {}).get('pages') or []
         preview_root = Path(record.get('input_path', '')).parent / 'previews'
-        return bool(pages) and all(
+        thumbnails_available = bool(pages) and all(
             (preview_root / f"{record['job_id']}-{page['index']}.png").exists()
             for page in pages
         )
+        editor_previews_available = all(
+            not page.get('editor_preview_name')
+            or (preview_root / page['editor_preview_name']).exists()
+            for page in pages
+        )
+        return thumbnails_available and editor_previews_available
     result_path = record.get('result_path')
     return bool(result_path and Path(result_path).exists())
 
