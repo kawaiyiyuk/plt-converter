@@ -7,9 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fakeredis
+from redis.exceptions import RedisError
 
 from app import create_app
 from app.billing import BillingRejected
+from app.routes import safe_uploaded_filename
 from app.job_queue import (
     JOB_OUTPUT_VERSIONS,
     QueueRejected,
@@ -75,6 +77,20 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(int(self.redis.get(rate_keys[0])), 1)
         self.assertEqual(self.redis.llen('rq:queue:conversions'), 1)
         self.assertEqual(queue_position(first['job_id'], self.redis), 1)
+
+    def test_filename_affects_deduplication(self):
+        first = self.submit()
+        renamed = submit_job(
+            'plt_to_pdf',
+            b'IN;PU0,0;PD1016,1016;',
+            '纸样.plt',
+            first['options'],
+            'user-a',
+            connection=self.redis,
+        )
+
+        self.assertNotEqual(first['job_id'], renamed['job_id'])
+        self.assertEqual(renamed['filename'], '纸样.plt')
 
     def test_billed_job_waits_for_confirmation_and_confirmation_is_idempotent(self):
         record = submit_job(
@@ -321,6 +337,21 @@ class JobQueueTest(unittest.TestCase):
         self.assertTrue(Path(result['result_path']).exists())
         self.assertFalse(self.redis.sismember('plt-converter:user-jobs:user-a', record['job_id']))
 
+    def test_worker_preserves_unicode_output_filename(self):
+        record = submit_job(
+            'plt_to_pdf',
+            b'IN;PU0,0;PD1016,1016;',
+            '春季 纸样.v1.plt',
+            {'units_per_inch': 1016},
+            'user-unicode-name',
+            connection=self.redis,
+        )
+        with patch('app.tasks.redis_connection', return_value=self.redis):
+            result = execute_job(record['job_id'])
+
+        self.assertEqual(result['filename'], '春季 纸样.v1.pdf')
+        self.assertEqual(Path(result['result_path']).name, '春季 纸样.v1.pdf')
+
     def test_job_and_preview_routes_are_owner_isolated(self):
         record = self.submit()
         completed = load_job(record['job_id'], self.redis)
@@ -382,6 +413,67 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(allowed.get_json()['status'], 'preview_ready')
         self.assertEqual(denied.status_code, 404)
 
+    def test_pdf_preview_cancel_route_uses_client_owner_and_rejects_formal_jobs(self):
+        allowed_preview = submit_job(
+            'pdf_preview',
+            b'%PDF allowed preview',
+            'allowed.pdf',
+            {},
+            'preview-owner',
+            connection=self.redis,
+        )
+        denied_preview = submit_job(
+            'pdf_preview',
+            b'%PDF denied preview',
+            'denied.pdf',
+            {},
+            'another-owner',
+            connection=self.redis,
+        )
+        formal_job = submit_job(
+            'pdf_to_plt',
+            b'%PDF formal job',
+            'formal.pdf',
+            {'rows': 1, 'columns': 1},
+            'preview-owner',
+            connection=self.redis,
+        )
+
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis):
+            client = app.test_client()
+            allowed = client.delete(
+                f"/api/v1/pdf/preview/jobs/{allowed_preview['job_id']}",
+                headers={'X-Client-Key': 'preview-owner'},
+            )
+            denied = client.delete(
+                f"/api/v1/pdf/preview/jobs/{denied_preview['job_id']}",
+                headers={'X-Client-Key': 'preview-owner'},
+            )
+            wrong_type = client.delete(
+                f"/api/v1/pdf/preview/jobs/{formal_job['job_id']}",
+                headers={'X-Client-Key': 'preview-owner'},
+            )
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.get_json()['status'], 'cancelled')
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(wrong_type.status_code, 404)
+        self.assertEqual(load_job(denied_preview['job_id'], self.redis)['status'], 'queued')
+        self.assertEqual(load_job(formal_job['job_id'], self.redis)['status'], 'queued')
+
+    def test_pdf_preview_cancel_route_returns_503_when_redis_is_unavailable(self):
+        app = create_app()
+        with patch('app.routes.load_job', side_effect=RedisError('unavailable')):
+            response = app.test_client().delete(
+                '/api/v1/pdf/preview/jobs/preview-job',
+                headers={'X-Client-Key': 'preview-owner'},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()['status'], 'unavailable')
+
     def test_pdf_preview_response_exposes_protected_editor_preview(self):
         record = submit_job(
             'pdf_preview',
@@ -437,7 +529,10 @@ class JobQueueTest(unittest.TestCase):
             plt_response = client.post(
                 '/api/v1/plt/jobs',
                 headers={'X-Client-Key': 'chinese-name-plt'},
-                data={'file': (io.BytesIO(b'IN;PU0,0;PD1016,1016;'), '纸样.plt')},
+                data={
+                    'original_filename': '春季 纸样.plt',
+                    'file': (io.BytesIO(b'IN;PU0,0;PD1016,1016;'), 'tmp.plt'),
+                },
             )
             pdf_response = client.post(
                 '/api/v1/pdf/preview',
@@ -447,6 +542,55 @@ class JobQueueTest(unittest.TestCase):
 
         self.assertEqual(plt_response.status_code, 200)
         self.assertEqual(pdf_response.status_code, 200)
+        record = load_job(plt_response.get_json()['job_id'], self.redis)
+        self.assertEqual(record['filename'], '春季 纸样.plt')
+
+    def test_pdf_job_prefers_original_filename_over_temporary_upload_name(self):
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authorize_job', return_value={
+                    'user_id': 1,
+                    'request_id': 'pdf-original-name-request',
+                }), \
+                patch('app.routes.commit_conversion', return_value={'success': True}):
+            response = app.test_client().post(
+                '/api/v1/pdf/jobs',
+                data={
+                    'original_filename': '春季 纸样.v1.pdf',
+                    'file': (io.BytesIO(b'%PDF'), 'tmp_upload.pdf'),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        record = load_job(response.get_json()['job_id'], self.redis)
+        self.assertEqual(record['filename'], '春季 纸样.v1.pdf')
+        with patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks.convert_pdf_to_plt', return_value=(b'IN;SP0;', {})):
+            result = execute_job(record['job_id'])
+        self.assertEqual(result['filename'], '春季 纸样.v1.plt')
+        self.assertEqual(Path(result['result_path']).name, '春季 纸样.v1.plt')
+
+    def test_safe_uploaded_filename_preserves_unicode_and_removes_paths(self):
+        self.assertEqual(safe_uploaded_filename('纸样.plt'), '纸样.plt')
+        self.assertEqual(safe_uploaded_filename('春季 连衣裙 01.PLT'), '春季 连衣裙 01.plt')
+        self.assertEqual(safe_uploaded_filename('../../裙子.v1.plt'), '裙子.v1.plt')
+        self.assertEqual(safe_uploaded_filename('..\\..\\裙子.plt'), '裙子.plt')
+        self.assertEqual(safe_uploaded_filename('.plt'), 'upload.plt')
+        self.assertLessEqual(len(safe_uploaded_filename('🧵' * 100 + '.plt').encode('utf-8')), 255)
+
+    def test_plt_preview_rejects_extension_that_only_sanitizes_to_plt(self):
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis):
+            response = app.test_client().post(
+                '/api/v1/plt/preview',
+                headers={'X-Client-Key': 'invalid-preview-extension'},
+                data={'file': (io.BytesIO(b'IN;PU0,0;PD1016,1016;'), 'sample.p-l-t')},
+            )
+
+        self.assertEqual(response.status_code, 415)
+        self.assertIn('只支持', response.get_json()['error'])
 
     def test_routes_reject_non_finite_numeric_options(self):
         app = create_app()
