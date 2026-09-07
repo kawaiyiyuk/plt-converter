@@ -368,7 +368,7 @@ def create_pdf_to_plt_job():
         record = submit_job(
             'pdf_to_plt',
             uploaded.read(),
-            safe_uploaded_filename(uploaded.filename),
+            safe_uploaded_filename(request.form.get('original_filename') or uploaded.filename),
             parse_pdf_render_options(request.form),
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
@@ -417,6 +417,28 @@ def get_pdf_preview_job(job_id):
     if record:
         return jsonify(job_response(record))
     return jsonify({'error': '任务不存在或已过期'}), 404
+
+
+@pdf_bp.delete('/preview/jobs/<job_id>')
+def cancel_pdf_preview_job(job_id):
+    """只允许提交预览的客户端取消对应 PDF 预览任务。"""
+    record = load_job(job_id)
+    if not record or record.get('job_type') != 'pdf_preview':
+        return jsonify({'error': '任务不存在或已过期'}), 404
+    user_key = request_user_key()
+    if record.get('user_key') != user_key:
+        return jsonify({'error': '无权取消该任务'}), 403
+    try:
+        record = cancel_job(job_id, user_key)
+    except PermissionError as error:
+        return jsonify({'error': str(error)}), 403
+    except QueueRejected as error:
+        return queue_error(error)
+    except RedisError as error:
+        return redis_unavailable(error)
+    if not record:
+        return jsonify({'error': '任务不存在或已过期'}), 404
+    return jsonify(job_response(record))
 
 
 @pdf_bp.delete('/jobs/<job_id>')

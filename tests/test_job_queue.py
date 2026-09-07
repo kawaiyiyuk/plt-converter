@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fakeredis
+from redis.exceptions import RedisError
 
 from app import create_app
 from app.billing import BillingRejected
@@ -412,6 +413,67 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(allowed.get_json()['status'], 'preview_ready')
         self.assertEqual(denied.status_code, 404)
 
+    def test_pdf_preview_cancel_route_uses_client_owner_and_rejects_formal_jobs(self):
+        allowed_preview = submit_job(
+            'pdf_preview',
+            b'%PDF allowed preview',
+            'allowed.pdf',
+            {},
+            'preview-owner',
+            connection=self.redis,
+        )
+        denied_preview = submit_job(
+            'pdf_preview',
+            b'%PDF denied preview',
+            'denied.pdf',
+            {},
+            'another-owner',
+            connection=self.redis,
+        )
+        formal_job = submit_job(
+            'pdf_to_plt',
+            b'%PDF formal job',
+            'formal.pdf',
+            {'rows': 1, 'columns': 1},
+            'preview-owner',
+            connection=self.redis,
+        )
+
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis):
+            client = app.test_client()
+            allowed = client.delete(
+                f"/api/v1/pdf/preview/jobs/{allowed_preview['job_id']}",
+                headers={'X-Client-Key': 'preview-owner'},
+            )
+            denied = client.delete(
+                f"/api/v1/pdf/preview/jobs/{denied_preview['job_id']}",
+                headers={'X-Client-Key': 'preview-owner'},
+            )
+            wrong_type = client.delete(
+                f"/api/v1/pdf/preview/jobs/{formal_job['job_id']}",
+                headers={'X-Client-Key': 'preview-owner'},
+            )
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.get_json()['status'], 'cancelled')
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(wrong_type.status_code, 404)
+        self.assertEqual(load_job(denied_preview['job_id'], self.redis)['status'], 'queued')
+        self.assertEqual(load_job(formal_job['job_id'], self.redis)['status'], 'queued')
+
+    def test_pdf_preview_cancel_route_returns_503_when_redis_is_unavailable(self):
+        app = create_app()
+        with patch('app.routes.load_job', side_effect=RedisError('unavailable')):
+            response = app.test_client().delete(
+                '/api/v1/pdf/preview/jobs/preview-job',
+                headers={'X-Client-Key': 'preview-owner'},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()['status'], 'unavailable')
+
     def test_pdf_preview_response_exposes_protected_editor_preview(self):
         record = submit_job(
             'pdf_preview',
@@ -482,6 +544,32 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(pdf_response.status_code, 200)
         record = load_job(plt_response.get_json()['job_id'], self.redis)
         self.assertEqual(record['filename'], '春季 纸样.plt')
+
+    def test_pdf_job_prefers_original_filename_over_temporary_upload_name(self):
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authorize_job', return_value={
+                    'user_id': 1,
+                    'request_id': 'pdf-original-name-request',
+                }), \
+                patch('app.routes.commit_conversion', return_value={'success': True}):
+            response = app.test_client().post(
+                '/api/v1/pdf/jobs',
+                data={
+                    'original_filename': '春季 纸样.v1.pdf',
+                    'file': (io.BytesIO(b'%PDF'), 'tmp_upload.pdf'),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        record = load_job(response.get_json()['job_id'], self.redis)
+        self.assertEqual(record['filename'], '春季 纸样.v1.pdf')
+        with patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks.convert_pdf_to_plt', return_value=(b'IN;SP0;', {})):
+            result = execute_job(record['job_id'])
+        self.assertEqual(result['filename'], '春季 纸样.v1.plt')
+        self.assertEqual(Path(result['result_path']).name, '春季 纸样.v1.plt')
 
     def test_safe_uploaded_filename_preserves_unicode_and_removes_paths(self):
         self.assertEqual(safe_uploaded_filename('纸样.plt'), '纸样.plt')
