@@ -25,6 +25,7 @@ def render_pdf(document, options=None):
     single_page = bool(options.get('single_page_output', False))
     show_page_number = bool(options.get('show_page_number', True))
     enabled_pages = options.get('enabled_pages')
+    disabled_pages = options.get('disabled_pages')
     maximum_pages = max(1, int(os.getenv('PLT_MAX_OUTPUT_PAGES', '80')))
     units_per_inch = float(metrics['units_per_inch'])
     scale = MM_TO_PT / 25.4 * 25.4 / units_per_inch
@@ -36,46 +37,8 @@ def render_pdf(document, options=None):
 
     drawing_width_pt = metrics['width_mm'] * MM_TO_PT
     drawing_height_pt = metrics['height_mm'] * MM_TO_PT
-    if enabled_pages is not None and not enabled_pages:
+    if disabled_pages is None and enabled_pages is not None and not enabled_pages:
         raise ValueError('至少保留一个输出页面')
-    if single_page:
-        page_width_pt = drawing_width_pt + margin_mm * MM_TO_PT * 2
-        page_height_pt = drawing_height_pt + margin_mm * MM_TO_PT * 2
-        pages = [{'row': 0, 'column': 0, 'source_index': 0}]
-        layout = {
-            'type': 'single',
-            'paper_size': None,
-            'orientation': 'portrait',
-            'page_width_pt': page_width_pt,
-            'page_height_pt': page_height_pt,
-            'drawing_width_mm': metrics['width_mm'],
-            'drawing_height_mm': metrics['height_mm'],
-            'columns': 1,
-            'rows': 1,
-            'page_count': 1,
-            'margin_mm': margin_mm,
-        }
-        page_contents = [
-            build_page_content(
-                shapes,
-                metrics,
-                page,
-                page_width_pt,
-                page_height_pt,
-                drawing_width_pt,
-                drawing_height_pt,
-                drawing_width_pt,
-                drawing_height_pt,
-                line_width_mm * MM_TO_PT,
-                show_page_number,
-                1,
-                1,
-                page_label='1-1',
-                paper_label='SINGLE',
-            )
-            for page in pages
-        ]
-        return build_pdf_document(page_contents, page_width_pt, page_height_pt), layout
 
     short_mm, long_mm = PAPER_SIZES_MM[paper_size]
     page_width_mm, page_height_mm = short_mm, long_mm
@@ -88,6 +51,86 @@ def render_pdf(document, options=None):
     tile_height_pt = max(1, page_height_pt - margin_pt * 2)
     columns = max(1, math.ceil(drawing_width_pt / tile_width_pt))
     rows = max(1, math.ceil(drawing_height_pt / tile_height_pt))
+    tiled_page_count = columns * rows
+
+    def tile_clip_rect(source_index):
+        row, column = divmod(source_index, columns)
+        clip_x = margin_pt + column * tile_width_pt
+        clip_y = margin_pt + max(
+            drawing_height_pt - (row + 1) * tile_height_pt,
+            0,
+        )
+        clip_width = min(
+            tile_width_pt,
+            drawing_width_pt - column * tile_width_pt,
+        )
+        clip_height = min(
+            tile_height_pt,
+            drawing_height_pt - row * tile_height_pt,
+        )
+        if clip_width <= 0 or clip_height <= 0:
+            return None
+        return clip_x, clip_y, clip_width, clip_height
+
+    if single_page:
+        single_page_width_pt = drawing_width_pt + margin_pt * 2
+        single_page_height_pt = drawing_height_pt + margin_pt * 2
+        excluded_clip_rects = None
+        if disabled_pages is not None:
+            disabled = {int(value) for value in disabled_pages}
+            if any(index < 0 or index >= tiled_page_count for index in disabled):
+                raise ValueError('disabled_pages 参数无效')
+            selected_tile_count = tiled_page_count - len(disabled)
+            if selected_tile_count <= 0:
+                raise ValueError('至少保留一个输出页面')
+            excluded_clip_rects = [
+                rect
+                for rect in (tile_clip_rect(index) for index in sorted(disabled))
+                if rect is not None
+            ]
+        else:
+            selected_tile_count = tiled_page_count
+        layout = {
+            'type': 'single',
+            'paper_size': None,
+            'orientation': 'portrait',
+            'page_width_pt': single_page_width_pt,
+            'page_height_pt': single_page_height_pt,
+            'drawing_width_mm': metrics['width_mm'],
+            'drawing_height_mm': metrics['height_mm'],
+            'columns': 1,
+            'rows': 1,
+            'tiled_columns': columns,
+            'tiled_rows': rows,
+            'selected_tile_count': selected_tile_count,
+            'page_count': 1,
+            'margin_mm': margin_mm,
+        }
+        content = build_page_content(
+            shapes,
+            metrics,
+            {'row': 0, 'column': 0, 'source_index': 0},
+            single_page_width_pt,
+            single_page_height_pt,
+            drawing_width_pt,
+            drawing_height_pt,
+            drawing_width_pt,
+            drawing_height_pt,
+            line_width_mm * MM_TO_PT,
+            show_page_number,
+            1,
+            1,
+            margin_pt=margin_pt,
+            page_label='1-1',
+            paper_label='SINGLE',
+            excluded_clip_rects=excluded_clip_rects,
+        )
+        return build_pdf_document(
+            [content],
+            single_page_width_pt,
+            single_page_height_pt,
+        ), layout
+
     all_pages = [
         {'row': row, 'column': column, 'source_index': row * columns + column}
         for row in range(rows)
@@ -95,10 +138,9 @@ def render_pdf(document, options=None):
     ]
     if enabled_pages is not None:
         enabled = {int(value) for value in enabled_pages}
-        selected_pages = [page for page in all_pages if page['source_index'] in enabled]
-        if not selected_pages:
+        pages = [page for page in all_pages if page['source_index'] in enabled]
+        if not pages:
             raise ValueError('至少保留一个输出页面')
-        pages = selected_pages
     else:
         pages = all_pages
 
@@ -160,9 +202,18 @@ def build_page_content(
     margin_pt=0,
     page_label='1-1',
     paper_label='A4',
+    excluded_clip_rects=None,
 ):
     content = ['q']
-    if margin_pt > 0 and tile_width_pt > 0 and tile_height_pt > 0:
+    if excluded_clip_rects is not None:
+        append_exclusion_clip(
+            content,
+            margin_pt,
+            drawing_width_pt,
+            drawing_height_pt,
+            excluded_clip_rects,
+        )
+    elif margin_pt > 0 and tile_width_pt > 0 and tile_height_pt > 0:
         content.extend([
             f'{fmt(margin_pt)} {fmt(margin_pt)} {fmt(tile_width_pt)} {fmt(tile_height_pt)} re',
             'W',
@@ -176,10 +227,16 @@ def build_page_content(
         '0 0 0 rg',
     ])
 
-    clip_min_x = margin_pt if margin_pt > 0 else 0
-    clip_min_y = margin_pt if margin_pt > 0 else 0
-    clip_max_x = clip_min_x + tile_width_pt
-    clip_max_y = clip_min_y + tile_height_pt
+    if excluded_clip_rects is not None:
+        clip_min_x = margin_pt
+        clip_min_y = margin_pt
+        clip_max_x = margin_pt + drawing_width_pt
+        clip_max_y = margin_pt + drawing_height_pt
+    else:
+        clip_min_x = margin_pt if margin_pt > 0 else 0
+        clip_min_y = margin_pt if margin_pt > 0 else 0
+        clip_max_x = clip_min_x + tile_width_pt
+        clip_max_y = clip_min_y + tile_height_pt
 
     path_content = []
     circles = []
@@ -259,14 +316,46 @@ def build_page_content(
         ])
 
     content.append('Q')
-    append_page_guide(content, margin_pt, tile_width_pt, tile_height_pt)
+    if excluded_clip_rects is not None:
+        content.append('q')
+        append_exclusion_clip(
+            content,
+            margin_pt,
+            drawing_width_pt,
+            drawing_height_pt,
+            excluded_clip_rects,
+        )
+        append_page_guide(content, margin_pt, tile_width_pt, tile_height_pt)
+        if page_number == 1:
+            append_scale_marker(content, page_width_pt, page_height_pt, margin_pt)
+        content.append('Q')
+    else:
+        append_page_guide(content, margin_pt, tile_width_pt, tile_height_pt)
+        if page_number == 1:
+            append_scale_marker(content, page_width_pt, page_height_pt, margin_pt)
     if show_page_number:
         append_text(content, page_label, 18, page_height_pt - 78, 48, color=(0.16, 0.24, 0.27))
         footer = f'{paper_label} 100% | {page_label} | {page_number}/{page_count} | plt-guide-v1'
         append_text(content, footer, 28, 12, 8, color=(0.16, 0.24, 0.27))
-    if page_number == 1:
-        append_scale_marker(content, page_width_pt, page_height_pt, margin_pt)
     return '\n'.join(content)
+
+
+def append_exclusion_clip(
+    content,
+    margin_pt,
+    drawing_width_pt,
+    drawing_height_pt,
+    excluded_clip_rects,
+):
+    content.append(
+        f'{fmt(margin_pt)} {fmt(margin_pt)} '
+        f'{fmt(drawing_width_pt)} {fmt(drawing_height_pt)} re'
+    )
+    for clip_x, clip_y, clip_width, clip_height in excluded_clip_rects:
+        content.append(
+            f'{fmt(clip_x)} {fmt(clip_y)} {fmt(clip_width)} {fmt(clip_height)} re'
+        )
+    content.extend(['W*', 'n'])
 
 
 def append_clipped_paths(content, points, min_x, min_y, max_x, max_y):

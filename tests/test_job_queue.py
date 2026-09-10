@@ -11,7 +11,7 @@ from redis.exceptions import RedisError
 
 from app import create_app
 from app.billing import BillingRejected
-from app.routes import safe_uploaded_filename
+from app.routes import parse_render_options, safe_uploaded_filename
 from app.job_queue import (
     JOB_OUTPUT_VERSIONS,
     QueueRejected,
@@ -613,6 +613,15 @@ class JobQueueTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
         self.assertIn('margin_mm', response.get_json()['error'])
+
+    def test_render_options_distinguish_empty_disabled_page_list(self):
+        options = parse_render_options({
+            'enabled_pages': '[0, 1]',
+            'disabled_pages': '[]',
+        })
+
+        self.assertEqual(options['enabled_pages'], [0, 1])
+        self.assertEqual(options['disabled_pages'], [])
 
     def test_pdf_route_strictly_rejects_invalid_crop_options(self):
         app = create_app()
