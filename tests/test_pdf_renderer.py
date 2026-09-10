@@ -75,6 +75,32 @@ class PdfRendererTest(unittest.TestCase):
                 'enabled_pages': [],
             })
 
+    def test_single_page_output_honors_selected_tiled_regions(self):
+        document = parse_plt(
+            b'IN;PU0,0;PD20000,0,20000,5000,0,5000,0,0;'
+        )
+        first_region, first_layout = render_pdf(document, {
+            'paper_size': 'A4',
+            'orientation': 'portrait',
+            'margin_mm': 10,
+            'single_page_output': True,
+            'enabled_pages': [0],
+        })
+        second_region, second_layout = render_pdf(document, {
+            'paper_size': 'A4',
+            'orientation': 'portrait',
+            'margin_mm': 10,
+            'single_page_output': True,
+            'enabled_pages': [1],
+        })
+
+        self.assertNotEqual(
+            self.decoded_streams(first_region),
+            self.decoded_streams(second_region),
+        )
+        self.assertEqual(first_layout['selected_tile_count'], 1)
+        self.assertEqual(second_layout['selected_tile_count'], 1)
+
     def test_clips_segments_to_page_bounds(self):
         self.assertIsNone(clip_segment((-10, -10), (-1, -1), 0, 0, 100, 100))
         self.assertEqual(
