@@ -553,13 +553,18 @@ def parse_render_options(form):
             return default
         return value in {'1', 'true', 'yes', 'on'}
 
-    raw_enabled_pages = form.get('enabled_pages', '')
-    enabled_pages = None
-    if raw_enabled_pages:
+    def page_indexes(name):
+        raw_value = form.get(name, '')
+        if raw_value == '' or raw_value is None:
+            return None
         try:
-            enabled_pages = [int(value) for value in json.loads(raw_enabled_pages)]
+            decoded = json.loads(raw_value)
+            if not isinstance(decoded, list):
+                raise ValueError
+            return [int(value) for value in decoded]
         except (TypeError, ValueError, json.JSONDecodeError):
-            raise ValueError('enabled_pages 参数无效')
+            raise ValueError(f'{name} 参数无效')
+
     return {
         'units_per_inch': parse_units_per_inch(form),
         'paper_size': str(form.get('paper_size', 'A4')).upper(),
@@ -568,7 +573,8 @@ def parse_render_options(form):
         'line_width_mm': number('line_width_mm', 0.265),
         'single_page_output': boolean('single_page_output'),
         'show_page_number': boolean('show_page_number', True),
-        'enabled_pages': enabled_pages,
+        'enabled_pages': page_indexes('enabled_pages'),
+        'disabled_pages': page_indexes('disabled_pages'),
     }
 
 

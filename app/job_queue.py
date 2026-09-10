@@ -16,7 +16,7 @@ from rq.registry import StartedJobRegistry
 TERMINAL_STATUSES = {'done', 'failed', 'cancelled', 'expired'}
 ACTIVE_STATUSES = {'billing_pending', 'queued', 'processing', 'cancelling'}
 JOB_OUTPUT_VERSIONS = {
-    'plt_to_pdf': '3-page-clipped',
+    'plt_to_pdf': '4-single-page-selection',
     'pdf_to_plt': '3-page-cropped',
     'pdf_preview': '2-editor-preview',
 }

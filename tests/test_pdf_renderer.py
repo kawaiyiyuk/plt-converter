@@ -19,6 +19,15 @@ class PdfRendererTest(unittest.TestCase):
         )
         return b'\n'.join(zlib.decompress(stream) for stream in streams)
 
+    @staticmethod
+    def rendered_samples(pdf, scale=0.2):
+        with pymupdf.open(stream=pdf, filetype='pdf') as rendered:
+            pixmap = rendered[0].get_pixmap(
+                matrix=pymupdf.Matrix(scale, scale),
+                alpha=False,
+            )
+            return bytes(pixmap.samples)
+
     def test_renders_tiled_pdf_and_selected_pages(self):
         document = parse_plt(
             b'IN;PU0,0;PD1016,0,1016,2032,0,2032,0,0;'
@@ -95,11 +104,50 @@ class PdfRendererTest(unittest.TestCase):
         })
 
         self.assertNotEqual(
-            self.decoded_streams(first_region),
-            self.decoded_streams(second_region),
+            self.rendered_samples(first_region),
+            self.rendered_samples(second_region),
         )
         self.assertEqual(first_layout['selected_tile_count'], 1)
         self.assertEqual(second_layout['selected_tile_count'], 1)
+
+    def test_single_page_disabled_pages_preserve_unpreviewed_regions(self):
+        document = parse_plt(
+            b'IN;PU0,0;PD76000,0,76000,99720,0,99720,0,0;'
+        )
+        complete, complete_layout = render_pdf(document, {
+            'paper_size': 'A4',
+            'orientation': 'portrait',
+            'margin_mm': 10,
+            'single_page_output': True,
+            'enabled_pages': list(range(80)),
+            'disabled_pages': [],
+        })
+        with_one_removed, removed_layout = render_pdf(document, {
+            'paper_size': 'A4',
+            'orientation': 'portrait',
+            'margin_mm': 10,
+            'single_page_output': True,
+            'enabled_pages': list(range(80)),
+            'disabled_pages': [1],
+        })
+
+        self.assertEqual(complete_layout['tiled_columns'], 10)
+        self.assertEqual(complete_layout['tiled_rows'], 9)
+        self.assertEqual(complete_layout['selected_tile_count'], 90)
+        self.assertEqual(removed_layout['selected_tile_count'], 89)
+        self.assertNotEqual(
+            self.rendered_samples(complete, scale=0.05),
+            self.rendered_samples(with_one_removed, scale=0.05),
+        )
+
+    def test_single_page_rejects_when_disabled_pages_cover_every_region(self):
+        document = parse_plt(b'IN;PU0,0;PD1016,1016;')
+        with self.assertRaisesRegex(ValueError, '至少保留一个输出页面'):
+            render_pdf(document, {
+                'single_page_output': True,
+                'enabled_pages': [0],
+                'disabled_pages': [0],
+            })
 
     def test_clips_segments_to_page_bounds(self):
         self.assertIsNone(clip_segment((-10, -10), (-1, -1), 0, 0, 100, 100))

@@ -25,6 +25,7 @@ def render_pdf(document, options=None):
     single_page = bool(options.get('single_page_output', False))
     show_page_number = bool(options.get('show_page_number', True))
     enabled_pages = options.get('enabled_pages')
+    disabled_pages = options.get('disabled_pages')
     maximum_pages = max(1, int(os.getenv('PLT_MAX_OUTPUT_PAGES', '80')))
     units_per_inch = float(metrics['units_per_inch'])
     scale = MM_TO_PT / 25.4 * 25.4 / units_per_inch
@@ -36,7 +37,7 @@ def render_pdf(document, options=None):
 
     drawing_width_pt = metrics['width_mm'] * MM_TO_PT
     drawing_height_pt = metrics['height_mm'] * MM_TO_PT
-    if enabled_pages is not None and not enabled_pages:
+    if disabled_pages is None and enabled_pages is not None and not enabled_pages:
         raise ValueError('至少保留一个输出页面')
 
     short_mm, long_mm = PAPER_SIZES_MM[paper_size]
@@ -50,40 +51,60 @@ def render_pdf(document, options=None):
     tile_height_pt = max(1, page_height_pt - margin_pt * 2)
     columns = max(1, math.ceil(drawing_width_pt / tile_width_pt))
     rows = max(1, math.ceil(drawing_height_pt / tile_height_pt))
-    all_pages = [
-        {'row': row, 'column': column, 'source_index': row * columns + column}
-        for row in range(rows)
-        for column in range(columns)
-    ]
-    if enabled_pages is not None:
-        enabled = {int(value) for value in enabled_pages}
-        selected_pages = [page for page in all_pages if page['source_index'] in enabled]
-        if not selected_pages:
-            raise ValueError('至少保留一个输出页面')
-        pages = selected_pages
-    else:
-        pages = all_pages
+    tiled_page_count = columns * rows
+
+    def tile_clip_rect(source_index):
+        row, column = divmod(source_index, columns)
+        clip_x = margin_pt + column * tile_width_pt
+        clip_y = margin_pt + max(
+            drawing_height_pt - (row + 1) * tile_height_pt,
+            0,
+        )
+        clip_width = min(
+            tile_width_pt,
+            drawing_width_pt - column * tile_width_pt,
+        )
+        clip_height = min(
+            tile_height_pt,
+            drawing_height_pt - row * tile_height_pt,
+        )
+        if clip_width <= 0 or clip_height <= 0:
+            return None
+        return clip_x, clip_y, clip_width, clip_height
 
     if single_page:
         single_page_width_pt = drawing_width_pt + margin_pt * 2
         single_page_height_pt = drawing_height_pt + margin_pt * 2
-        clip_rects = []
-        for page in pages:
-            clip_x = margin_pt + page['column'] * tile_width_pt
-            clip_y = margin_pt + max(
-                drawing_height_pt - (page['row'] + 1) * tile_height_pt,
-                0,
-            )
-            clip_width = min(
-                tile_width_pt,
-                drawing_width_pt - page['column'] * tile_width_pt,
-            )
-            clip_height = min(
-                tile_height_pt,
-                drawing_height_pt - page['row'] * tile_height_pt,
-            )
-            if clip_width > 0 and clip_height > 0:
-                clip_rects.append((clip_x, clip_y, clip_width, clip_height))
+        clip_rects = None
+        excluded_clip_rects = None
+        if disabled_pages is not None:
+            disabled = {int(value) for value in disabled_pages}
+            if any(index < 0 or index >= tiled_page_count for index in disabled):
+                raise ValueError('disabled_pages 参数无效')
+            selected_tile_count = tiled_page_count - len(disabled)
+            if selected_tile_count <= 0:
+                raise ValueError('至少保留一个输出页面')
+            excluded_clip_rects = [
+                rect
+                for rect in (tile_clip_rect(index) for index in sorted(disabled))
+                if rect is not None
+            ]
+        elif enabled_pages is not None:
+            enabled = {
+                int(value)
+                for value in enabled_pages
+                if 0 <= int(value) < tiled_page_count
+            }
+            clip_rects = [
+                rect
+                for rect in (tile_clip_rect(index) for index in sorted(enabled))
+                if rect is not None
+            ]
+            selected_tile_count = len(clip_rects)
+            if selected_tile_count <= 0:
+                raise ValueError('至少保留一个输出页面')
+        else:
+            selected_tile_count = tiled_page_count
         layout = {
             'type': 'single',
             'paper_size': None,
@@ -96,7 +117,7 @@ def render_pdf(document, options=None):
             'rows': 1,
             'tiled_columns': columns,
             'tiled_rows': rows,
-            'selected_tile_count': len(clip_rects),
+            'selected_tile_count': selected_tile_count,
             'page_count': 1,
             'margin_mm': margin_mm,
         }
@@ -118,12 +139,26 @@ def render_pdf(document, options=None):
             page_label='1-1',
             paper_label='SINGLE',
             clip_rects=clip_rects,
+            excluded_clip_rects=excluded_clip_rects,
         )
         return build_pdf_document(
             [content],
             single_page_width_pt,
             single_page_height_pt,
         ), layout
+
+    all_pages = [
+        {'row': row, 'column': column, 'source_index': row * columns + column}
+        for row in range(rows)
+        for column in range(columns)
+    ]
+    if enabled_pages is not None:
+        enabled = {int(value) for value in enabled_pages}
+        pages = [page for page in all_pages if page['source_index'] in enabled]
+        if not pages:
+            raise ValueError('至少保留一个输出页面')
+    else:
+        pages = all_pages
 
     page_count = len(pages)
     if page_count > maximum_pages:
@@ -184,9 +219,20 @@ def build_page_content(
     page_label='1-1',
     paper_label='A4',
     clip_rects=None,
+    excluded_clip_rects=None,
 ):
     content = ['q']
-    if clip_rects:
+    if excluded_clip_rects is not None:
+        content.append(
+            f'{fmt(margin_pt)} {fmt(margin_pt)} '
+            f'{fmt(drawing_width_pt)} {fmt(drawing_height_pt)} re'
+        )
+        for clip_x, clip_y, clip_width, clip_height in excluded_clip_rects:
+            content.append(
+                f'{fmt(clip_x)} {fmt(clip_y)} {fmt(clip_width)} {fmt(clip_height)} re'
+            )
+        content.extend(['W*', 'n'])
+    elif clip_rects:
         for clip_x, clip_y, clip_width, clip_height in clip_rects:
             content.append(
                 f'{fmt(clip_x)} {fmt(clip_y)} {fmt(clip_width)} {fmt(clip_height)} re'
@@ -206,7 +252,12 @@ def build_page_content(
         '0 0 0 rg',
     ])
 
-    if clip_rects:
+    if excluded_clip_rects is not None:
+        clip_min_x = margin_pt
+        clip_min_y = margin_pt
+        clip_max_x = margin_pt + drawing_width_pt
+        clip_max_y = margin_pt + drawing_height_pt
+    elif clip_rects:
         clip_min_x = min(rect[0] for rect in clip_rects)
         clip_min_y = min(rect[1] for rect in clip_rects)
         clip_max_x = max(rect[0] + rect[2] for rect in clip_rects)
