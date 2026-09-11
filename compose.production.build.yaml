@@ -1,0 +1,12 @@
+services:
+  api:
+    build:
+      context: ${PLT_BUILD_CONTEXT:?Set PLT_BUILD_CONTEXT to a clean Git archive directory}
+      args:
+        PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
+
+  worker:
+    build:
+      context: ${PLT_BUILD_CONTEXT:?Set PLT_BUILD_CONTEXT to a clean Git archive directory}
+      args:
+        PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}

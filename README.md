@@ -84,15 +84,28 @@ docker compose up --build
 cp /opt/plt-converter/.env.production.example /opt/plt-converter/.env.production
 # 设置主后台地址、服务密钥和指标密钥
 
-docker compose \
-  --env-file /opt/plt-converter/.env.production \
-  -f /opt/plt-converter/compose.production.yaml \
-  config
+(
+  set -Eeuo pipefail
+  cd /opt/plt-converter
+  build_context="$(mktemp -d /tmp/plt-converter-build.XXXXXX)"
+  trap 'rm -rf -- "$build_context"' EXIT
+  git pull --ff-only origin main
+  test "$(git rev-parse HEAD)" = "$(git rev-parse refs/remotes/origin/main)"
+  git archive --format=tar HEAD | tar -xf - -C "$build_context"
+  export PLT_BUILD_CONTEXT="$build_context"
 
-docker compose \
-  --env-file /opt/plt-converter/.env.production \
-  -f /opt/plt-converter/compose.production.yaml \
-  up -d --build
+  docker compose \
+    --env-file /opt/plt-converter/.env.production \
+    -f /opt/plt-converter/compose.production.yaml \
+    -f /opt/plt-converter/compose.production.build.yaml \
+    config
+
+  docker compose \
+    --env-file /opt/plt-converter/.env.production \
+    -f /opt/plt-converter/compose.production.yaml \
+    -f /opt/plt-converter/compose.production.build.yaml \
+    up -d --build
+)
 ```
 
 首次部署完成后，后续更新统一使用一键部署脚本：
@@ -102,7 +115,7 @@ cd /opt/plt-converter
 ./scripts/deploy-production.sh
 ```
 
-脚本固定使用 `plt-converter` 项目及本仓库生产配置，会校验端口归属、服务边界和 Redis 状态。新镜像在线构建完成后，脚本会暂停 API 接收新任务，等待旧 Worker 排空队列，再更新容器并执行健康检查及主后台服务密钥验证。部署失败时会使用更新前的 API 和 Worker 镜像自动回滚；不会操作其他 Compose 项目、重建 Redis 或删除数据卷。
+脚本固定使用 `plt-converter` 项目及本仓库生产配置，会要求当前分支为 `main`、工作树没有未提交或未跟踪文件，并确认本地 HEAD 与远端 `origin/main` 完全一致；随后从该 Git 提交生成隔离的临时构建上下文，避免本地忽略文件进入镜像，再校验端口归属、服务边界和 Redis 状态。构建专用配置只在构建镜像时叠加，日常 `ps`、`logs`、`start`、`restart` 等运维命令只需使用 `compose.production.yaml`，无需设置临时构建目录。新镜像在线构建完成后，脚本会暂停 API 接收新任务，等待旧 Worker 排空队列，再更新容器并执行有超时限制的健康检查及主后台服务密钥验证。部署失败、队列等待超时或收到 `INT` / `TERM` 信号时，会尝试重新开放原 API 或恢复更新前的 API 和 Worker 镜像，并重新执行健康检查及主后台连接验证；恢复不完整时会明确报错并要求人工检查。脚本不会操作其他 Compose 项目、重建 Redis 或删除数据卷。
 
 转换 API 只绑定宿主机 `127.0.0.1:8091`，供宿主机 Nginx 反向代理；转换服务 Redis 不开放宿主机端口。
 生产数据卷使用固定名称 `plt_converter_redis_data` 和 `plt_converter_temp`，不会随 Compose 项目名变化。
