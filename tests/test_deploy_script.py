@@ -28,7 +28,13 @@ case "${1:-}" in
     printf 'main\n'
     ;;
   status)
-    if [[ "${GIT_UNTRACKED:-0}" == "1" && "$*" == *"--untracked-files=all"* ]]; then
+    if [[ "${GIT_TRACKED_DIRTY:-0}" == "1" ]]; then
+      printf ' M app/routes.py\n'
+    fi
+    if [[ "${GIT_TRACKED_STAGED:-0}" == "1" ]]; then
+      printf 'A  app/new_module.py\n'
+    fi
+    if [[ "${GIT_UNTRACKED:-0}" == "1" && "$*" != *"--untracked-files=no"* ]]; then
       printf '?? app/local_override.py\n'
     fi
     ;;
@@ -254,11 +260,25 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn("远端 main", result.stderr)
         self.assertNotIn("build api worker", log)
 
-    def test_untracked_files_are_rejected_before_build(self):
+    def test_untracked_files_do_not_block_archived_build(self):
         result, log = self.run_deploy(GIT_UNTRACKED="1")
 
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("git status --porcelain --untracked-files=no", log)
+        self.assertIn("build api worker", log)
+
+    def test_tracked_changes_are_rejected_before_build(self):
+        result, log = self.run_deploy(GIT_TRACKED_DIRTY="1")
+
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("未提交或未跟踪", result.stderr)
+        self.assertIn("已跟踪文件", result.stderr)
+        self.assertNotIn("build api worker", log)
+
+    def test_staged_tracked_files_are_rejected_before_build(self):
+        result, log = self.run_deploy(GIT_TRACKED_STAGED="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("已跟踪文件", result.stderr)
         self.assertNotIn("build api worker", log)
 
     def test_docker_context_excludes_local_secrets_and_python_caches(self):

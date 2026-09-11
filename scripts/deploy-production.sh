@@ -266,7 +266,7 @@ main() {
   [[ -f "$COMPOSE_FILE" ]] || fail "缺少 $COMPOSE_FILE"
   [[ -f "$BUILD_COMPOSE_FILE" ]] || fail "缺少 $BUILD_COMPOSE_FILE"
   [[ "$(git branch --show-current)" == "main" ]] || fail "生产部署必须在 main 分支执行"
-  [[ -z "$(git status --porcelain --untracked-files=all)" ]] || fail "存在未提交或未跟踪文件，请先处理"
+  [[ -z "$(git status --porcelain --untracked-files=no)" ]] || fail "存在已跟踪文件的未提交修改，请先处理"
 
   check_env_variable PLT_METRICS_TOKEN
   check_env_variable WX_BACKEND_URL
