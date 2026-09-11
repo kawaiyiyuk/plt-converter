@@ -26,11 +26,7 @@ x-converter-environment: &converter-environment
 
 services:
   api:
-    image: plt-converter-api:production
-    build:
-      context: .
-      args:
-        PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
+    image: ${PLT_API_IMAGE:-plt-converter-api:production}
     restart: unless-stopped
     environment:
       <<: *converter-environment
@@ -51,11 +47,7 @@ services:
         condition: service_healthy
 
   worker:
-    image: plt-converter-worker:production
-    build:
-      context: .
-      args:
-        PIP_INDEX_URL: ${PLT_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
+    image: ${PLT_WORKER_IMAGE:-plt-converter-worker:production}
     restart: unless-stopped
     command: ["python", "worker.py"]
     environment:
