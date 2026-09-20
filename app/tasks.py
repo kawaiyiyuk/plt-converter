@@ -1,6 +1,7 @@
 import os
 import shutil
 import time
+import math
 from pathlib import Path
 from rq.job import Callback
 from rq.timeouts import JobTimeoutException
@@ -17,7 +18,12 @@ from .job_queue import (
 )
 from .billing import release_conversion
 from .services.pdf_renderer import render_pdf
-from .services.pdf_to_plt import convert_pdf_to_plt, inspect_pdf
+from .services.pdf_layout_optimizer import optimize_pdf_layout
+from .services.pdf_to_plt import (
+    convert_pdf_to_plt,
+    inspect_pdf,
+    read_pdf_layout_metadata,
+)
 from .services.plt_parser import parse_plt
 
 
@@ -243,6 +249,117 @@ def mark_job_stopped(job, connection):
     record_metric('cancelled', connection=connection)
 
 
+def execute_pdf_layout_suggestion(job_id, attempt=None):
+    """Analyze PDF seams outside the HTTP worker and cache the suggestion on the preview."""
+    connection = redis_connection()
+    lock = acquire_job_lock(job_id, connection)
+    try:
+        record = load_job(job_id, connection)
+        if not record or record.get('job_type') != 'pdf_preview':
+            return None
+        result = dict(record.get('result') or {})
+        current_attempt = int(result.get('layout_suggestion_attempt', 0))
+        expected_attempt = current_attempt if attempt is None else int(attempt)
+        if current_attempt != expected_attempt:
+            return None
+        if result.get('layout_suggestion'):
+            return result['layout_suggestion']
+        result.update({
+            'layout_suggestion_status': 'processing',
+            'layout_suggestion_error': None,
+            'layout_suggestion_started_at': time.time(),
+        })
+        update_job(job_id, connection, result=result)
+        input_path = Path(record.get('input_path', ''))
+    finally:
+        lock.release()
+
+    try:
+        if not input_path.exists():
+            raise ValueError('PDF 预览已过期，请重新选择文件')
+        suggestion = optimize_pdf_layout(input_path.read_bytes())
+    except Exception as error:
+        _finish_pdf_layout_suggestion(
+            job_id,
+            connection,
+            expected_attempt=expected_attempt,
+            status='failed',
+            error=str(error) or error.__class__.__name__,
+        )
+        raise
+
+    _finish_pdf_layout_suggestion(
+        job_id,
+        connection,
+        expected_attempt=expected_attempt,
+        status='done',
+        suggestion=suggestion,
+    )
+    return suggestion
+
+
+def _finish_pdf_layout_suggestion(
+    job_id,
+    connection,
+    status,
+    suggestion=None,
+    error=None,
+    expected_attempt=None,
+):
+    lock = acquire_job_lock(job_id, connection)
+    try:
+        record = load_job(job_id, connection)
+        if not record:
+            return None
+        result = dict(record.get('result') or {})
+        if expected_attempt is not None and int(
+            result.get('layout_suggestion_attempt', 0)
+        ) != int(expected_attempt):
+            return record
+        if result.get('layout_suggestion_status') == 'done' and status != 'done':
+            return record
+        result.update({
+            'layout_suggestion_status': status,
+            'layout_suggestion_error': error,
+            'layout_suggestion_finished_at': time.time(),
+        })
+        if suggestion is not None:
+            result['layout_suggestion'] = suggestion
+        return update_job(job_id, connection, result=result)
+    finally:
+        lock.release()
+
+
+def _pdf_layout_job_identity(job):
+    job_id = job.args[0] if job.args else job.id.split(':layout-suggestion:', 1)[0]
+    if len(job.args) > 1:
+        return job_id, int(job.args[1])
+    suffix = job.id.rsplit(':layout-suggestion:', 1)
+    return job_id, int(suffix[1]) if len(suffix) == 2 else None
+
+
+def mark_pdf_layout_suggestion_failed(job, connection, type_, value, traceback):
+    job_id, attempt = _pdf_layout_job_identity(job)
+    _finish_pdf_layout_suggestion(
+        job_id,
+        connection,
+        expected_attempt=attempt,
+        status='failed',
+        error=f'{type_.__name__}: {value}',
+    )
+
+
+def mark_pdf_layout_suggestion_stopped(job, connection):
+    job_id, attempt = _pdf_layout_job_identity(job)
+    _finish_pdf_layout_suggestion(
+        job_id,
+        connection,
+        expected_attempt=attempt,
+        status='failed',
+        error='智能排版分析已停止，请重试',
+    )
+
+
 def _execute(record, connection):
     job_id = record['job_id']
     job_type = record['job_type']
@@ -271,13 +388,30 @@ def _execute(record, connection):
         preview_folder = job_root / 'previews'
         preview_folder.mkdir(parents=True, exist_ok=True)
         pages = inspect_pdf(source, preview_folder, job_id)
-        columns = min(4, max(1, len(pages)))
-        return {
+        embedded_layout = read_pdf_layout_metadata(source)
+        complete_embedded_layout = (
+            embedded_layout
+            if embedded_layout and embedded_layout.get('complete_layout')
+            else None
+        )
+        if complete_embedded_layout:
+            columns = complete_embedded_layout['columns']
+            rows = complete_embedded_layout['rows']
+        else:
+            columns = min(4, max(1, len(pages)))
+            rows = max(1, math.ceil(len(pages) / columns))
+            if rows > 24:
+                columns = min(24, max(columns, math.ceil(len(pages) / 24)))
+                rows = max(1, math.ceil(len(pages) / columns))
+        result = {
             'pages': pages,
             'page_count': len(pages),
-            'rows': max(1, (len(pages) + columns - 1) // columns),
+            'rows': rows,
             'columns': columns,
         }
+        if complete_embedded_layout:
+            result['embedded_layout'] = complete_embedded_layout
+        return result
 
     raise ValueError('不支持的任务类型')
 

@@ -47,7 +47,8 @@ curl -F "file=@sample.plt" http://127.0.0.1:8090/api/v1/plt/preview
 curl -F "file=@sample.pdf" http://127.0.0.1:8090/api/v1/pdf/preview
 curl -F "file=@sample.pdf" \
   -F "rows=5" -F "columns=4" -F "order=row" \
-  -F "margin_mm=0" -F 'page_slots=[0,1,null,3]' \
+  -F "margin_mm=0" -F "output_rotation=90" \
+  -F 'page_slots=[0,1,null,3]' \
   http://127.0.0.1:8090/api/v1/pdf/jobs
 ```
 
@@ -66,7 +67,11 @@ DELETE /api/v1/pdf/jobs/<job_id>
 GET  /api/v1/pdf/previews/<preview_id>/<page>.png
 ```
 
-完成任务后返回 `pdf_path`、`plt_path` 或 `preview_id/pages`。Redis 不可用返回 503；队列、用户容量或限流拒绝返回 429 和 `Retry-After`。`page_slots` 中的 `null` 表示保留空白格。图片 PDF 的降级描边精度不等同于矢量 PDF。
+完成任务后返回 `pdf_path`、`plt_path` 或 `preview_id/pages`。Redis 不可用返回 503；队列、用户容量或限流拒绝返回 429 和 `Retry-After`。`page_slots` 中的 `null` 表示保留空白格；PDF→PLT 的 `output_rotation` 支持 `0/90/180/270`，在裁边和拼版完成后整体顺时针旋转，不影响 PLT→PDF。图片 PDF 的降级描边精度不等同于矢量 PDF。
+
+PDF→PLT 生成结果同样受 `PLT_MAX_PATHS`、`PLT_MAX_COMMANDS`、`PLT_MAX_POINTS` 和 `PLT_MAX_DIMENSION_MM` 约束；超限时任务失败，不返回本服务随后无法重新解析的 PLT。
+
+`GET /api/v1/pdf/preview/jobs/<job_id>/layout-suggestion` 不在 API 请求线程内直接扫描 PDF。首次调用把分析放入 `pdf-layout-analysis` 队列并返回 HTTP 202 / `analyzing`，客户端继续轮询；完成后同一接口返回缓存建议。正式转换和排版分析分别由独立 RQ Worker 消费，两个队列互不等待；健康检查要求两个队列都存在活跃消费者。
 
 ## Docker
 
@@ -74,7 +79,7 @@ GET  /api/v1/pdf/previews/<preview_id>/<page>.png
 docker compose up --build
 ```
 
-默认部署为 1 个 API、1 个 RQ Worker 和 1 个 Redis。转换并发由 Worker 副本数控制；提高副本数前需要同步评估 CPU、内存和队列容量。文件只用于临时处理，不进入缝纫记忆主业务数据库。
+默认部署为 1 个 API、1 个正式转换 Worker、1 个排版分析 Worker 和 1 个 Redis。两个 Worker 各自限制为 1 CPU / 1GB 内存；提高副本数或调整资源限制前，需要同步评估主机 CPU、内存和队列容量。文件只用于临时处理，不进入缝纫记忆主业务数据库。
 
 ### 生产部署
 
@@ -115,7 +120,7 @@ cd /opt/plt-converter
 ./scripts/deploy-production.sh
 ```
 
-脚本固定使用 `plt-converter` 项目及本仓库生产配置，会要求当前分支为 `main`、已跟踪文件没有未提交修改，并确认本地 HEAD 与远端 `origin/main` 完全一致；未跟踪的运维文件可以保留，因为镜像始终从当前 Git 提交生成的隔离临时上下文构建，不会把这些文件带入镜像。随后脚本会校验端口归属、服务边界和 Redis 状态。构建专用配置只在构建镜像时叠加，日常 `ps`、`logs`、`start`、`restart` 等运维命令只需使用 `compose.production.yaml`，无需设置临时构建目录。新镜像在线构建完成后，脚本会暂停 API 接收新任务，等待旧 Worker 排空队列，再更新容器并执行有超时限制的健康检查及主后台服务密钥验证。部署失败、队列等待超时或收到 `INT` / `TERM` 信号时，会尝试重新开放原 API 或恢复更新前的 API 和 Worker 镜像，并重新执行健康检查及主后台连接验证；恢复不完整时会明确报错并要求人工检查。脚本不会操作其他 Compose 项目、重建 Redis 或删除数据卷。
+脚本固定使用 `plt-converter` 项目及本仓库生产配置，会要求当前分支为 `main`、已跟踪文件没有未提交修改，并确认本地 HEAD 与远端 `origin/main` 完全一致；未跟踪的运维文件可以保留，因为镜像始终从当前 Git 提交生成的隔离临时上下文构建，不会把这些文件带入镜像。随后脚本会校验端口归属、服务边界和 Redis 状态。构建专用配置只在构建镜像时叠加，日常 `ps`、`logs`、`start`、`restart` 等运维命令只需使用 `compose.production.yaml`，无需设置临时构建目录。新镜像在线构建完成后，脚本会暂停 API 接收新任务，等待正式转换与排版分析两个队列全部排空，再更新 API、正式转换 Worker 和排版分析 Worker，并执行有超时限制的健康检查及主后台服务密钥验证。部署失败、队列等待超时或收到 `INT` / `TERM` 信号时，会尝试重新开放原 API 或恢复更新前的 API 和 Worker 镜像；若上一版还没有独立排版 Worker，回滚会移除本次新增的排版 Worker。恢复后重新执行健康检查及主后台连接验证，恢复不完整时会明确报错并要求人工检查。脚本不会操作其他 Compose 项目、重建 Redis 或删除数据卷。
 
 转换 API 只绑定宿主机 `127.0.0.1:8091`，供宿主机 Nginx 反向代理；转换服务 Redis 不开放宿主机端口。
 生产数据卷使用固定名称 `plt_converter_redis_data` 和 `plt_converter_temp`，不会随 Compose 项目名变化。
@@ -131,6 +136,13 @@ PLT_RATE_LIMIT_PER_MINUTE=3
 PLT_PREVIEW_RATE_LIMIT_PER_MINUTE=12
 PLT_UPLOAD_RATE_LIMIT_PER_MINUTE=10
 PLT_UPLOAD_IP_RATE_LIMIT_PER_MINUTE=30
+PDF_LAYOUT_OPTIMIZE_RATE_LIMIT_PER_MINUTE=6
+PDF_LAYOUT_QUEUE_NAME=pdf-layout-analysis
+PDF_LAYOUT_QUEUE_MAX_PENDING=20
+PDF_LAYOUT_OPTIMIZER_TIMEOUT_SECONDS=90
+PDF_LAYOUT_OPTIMIZER_MAX_CROP_MM=15
+PDF_LAYOUT_OPTIMIZER_CROP_STEP_MM=0.1
+PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS=4
 PLT_USER_MAX_ACTIVE_JOBS=2
 PLT_MAX_UPLOAD_MB=20
 PLT_MAX_POINTS=500000
@@ -147,16 +159,13 @@ WX_BACKEND_URL=https://api.fengrenjiyi.com
 CONVERSION_SERVICE_TOKEN=<与主后台相同的服务密钥>
 ```
 
-健康检查为 `/health`、`/health/redis`、`/health/worker`。指标接口为 `/api/v1/plt/metrics` 和 `/api/v1/pdf/metrics`；未设置 `PLT_METRICS_TOKEN` 时接口不启用，启用后请求必须携带 `X-Metrics-Token`。Redis 使用 128MB、AOF 和 `noeviction`，内存写满时会明确拒绝新任务，因此生产监控应同时关注 Redis 内存、接口 503 和队列拒绝数。
+健康检查为 `/health`、`/health/redis`、`/health/worker`；总健康状态和 Worker 健康状态都要求正式转换、排版分析两个队列各有活跃消费者。指标接口为 `/api/v1/plt/metrics` 和 `/api/v1/pdf/metrics`；未设置 `PLT_METRICS_TOKEN` 时接口不启用，启用后请求必须携带 `X-Metrics-Token`。Redis 使用 128MB、AOF 和 `noeviction`，内存写满时会明确拒绝新任务，因此生产监控应同时关注 Redis 内存、接口 503 和队列拒绝数。
 
 ## 验证
 
 ```bash
-PYTHONPATH=. .venv/bin/python tests/test_metadata.py
-PYTHONPATH=. .venv/bin/python tests/test_pdf_renderer.py
-PYTHONPATH=. .venv/bin/python tests/test_job_queue.py
-PYTHONPATH=. .venv/bin/python tests/test_plt_parser_limits.py
-PYTHONPATH=. .venv/bin/python tests/test_pdf_options.py
-PYTHONPYCACHEPREFIX=/tmp/plt-converter-pycache python3 -m py_compile app/*.py app/services/*.py worker.py
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+.venv/bin/python -m compileall -q app worker.py
+bash -n scripts/deploy-production.sh
 docker compose config
 ```

@@ -2,6 +2,8 @@ import math
 import os
 import zlib
 
+from .pdf_metadata import encode_pdf_layout_metadata
+
 
 MM_TO_PT = 72 / 25.4
 PAPER_SIZES_MM = {
@@ -125,10 +127,20 @@ def render_pdf(document, options=None):
             paper_label='SINGLE',
             excluded_clip_rects=excluded_clip_rects,
         )
+        embedded_layout = build_roundtrip_layout_metadata(
+            rows=1,
+            columns=1,
+            page_slots=[0],
+            margin_mm=margin_mm,
+            metrics=metrics,
+            complete_layout=excluded_clip_rects is None,
+        )
+        layout['embedded_layout'] = embedded_layout
         return build_pdf_document(
             [content],
             single_page_width_pt,
             single_page_height_pt,
+            embedded_layout,
         ), layout
 
     all_pages = [
@@ -182,7 +194,54 @@ def render_pdf(document, options=None):
             page_label=f"{page['row'] + 1}-{page['column'] + 1}",
             paper_label=paper_size,
         ))
-    return build_pdf_document(page_contents, page_width_pt, page_height_pt), layout
+    output_index_by_source = {
+        page['source_index']: output_index
+        for output_index, page in enumerate(pages)
+    }
+    embedded_layout = build_roundtrip_layout_metadata(
+        rows=rows,
+        columns=columns,
+        page_slots=[
+            output_index_by_source.get(source_index)
+            for source_index in range(tiled_page_count)
+        ],
+        margin_mm=margin_mm,
+        metrics=metrics,
+        complete_layout=page_count == tiled_page_count,
+    )
+    layout['embedded_layout'] = embedded_layout
+    return build_pdf_document(
+        page_contents,
+        page_width_pt,
+        page_height_pt,
+        embedded_layout,
+    ), layout
+
+
+def build_roundtrip_layout_metadata(
+    rows,
+    columns,
+    page_slots,
+    margin_mm,
+    metrics,
+    complete_layout,
+):
+    return {
+        'version': 1,
+        'rows': rows,
+        'columns': columns,
+        'order': 'row',
+        'page_slots': page_slots,
+        'crop_margins_mm': {
+            'top': float(margin_mm),
+            'right': float(margin_mm),
+            'bottom': float(margin_mm),
+            'left': float(margin_mm),
+        },
+        'drawing_width_mm': float(metrics['width_mm']),
+        'drawing_height_mm': float(metrics['height_mm']),
+        'complete_layout': bool(complete_layout),
+    }
 
 
 def build_page_content(
@@ -470,14 +529,14 @@ def append_scale_marker(content, page_width_pt, page_height_pt, margin_pt):
 
 
 def append_text(content, text, x, y, font_size, color=(0, 0, 0)):
-    encoded_text = utf16be_hex(text)
+    encoded_text = pdf_ascii_hex(text)
     if not encoded_text:
         return
     content.extend([
         'q',
         f'{fmt(color[0])} {fmt(color[1])} {fmt(color[2])} rg',
         'BT',
-        f'/F1 {fmt(font_size)} Tf',
+        f'/F2 {fmt(font_size)} Tf',
         f'1 0 0 1 {fmt(x)} {fmt(y)} Tm',
         f'<{encoded_text}> Tj',
         'ET',
@@ -485,18 +544,27 @@ def append_text(content, text, x, y, font_size, color=(0, 0, 0)):
     ])
 
 
-def build_pdf_document(page_contents, page_width_pt, page_height_pt):
+def build_pdf_document(page_contents, page_width_pt, page_height_pt, layout_metadata=None):
     objects = [None]
-    cid_font = add_object(
+    text_shape_font = None
+    if any('/F1 ' in content for content in page_contents):
+        cid_font = add_object(
+            objects,
+            '<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light '
+            '/CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> /DW 1000 >>',
+        )
+        text_shape_font = add_object(
+            objects,
+            f'<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light '
+            f'/Encoding /UniGB-UCS2-H /DescendantFonts [{cid_font} 0 R] >>',
+        )
+    auxiliary_font = add_object(
         objects,
-        '<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light '
-        '/CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> /DW 1000 >>',
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>',
     )
-    font = add_object(
-        objects,
-        f'<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light '
-        f'/Encoding /UniGB-UCS2-H /DescendantFonts [{cid_font} 0 R] >>',
-    )
+    font_resources = f'/F2 {auxiliary_font} 0 R'
+    if text_shape_font:
+        font_resources += f' /F1 {text_shape_font} 0 R'
     pages_object = add_object(objects, '')
     page_objects = []
     for content in page_contents:
@@ -505,7 +573,7 @@ def build_pdf_document(page_contents, page_width_pt, page_height_pt):
             objects,
             f'<< /Type /Page /Parent {pages_object} 0 R '
             f'/MediaBox [0 0 {fmt(page_width_pt)} {fmt(page_height_pt)}] '
-            f'/Resources << /Font << /F1 {font} 0 R >> >> '
+            f'/Resources << /Font << {font_resources} >> >> '
             f'/Contents {content_object} 0 R >>',
         )
         page_objects.append(page_object)
@@ -514,7 +582,16 @@ def build_pdf_document(page_contents, page_width_pt, page_height_pt):
         f'/Count {len(page_objects)} >>'
     )
     catalog = add_object(objects, f'<< /Type /Catalog /Pages {pages_object} 0 R >>')
-    return build_pdf(objects, catalog)
+    info = None
+    if layout_metadata:
+        subject = encode_pdf_layout_metadata(layout_metadata)
+        info = add_object(
+            objects,
+            '<< /Producer (Fengrenjiyi PLT Converter) '
+            '/Creator (Fengrenjiyi) '
+            f'/Subject ({escape_pdf_string(subject)}) >>',
+        )
+    return build_pdf(objects, catalog, info)
 
 
 def stream_object(content):
@@ -531,7 +608,7 @@ def add_object(objects, content):
     return len(objects) - 1
 
 
-def build_pdf(objects, catalog):
+def build_pdf(objects, catalog, info=None):
     chunks = [b'%PDF-1.4\n']
     offsets = [0]
     offset = len(chunks[0])
@@ -546,8 +623,9 @@ def build_pdf(objects, catalog):
     xref_offset = offset
     xref = f'xref\n0 {len(objects)}\n0000000000 65535 f \n'
     xref += ''.join(f'{item:010d} 00000 n \n' for item in offsets[1:])
+    info_reference = f' /Info {info} 0 R' if info else ''
     trailer = (
-        f'trailer\n<< /Size {len(objects)} /Root {catalog} 0 R >>\n'
+        f'trailer\n<< /Size {len(objects)} /Root {catalog} 0 R{info_reference} >>\n'
         f'startxref\n{xref_offset}\n%%EOF\n'
     )
     return b''.join(chunks + [xref.encode('ascii'), trailer.encode('ascii')])
@@ -555,6 +633,10 @@ def build_pdf(objects, catalog):
 
 def utf16be_hex(text):
     return str(text).encode('utf-16-be').hex().upper()
+
+
+def pdf_ascii_hex(text):
+    return str(text).encode('latin-1', errors='replace').hex().upper()
 
 
 def escape_pdf_string(text):

@@ -14,10 +14,12 @@ from .job_queue import (
     cancel_job,
     confirm_job_billing,
     enforce_rate_limit,
+    enqueue_pdf_layout_suggestion,
     load_job,
     queue_position,
     redis_connection,
     submit_job,
+    update_job,
 )
 from redis.exceptions import RedisError
 
@@ -419,6 +421,67 @@ def get_pdf_preview_job(job_id):
     return jsonify({'error': '任务不存在或已过期'}), 404
 
 
+@pdf_bp.get('/preview/jobs/<job_id>/layout-suggestion')
+def get_pdf_layout_suggestion(job_id):
+    """Analyze the already uploaded preview PDF without billing or converting it."""
+    record = load_job(job_id)
+    if not record or (
+        record.get('job_type') != 'pdf_preview'
+        or record.get('user_key') != request_user_key()
+    ):
+        return jsonify({'error': '任务不存在或已过期'}), 404
+    if record.get('status') != 'done':
+        return jsonify({'error': 'PDF 预览尚未完成，请稍后再试'}), 409
+    input_path = Path(record.get('input_path', ''))
+    if not input_path.exists():
+        return jsonify({'error': 'PDF 预览已过期，请重新选择文件'}), 404
+    result = dict(record.get('result') or {})
+    cached_suggestion = result.get('layout_suggestion')
+    try:
+        if not cached_suggestion:
+            record = enqueue_pdf_layout_suggestion(
+                job_id,
+                request_user_key(),
+                retry_failed=request.args.get('retry') == '1',
+            )
+            result = dict(record.get('result') or {})
+            cached_suggestion = result.get('layout_suggestion')
+    except RedisError as error:
+        return redis_unavailable(error)
+    except QueueRejected as error:
+        return queue_error(error)
+    except PermissionError as error:
+        return jsonify({'error': str(error)}), 403
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 422
+    if not cached_suggestion:
+        if result.get('layout_suggestion_status') == 'failed':
+            return jsonify({
+                'status': 'analysis_failed',
+                'error': result.get('layout_suggestion_error') or '智能排版分析失败，请重试',
+            }), 422
+        return jsonify({'status': 'analyzing'}), 202
+    suggestion = cached_suggestion
+    if suggestion.get('confidence') == 'low':
+        return jsonify({
+            'status': 'insufficient_evidence',
+            'reason': suggestion.get('reason') or '没有找到足够可靠的跨页接缝',
+            'analysis': {
+                key: suggestion.get(key)
+                for key in (
+                    'confidence',
+                    'confidence_score',
+                    'seam_evidence',
+                    'matched_seams',
+                    'perfect_seams',
+                    'zero_seams',
+                    'layout_ambiguous',
+                )
+            },
+        })
+    return jsonify({'status': 'suggestion_ready', 'suggestion': suggestion})
+
+
 @pdf_bp.delete('/preview/jobs/<job_id>')
 def cancel_pdf_preview_job(job_id):
     """只允许提交预览的客户端取消对应 PDF 预览任务。"""
@@ -615,6 +678,13 @@ def parse_pdf_render_options(form):
             ]
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise ValueError('page_slots 参数无效') from error
+    raw_output_rotation = form.get('output_rotation', 0)
+    try:
+        output_rotation = int(raw_output_rotation)
+    except (TypeError, ValueError) as error:
+        raise ValueError('output_rotation 参数无效') from error
+    if output_rotation not in {0, 90, 180, 270}:
+        raise ValueError('output_rotation 只支持 0、90、180、270')
     return {
         'units_per_inch': parse_units_per_inch(form),
         'rows': max(1, min(24, int(number('rows', 1)))),
@@ -628,4 +698,5 @@ def parse_pdf_render_options(form):
         'line_width_mm': number('line_width_mm', 0.265),
         'enabled_pages': enabled_pages,
         'page_slots': page_slots,
+        'output_rotation': output_rotation,
     }

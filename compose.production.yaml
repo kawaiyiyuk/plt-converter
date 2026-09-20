@@ -11,6 +11,13 @@ x-converter-environment: &converter-environment
   PLT_PREVIEW_RATE_LIMIT_PER_MINUTE: 12
   PLT_UPLOAD_RATE_LIMIT_PER_MINUTE: 10
   PLT_UPLOAD_IP_RATE_LIMIT_PER_MINUTE: 30
+  PDF_LAYOUT_OPTIMIZE_RATE_LIMIT_PER_MINUTE: 6
+  PDF_LAYOUT_QUEUE_NAME: pdf-layout-analysis
+  PDF_LAYOUT_QUEUE_MAX_PENDING: 20
+  PDF_LAYOUT_OPTIMIZER_TIMEOUT_SECONDS: 90
+  PDF_LAYOUT_OPTIMIZER_MAX_CROP_MM: 15
+  PDF_LAYOUT_OPTIMIZER_CROP_STEP_MM: 0.1
+  PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS: 4
   PLT_USER_MAX_ACTIVE_JOBS: 2
   PLT_MAX_POINTS: 500000
   PLT_MAX_PATHS: 100000
@@ -52,6 +59,22 @@ services:
     command: ["python", "worker.py"]
     environment:
       <<: *converter-environment
+      PLT_WORKER_ROLE: conversion
+    volumes:
+      - temp_data:/tmp/plt-converter
+    mem_limit: 1g
+    cpus: 1.0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  layout-worker:
+    image: ${PLT_WORKER_IMAGE:-plt-converter-worker:production}
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    environment:
+      <<: *converter-environment
+      PLT_WORKER_ROLE: layout
     volumes:
       - temp_data:/tmp/plt-converter
     mem_limit: 1g
