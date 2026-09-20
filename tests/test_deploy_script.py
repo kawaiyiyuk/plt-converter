@@ -81,7 +81,7 @@ args="$*"
 if [[ "${1:-}" == "compose" ]]; then
   case "$args" in
     *"config --services")
-      printf 'api\nredis\nworker\n'
+      printf 'api\nlayout-worker\nredis\nworker\n'
       ;;
     *"config --quiet")
       ;;
@@ -93,6 +93,11 @@ if [[ "${1:-}" == "compose" ]]; then
       ;;
     *"ps -q worker")
       printf 'worker-id\n'
+      ;;
+    *"ps -q layout-worker")
+      if [[ "${LAYOUT_WORKER_EXISTS:-0}" == "1" ]]; then
+        printf 'layout-worker-id\n'
+      fi
       ;;
     *"build api worker")
       printf 'build-context %s\n' "${PLT_BUILD_CONTEXT:-}" >> "$DEPLOY_TEST_LOG"
@@ -150,6 +155,7 @@ case "${1:-}" in
       case "${2:-}" in
         api-id) printf 'old-api-image\n' ;;
         worker-id) printf 'old-worker-image\n' ;;
+        layout-worker-id) printf 'old-worker-image\n' ;;
       esac
     elif [[ "${2:-}" == "redis-id" ]]; then
       printf 'healthy\n'
@@ -306,6 +312,28 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn("自动恢复未完成", result.stderr)
         self.assertNotIn("自动恢复完成。", result.stderr)
 
+    def test_rollback_removes_layout_worker_when_previous_release_had_none(self):
+        result, log = self.run_deploy(BACKEND_VERIFY_FAIL="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rm -sf layout-worker", log)
+        up_calls = [line for line in log.splitlines() if " up -d " in line]
+        self.assertGreaterEqual(len(up_calls), 2)
+        self.assertIn("layout-worker", up_calls[0])
+        self.assertNotIn("layout-worker", up_calls[-1])
+
+    def test_rollback_restores_layout_worker_when_previous_release_had_one(self):
+        result, log = self.run_deploy(
+            BACKEND_VERIFY_FAIL="1",
+            LAYOUT_WORKER_EXISTS="1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("rm -sf layout-worker", log)
+        up_calls = [line for line in log.splitlines() if " up -d " in line]
+        self.assertGreaterEqual(len(up_calls), 2)
+        self.assertIn("layout-worker", up_calls[-1])
+
     def test_build_uses_an_archived_git_context(self):
         result, log = self.run_deploy()
 
@@ -327,6 +355,19 @@ class DeployScriptTest(unittest.TestCase):
         self.assertNotIn("build:", compose)
         self.assertIn("${PLT_BUILD_CONTEXT:?", build_compose)
         self.assertIn("git archive --format=tar HEAD", readme)
+
+    def test_compose_runs_layout_analysis_in_a_dedicated_worker(self):
+        development_compose = (PROJECT_ROOT / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        production_compose = (PROJECT_ROOT / "compose.production.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        for compose in (development_compose, production_compose):
+            self.assertIn("layout-worker:", compose)
+            self.assertIn("PLT_WORKER_ROLE: conversion", compose)
+            self.assertIn("PLT_WORKER_ROLE: layout", compose)
 
     def test_initial_deploy_enters_the_target_repository_before_git_commands(self):
         readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
@@ -371,6 +412,7 @@ class DeployScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("build api worker", log)
         self.assertIn("up -d", log)
+        self.assertIn("api worker layout-worker", log)
         self.assertIn("/health/worker", log)
 
 

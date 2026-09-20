@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,7 +12,7 @@ from redis.exceptions import RedisError
 
 from app import create_app
 from app.billing import BillingRejected
-from app.routes import parse_render_options, safe_uploaded_filename
+from app.routes import parse_pdf_render_options, parse_render_options, safe_uploaded_filename
 from app.job_queue import (
     JOB_OUTPUT_VERSIONS,
     QueueRejected,
@@ -22,7 +23,13 @@ from app.job_queue import (
     queue_position,
     submit_job,
 )
-from app.tasks import execute_job, mark_job_failed, mark_job_stopped
+from app.tasks import (
+    _execute,
+    execute_job,
+    execute_pdf_layout_suggestion,
+    mark_job_failed,
+    mark_job_stopped,
+)
 
 
 class MemoryLock:
@@ -306,6 +313,98 @@ class JobQueueTest(unittest.TestCase):
 
         self.assertGreaterEqual(ttl, 399)
 
+    def test_layout_analysis_ttl_covers_its_background_queue_wait(self):
+        with patch.dict(os.environ, {
+            'PLT_JOB_RETENTION_SECONDS': '60',
+            'PLT_QUEUE_MAX_PENDING': '1',
+            'PLT_JOB_TIMEOUT_SECONDS': '10',
+            'PDF_LAYOUT_QUEUE_MAX_PENDING': '7',
+            'PDF_LAYOUT_OPTIMIZER_TIMEOUT_SECONDS': '11',
+        }):
+            record = self.submit()
+            record['status'] = 'done'
+            record['result'] = {'layout_suggestion_status': 'queued'}
+            from app.job_queue import save_job
+            save_job(record, self.redis)
+            ttl = self.redis.ttl(f"plt-converter:job:{record['job_id']}")
+
+        self.assertGreaterEqual(ttl, 453)
+
+    def test_conversion_and_layout_workers_consume_isolated_queues(self):
+        import worker
+
+        with patch.dict(os.environ, {'PLT_WORKER_ROLE': 'conversion'}):
+            conversion_queues = worker.worker_queues(self.redis)
+        with patch.dict(os.environ, {'PLT_WORKER_ROLE': 'layout'}):
+            layout_queues = worker.worker_queues(self.redis)
+
+        self.assertEqual([queue.name for queue in conversion_queues], ['conversions'])
+        self.assertEqual(
+            [queue.name for queue in layout_queues],
+            ['pdf-layout-analysis'],
+        )
+
+    def test_worker_health_requires_both_conversion_and_layout_consumers(self):
+        from rq import Queue
+
+        conversion_worker = SimpleNamespace(
+            queues=[Queue('conversions', connection=self.redis)]
+        )
+        layout_worker = SimpleNamespace(
+            queues=[Queue('pdf-layout-analysis', connection=self.redis)]
+        )
+        combined_worker = SimpleNamespace(
+            queues=[
+                Queue('conversions', connection=self.redis),
+                Queue('pdf-layout-analysis', connection=self.redis),
+            ]
+        )
+        app = create_app()
+
+        with patch('app.redis_connection', return_value=self.redis), \
+                patch('rq.Worker.all', return_value=[conversion_worker]):
+            missing_layout = app.test_client().get('/health/worker')
+        with patch('app.redis_connection', return_value=self.redis), \
+                patch('rq.Worker.all', return_value=[combined_worker]):
+            shared_consumer = app.test_client().get('/health/worker')
+        with patch.dict(os.environ, {'PDF_LAYOUT_QUEUE_NAME': 'conversions'}), \
+                patch('app.redis_connection', return_value=self.redis), \
+                patch('rq.Worker.all', return_value=[conversion_worker]):
+            overlapping_queue_names = app.test_client().get('/health/worker')
+        with patch('app.redis_connection', return_value=self.redis), \
+                patch('rq.Worker.all', return_value=[conversion_worker, layout_worker]):
+            complete = app.test_client().get('/health/worker')
+
+        self.assertEqual(missing_layout.status_code, 503)
+        self.assertEqual(shared_consumer.status_code, 503)
+        self.assertEqual(overlapping_queue_names.status_code, 503)
+        self.assertEqual(complete.status_code, 200)
+
+    def test_cleanup_preserves_old_preview_folder_while_layout_analysis_is_active(self):
+        record = submit_job(
+            'pdf_preview',
+            b'%PDF preview source',
+            'sample.pdf',
+            {},
+            'user-a',
+            connection=self.redis,
+        )
+        job_folder = Path(record['input_path']).parent
+        old_time = time.time() - 400
+        os.utime(job_folder, (old_time, old_time))
+        from app.job_queue import update_job
+        update_job(
+            record['job_id'],
+            self.redis,
+            status='done',
+            finished_at=old_time,
+            result={'pages': [], 'layout_suggestion_status': 'queued'},
+        )
+
+        cleanup_expired_job_files(self.redis)
+
+        self.assertTrue(job_folder.exists())
+
     def test_active_job_update_refreshes_user_capacity_ttl(self):
         record = self.submit()
         key = 'plt-converter:user-jobs:user-a'
@@ -413,6 +512,133 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(allowed.get_json()['status'], 'preview_ready')
         self.assertEqual(denied.status_code, 404)
 
+    def test_pdf_layout_suggestion_reuses_owned_preview_without_billing(self):
+        record = submit_job(
+            'pdf_preview',
+            b'%PDF preview source',
+            'sample.pdf',
+            {},
+            'user-a',
+            connection=self.redis,
+        )
+        completed = load_job(record['job_id'], self.redis)
+        completed['status'] = 'done'
+        completed['result'] = {'pages': [{'index': index} for index in range(24)]}
+        from app.job_queue import save_job
+        save_job(completed, self.redis)
+        expected = {
+            'status': 'suggestion_ready',
+            'suggestion': {
+                'rows': 8,
+                'columns': 3,
+                'order': 'column',
+                'page_slots': list(range(24)),
+                'crop_margins_mm': {'top': 5, 'right': 5, 'bottom': 5, 'left': 5},
+                'output_rotation': 0,
+                'confidence': 'high',
+            },
+        }
+
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch(
+                    'app.tasks.optimize_pdf_layout',
+                    return_value=expected['suggestion'],
+                ) as optimize:
+            client = app.test_client()
+            queued = client.get(
+                f"/api/v1/pdf/preview/jobs/{record['job_id']}/layout-suggestion",
+                headers={'X-Client-Key': 'user-a'},
+            )
+            analyzing = client.get(
+                f"/api/v1/pdf/preview/jobs/{record['job_id']}/layout-suggestion",
+                headers={'X-Client-Key': 'user-a'},
+            )
+            execute_pdf_layout_suggestion(record['job_id'])
+            cached = client.get(
+                f"/api/v1/pdf/preview/jobs/{record['job_id']}/layout-suggestion",
+                headers={'X-Client-Key': 'user-a'},
+            )
+            denied = client.get(
+                f"/api/v1/pdf/preview/jobs/{record['job_id']}/layout-suggestion",
+                headers={'X-Client-Key': 'user-b'},
+            )
+
+        self.assertEqual(queued.status_code, 202)
+        self.assertEqual(queued.get_json()['status'], 'analyzing')
+        self.assertEqual(analyzing.status_code, 202)
+        self.assertEqual(self.redis.llen('rq:queue:pdf-layout-analysis'), 1)
+        self.assertEqual(cached.get_json(), expected)
+        self.assertEqual(denied.status_code, 404)
+        optimize.assert_called_once_with(b'%PDF preview source')
+
+    def test_pdf_layout_suggestion_rejects_when_analysis_queue_is_full(self):
+        from app.job_queue import enqueue_pdf_layout_suggestion, save_job
+
+        previews = []
+        for index, user in enumerate(('user-a', 'user-b')):
+            record = submit_job(
+                'pdf_preview',
+                f'%PDF preview {index}'.encode(),
+                f'sample-{index}.pdf',
+                {},
+                user,
+                connection=self.redis,
+            )
+            completed = load_job(record['job_id'], self.redis)
+            completed['status'] = 'done'
+            completed['finished_at'] = time.time()
+            completed['result'] = {'pages': [{'index': 0}]}
+            save_job(completed, self.redis)
+            previews.append((completed, user))
+
+        with patch.dict(os.environ, {'PDF_LAYOUT_QUEUE_MAX_PENDING': '1'}):
+            enqueue_pdf_layout_suggestion(
+                previews[0][0]['job_id'], previews[0][1], self.redis
+            )
+            with self.assertRaisesRegex(QueueRejected, '智能排版任务已排满'):
+                enqueue_pdf_layout_suggestion(
+                    previews[1][0]['job_id'], previews[1][1], self.redis
+                )
+
+    def test_stale_layout_failure_callback_does_not_overwrite_new_attempt(self):
+        from app.job_queue import save_job
+        from app.tasks import mark_pdf_layout_suggestion_failed
+
+        record = submit_job(
+            'pdf_preview',
+            b'%PDF preview source',
+            'sample.pdf',
+            {},
+            'user-a',
+            connection=self.redis,
+        )
+        record['status'] = 'done'
+        record['result'] = {
+            'pages': [{'index': 0}],
+            'layout_suggestion_status': 'queued',
+            'layout_suggestion_attempt': 2,
+        }
+        save_job(record, self.redis)
+
+        stale_job = type('Job', (), {
+            'args': (record['job_id'], 1),
+            'id': f"{record['job_id']}:layout-suggestion:1",
+        })()
+        mark_pdf_layout_suggestion_failed(
+            stale_job,
+            self.redis,
+            RuntimeError,
+            RuntimeError('old failure'),
+            None,
+        )
+
+        refreshed = load_job(record['job_id'], self.redis)
+        self.assertEqual(refreshed['result']['layout_suggestion_status'], 'queued')
+        self.assertEqual(refreshed['result']['layout_suggestion_attempt'], 2)
+
     def test_pdf_preview_cancel_route_uses_client_owner_and_rejects_formal_jobs(self):
         allowed_preview = submit_job(
             'pdf_preview',
@@ -471,8 +697,97 @@ class JobQueueTest(unittest.TestCase):
                 headers={'X-Client-Key': 'preview-owner'},
             )
 
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.get_json()['status'], 'unavailable')
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.get_json()['status'], 'unavailable')
+
+    def test_pdf_preview_exposes_embedded_roundtrip_layout(self):
+        source = Path(self.temp_dir.name) / 'embedded-layout.pdf'
+        source.write_bytes(b'%PDF generated')
+        embedded_layout = {
+            'version': 1,
+            'rows': 4,
+            'columns': 3,
+            'order': 'row',
+            'page_slots': list(range(12)),
+            'crop_margins_mm': {
+                'top': 10.0,
+                'right': 10.0,
+                'bottom': 10.0,
+                'left': 10.0,
+            },
+            'drawing_width_mm': 663.15,
+            'drawing_height_mm': 1508.15,
+            'complete_layout': True,
+        }
+        pages = [{'index': index} for index in range(12)]
+
+        with patch('app.tasks.update_job'), \
+                patch('app.tasks.inspect_pdf', return_value=pages), \
+                patch('app.tasks.read_pdf_layout_metadata', return_value=embedded_layout):
+            result = _execute({
+                'job_id': 'preview-layout',
+                'job_type': 'pdf_preview',
+                'input_path': str(source),
+                'options': {},
+            }, self.redis)
+
+        self.assertEqual(result['rows'], 4)
+        self.assertEqual(result['columns'], 3)
+        self.assertEqual(result['embedded_layout'], embedded_layout)
+
+    def test_pdf_preview_does_not_expose_incomplete_roundtrip_layout(self):
+        source = Path(self.temp_dir.name) / 'incomplete-layout.pdf'
+        source.write_bytes(b'%PDF generated')
+        embedded_layout = {
+            'version': 1,
+            'rows': 5,
+            'columns': 7,
+            'order': 'row',
+            'page_slots': [0, 1] + [None] * 33,
+            'crop_margins_mm': {
+                'top': 10.0,
+                'right': 10.0,
+                'bottom': 10.0,
+                'left': 10.0,
+            },
+            'drawing_width_mm': 1000.0,
+            'drawing_height_mm': 1000.0,
+            'complete_layout': False,
+        }
+        pages = [{'index': 0}, {'index': 1}]
+
+        with patch('app.tasks.update_job'), \
+                patch('app.tasks.inspect_pdf', return_value=pages), \
+                patch('app.tasks.read_pdf_layout_metadata', return_value=embedded_layout):
+            result = _execute({
+                'job_id': 'preview-incomplete-layout',
+                'job_type': 'pdf_preview',
+                'input_path': str(source),
+                'options': {},
+            }, self.redis)
+
+        self.assertEqual(result['rows'], 1)
+        self.assertEqual(result['columns'], 2)
+        self.assertNotIn('embedded_layout', result)
+
+    def test_large_pdf_preview_default_grid_stays_within_conversion_limits(self):
+        source = Path(self.temp_dir.name) / 'large-preview.pdf'
+        source.write_bytes(b'%PDF generated')
+        pages = [{'index': index} for index in range(200)]
+
+        with patch('app.tasks.update_job'), \
+                patch('app.tasks.inspect_pdf', return_value=pages), \
+                patch('app.tasks.read_pdf_layout_metadata', return_value=None):
+            result = _execute({
+                'job_id': 'large-preview-layout',
+                'job_type': 'pdf_preview',
+                'input_path': str(source),
+                'options': {},
+            }, self.redis)
+
+        self.assertLessEqual(result['rows'], 24)
+        self.assertLessEqual(result['columns'], 24)
+        self.assertGreaterEqual(result['rows'] * result['columns'], len(pages))
 
     def test_pdf_preview_response_exposes_protected_editor_preview(self):
         record = submit_job(
@@ -644,6 +959,13 @@ class JobQueueTest(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 422)
                 self.assertIn('crop_left_mm', response.get_json()['error'])
+
+    def test_pdf_render_options_only_accept_quarter_turn_rotation(self):
+        self.assertEqual(parse_pdf_render_options({'output_rotation': '90'})['output_rotation'], 90)
+        self.assertEqual(parse_pdf_render_options({})['output_rotation'], 0)
+        for value in ('45', '-90', 'abc'):
+            with self.assertRaisesRegex(ValueError, 'output_rotation'):
+                parse_pdf_render_options({'output_rotation': value})
 
     def test_route_cancels_job_and_forwards_commit_balance_rejection(self):
         app = create_app()

@@ -2,6 +2,8 @@ import math
 import os
 from pathlib import Path
 
+from .pdf_metadata import decode_pdf_layout_metadata
+
 
 MAX_PDF_PAGES = 200
 PREVIEW_WIDTH_PX = 360
@@ -54,6 +56,29 @@ def inspect_pdf(source, preview_folder, preview_id):
         document.close()
 
 
+def read_pdf_layout_metadata(source):
+    """Return validated round-trip layout metadata from PDFs created by this service."""
+    fitz = load_fitz()
+    document = open_pdf_document(source, fitz)
+    try:
+        return read_pdf_layout_metadata_from_document(document)
+    finally:
+        document.close()
+
+
+def read_pdf_layout_metadata_from_document(document):
+    subject = (getattr(document, 'metadata', None) or {}).get('subject', '')
+    metadata = decode_pdf_layout_metadata(subject)
+    if not metadata:
+        return None
+    page_indexes = sorted(
+        index for index in metadata['page_slots'] if index is not None
+    )
+    if page_indexes != list(range(document.page_count)):
+        return None
+    return metadata
+
+
 def convert_pdf_to_plt(source, options=None):
     """Convert vector PDF paths, or raster page lines as a best-effort fallback, to HPGL."""
     options = options or {}
@@ -65,12 +90,14 @@ def convert_pdf_to_plt(source, options=None):
     rows = positive_int(options.get('rows', 1), 'rows')
     columns = positive_int(options.get('columns', 1), 'columns')
     order = options.get('order', 'row') if options.get('order', 'row') in {'row', 'column'} else 'row'
+    output_rotation = normalize_output_rotation(options.get('output_rotation', 0))
 
     document = open_pdf_document(source, fitz)
     try:
         if document.page_count > MAX_PDF_PAGES:
             raise ValueError(f'PDF 页数过多，最多支持 {MAX_PDF_PAGES} 页')
         page_count = document.page_count
+        embedded_layout = read_pdf_layout_metadata_from_document(document)
         validate_pdf_complexity(document)
         placements, enabled_pages = resolve_page_placements(
             page_count,
@@ -92,6 +119,7 @@ def convert_pdf_to_plt(source, options=None):
                 fitz,
                 maximum_segments - total_segments,
                 crop_rect,
+                ignore_internal_guides=bool(embedded_layout),
             )
             total_segments += sum(max(len(shape) - 1, 0) for shape in extracted_page['shapes'])
             if total_segments > maximum_segments:
@@ -121,6 +149,27 @@ def convert_pdf_to_plt(source, options=None):
 
     if not output_paths:
         raise ValueError('PDF 页面没有可转换的线条内容')
+    embedded_layout_applied = embedded_layout_matches_options(
+        embedded_layout,
+        rows,
+        columns,
+        order,
+        options.get('page_slots'),
+        crop_margins,
+    )
+    if embedded_layout_applied:
+        output_paths, output_width, output_height = normalize_generated_pdf_paths(
+            output_paths,
+            embedded_layout,
+            units_per_inch,
+        )
+    output_paths, output_width, output_height = rotate_output_paths(
+        output_paths,
+        output_width,
+        output_height,
+        output_rotation,
+    )
+    validate_generated_plt(output_paths, units_per_inch)
     plt = serialize_hpgl(output_paths, units_per_inch, line_width_mm)
     return plt, {
         'page_count': page_count,
@@ -129,6 +178,7 @@ def convert_pdf_to_plt(source, options=None):
         'rows': rows,
         'columns': columns,
         'order': order,
+        'output_rotation': output_rotation,
         'margin_mm': margin_mm,
         'crop_left_mm': crop_margins['left'],
         'crop_right_mm': crop_margins['right'],
@@ -138,7 +188,79 @@ def convert_pdf_to_plt(source, options=None):
         'height_mm': round(output_height * 25.4 / units_per_inch, 2),
         'source_types': sorted({page['source_type'] for page in pages.values()}),
         'raster_fallback': any(page['source_type'] == 'raster' for page in pages.values()),
+        'embedded_layout_detected': bool(embedded_layout),
+        'embedded_layout_applied': embedded_layout_applied,
     }
+
+
+def embedded_layout_matches_options(
+    metadata,
+    rows,
+    columns,
+    order,
+    page_slots,
+    crop_margins,
+):
+    if not metadata or not metadata.get('complete_layout') or page_slots is None:
+        return False
+    if rows != metadata['rows'] or columns != metadata['columns'] or order != metadata['order']:
+        return False
+    normalized_slots = [None if value is None else int(value) for value in page_slots]
+    if normalized_slots != metadata['page_slots']:
+        return False
+    expected_crop = metadata['crop_margins_mm']
+    return all(
+        abs(float(crop_margins[side]) - float(expected_crop[side])) <= 1e-6
+        for side in ('top', 'right', 'bottom', 'left')
+    )
+
+
+def normalize_generated_pdf_paths(shapes, metadata, units_per_inch):
+    min_x = min(point['x'] for shape in shapes for point in shape)
+    min_y = min(point['y'] for shape in shapes for point in shape)
+    normalized = [
+        [
+            {
+                'x': round(point['x'] - min_x),
+                'y': round(point['y'] - min_y),
+            }
+            for point in shape
+        ]
+        for shape in shapes
+    ]
+    width = round(metadata['drawing_width_mm'] * units_per_inch / 25.4)
+    height = round(metadata['drawing_height_mm'] * units_per_inch / 25.4)
+    return normalized, width, height
+
+
+def normalize_output_rotation(value):
+    try:
+        rotation = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError('output_rotation 参数无效') from error
+    if rotation not in {0, 90, 180, 270}:
+        raise ValueError('output_rotation 只支持 0、90、180、270')
+    return rotation
+
+
+def rotate_output_paths(shapes, width, height, rotation):
+    """在完成拼版后绕输出边界顺时针旋转全部路径。"""
+    if rotation == 0:
+        return shapes, width, height
+
+    def rotate_point(point):
+        x = point['x']
+        y = point['y']
+        if rotation == 90:
+            return {'x': round(y), 'y': round(width - x)}
+        if rotation == 180:
+            return {'x': round(width - x), 'y': round(height - y)}
+        return {'x': round(height - y), 'y': round(x)}
+
+    rotated = [[rotate_point(point) for point in shape] for shape in shapes]
+    if rotation in {90, 270}:
+        return rotated, height, width
+    return rotated, width, height
 
 
 def resolve_page_placements(page_count, rows, columns, order, page_slots, enabled_pages):
@@ -240,7 +362,14 @@ def build_crop_rect(page, crop_margins, fitz, page_number=None):
     return rect
 
 
-def _extract_page(page, units_per_inch, fitz, remaining_segments, crop_rect=None):
+def _extract_page(
+    page,
+    units_per_inch,
+    fitz,
+    remaining_segments,
+    crop_rect=None,
+    ignore_internal_guides=False,
+):
     crop_rect = crop_rect or fitz.Rect(0, 0, page.rect.width, page.rect.height)
     page_width = crop_rect.width * units_per_inch / 72
     page_height = crop_rect.height * units_per_inch / 72
@@ -248,6 +377,11 @@ def _extract_page(page, units_per_inch, fitz, remaining_segments, crop_rect=None
     drawings = page.get_drawings()
     rotation_matrix = getattr(page, 'rotation_matrix', None)
     for drawing in drawings:
+        if ignore_internal_guides and is_internal_guide_drawing(drawing):
+            continue
+        if is_crop_guide_drawing(drawing, crop_rect, rotation_matrix, fitz):
+            continue
+        drawing_shapes = []
         for item in drawing.get('items', []):
             points = drawing_item_points(item, fitz)
             # get_drawings 返回未旋转坐标，先转成与预览及 page.rect 一致的显示坐标。
@@ -262,14 +396,16 @@ def _extract_page(page, units_per_inch, fitz, remaining_segments, crop_rect=None
             ):
                 if len(visible_points) - 1 > remaining_segments:
                     raise ValueError('PDF 线条数量超过服务器限制')
-                shapes.append([
+                converted = [
                     {
                         'x': (point.x - crop_rect.x0) * units_per_inch / 72,
                         'y': (crop_rect.y1 - point.y) * units_per_inch / 72,
                     }
                     for point in visible_points
-                ])
+                ]
+                append_contiguous_shape(drawing_shapes, converted)
                 remaining_segments -= len(visible_points) - 1
+        shapes.extend(drawing_shapes)
     if drawings:
         return {
             'width_units': page_width,
@@ -283,6 +419,74 @@ def _extract_page(page, units_per_inch, fitz, remaining_segments, crop_rect=None
         'shapes': rasterize_page(page, units_per_inch, fitz, remaining_segments, crop_rect),
         'source_type': 'raster',
     }
+
+
+def is_internal_guide_drawing(drawing):
+    color = drawing.get('color')
+    if not color or len(color) < 3:
+        return False
+    red, green, blue = (float(value) for value in color[:3])
+    is_page_guide = (
+        abs(red) <= 0.02
+        and abs(green - 0.55) <= 0.02
+        and abs(blue - 0.55) <= 0.02
+    )
+    is_scale_marker = (
+        abs(red - 1.0) <= 0.02
+        and abs(green) <= 0.02
+        and abs(blue) <= 0.02
+    )
+    return is_page_guide or is_scale_marker
+
+
+def append_contiguous_shape(shapes, points):
+    if len(points) < 2:
+        return
+    if shapes and hpgl_points_equal(shapes[-1][-1], points[0]):
+        shapes[-1].extend(points[1:])
+        return
+    shapes.append(points)
+
+
+def hpgl_points_equal(first, second):
+    return (
+        abs(float(first['x']) - float(second['x'])) < 1e-7
+        and abs(float(first['y']) - float(second['y'])) < 1e-7
+    )
+
+
+def is_crop_guide_drawing(drawing, crop_rect, rotation_matrix, fitz):
+    """只忽略恰好位于裁边线上的纯红色水平或垂直辅助线。"""
+    color = drawing.get('color')
+    if (
+        not color
+        or len(color) < 3
+        or color[0] < 0.9
+        or color[1] > 0.1
+        or color[2] > 0.1
+    ):
+        return False
+
+    tolerance = 0.5
+    found_visible_item = False
+    for item in drawing.get('items', []):
+        points = drawing_item_points(item, fitz)
+        if rotation_matrix is not None:
+            points = [point * rotation_matrix for point in points]
+        if not points:
+            continue
+        found_visible_item = True
+        on_vertical_boundary = any(
+            all(abs(point.x - edge_x) <= tolerance for point in points)
+            for edge_x in (crop_rect.x0, crop_rect.x1)
+        )
+        on_horizontal_boundary = any(
+            all(abs(point.y - edge_y) <= tolerance for point in points)
+            for edge_y in (crop_rect.y0, crop_rect.y1)
+        )
+        if not on_vertical_boundary and not on_horizontal_boundary:
+            return False
+    return found_visible_item
 
 
 def drawing_item_points(item, fitz):
@@ -446,9 +650,36 @@ def serialize_hpgl(shapes, units_per_inch, line_width_mm):
             continue
         commands.append(f"PU{format_point(shape[0])};")
         commands.append('PD' + ','.join(format_point(point) for point in shape) + ';')
-        commands.append('PU;')
+    commands.append('PU;')
     commands.append('SP0;')
     return ''.join(commands).encode('ascii')
+
+
+def validate_generated_plt(shapes, units_per_inch):
+    valid_shapes = [shape for shape in shapes if len(shape) >= 2]
+    maximum_paths = max(100, int(os.getenv('PLT_MAX_PATHS', '100000')))
+    if len(valid_shapes) > maximum_paths:
+        raise ValueError(f'PLT 路径过多，最多支持 {maximum_paths} 条')
+
+    emitted_points = sum(len(shape) + 1 for shape in valid_shapes)
+    maximum_points = max(1000, int(os.getenv('PLT_MAX_POINTS', '500000')))
+    if emitted_points > maximum_points:
+        raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
+
+    emitted_commands = 5 + len(valid_shapes) * 2
+    maximum_commands = max(1000, int(os.getenv('PLT_MAX_COMMANDS', '250000')))
+    if emitted_commands > maximum_commands:
+        raise ValueError(f'PLT 命令数量过多，最多支持 {maximum_commands} 条')
+
+    xs = [point['x'] for shape in valid_shapes for point in shape]
+    ys = [point['y'] for shape in valid_shapes for point in shape]
+    if not xs or not ys:
+        return
+    width_mm = (max(xs) - min(xs)) * 25.4 / units_per_inch
+    height_mm = (max(ys) - min(ys)) * 25.4 / units_per_inch
+    maximum_dimension = max(100, float(os.getenv('PLT_MAX_DIMENSION_MM', '10000')))
+    if width_mm > maximum_dimension or height_mm > maximum_dimension:
+        raise ValueError(f'PLT 尺寸过大，单边最多支持 {maximum_dimension:g}mm')
 
 
 def format_point(point):

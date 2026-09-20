@@ -41,6 +41,18 @@ def conversion_queue(connection=None):
     )
 
 
+def pdf_layout_queue(connection=None):
+    connection = connection or redis_connection()
+    return Queue(
+        os.getenv('PDF_LAYOUT_QUEUE_NAME', 'pdf-layout-analysis'),
+        connection=connection,
+        default_timeout=max(10, int(os.getenv(
+            'PDF_LAYOUT_OPTIMIZER_TIMEOUT_SECONDS',
+            os.getenv('PLT_JOB_TIMEOUT_SECONDS', '90'),
+        ))),
+    )
+
+
 def job_key(job_id):
     return f'plt-converter:job:{job_id}'
 
@@ -77,10 +89,20 @@ def save_job(record, connection=None):
 
 def job_record_ttl(record=None):
     retention = max(60, int(os.getenv('PLT_JOB_RETENTION_SECONDS', '1800')))
-    if not record or record.get('status') not in ACTIVE_STATUSES:
+    layout_status = ((record or {}).get('result') or {}).get('layout_suggestion_status')
+    layout_active = layout_status in {'queued', 'processing'}
+    conversion_active = bool(record and record.get('status') in ACTIVE_STATUSES)
+    if not conversion_active and not layout_active:
         return retention
-    queue_capacity = max(1, int(os.getenv('PLT_QUEUE_MAX_PENDING', '20')))
-    timeout = max(10, int(os.getenv('PLT_JOB_TIMEOUT_SECONDS', '90')))
+    if layout_active:
+        queue_capacity = max(1, int(os.getenv('PDF_LAYOUT_QUEUE_MAX_PENDING', '20')))
+        timeout = max(10, int(os.getenv(
+            'PDF_LAYOUT_OPTIMIZER_TIMEOUT_SECONDS',
+            os.getenv('PLT_JOB_TIMEOUT_SECONDS', '90'),
+        )))
+    else:
+        queue_capacity = max(1, int(os.getenv('PLT_QUEUE_MAX_PENDING', '20')))
+        timeout = max(10, int(os.getenv('PLT_JOB_TIMEOUT_SECONDS', '90')))
     maximum_attempts = 2
     return max(retention, queue_capacity * timeout * maximum_attempts + 300)
 
@@ -115,6 +137,17 @@ def queue_load(connection=None):
         'queued': queue.count,
         'processing': started.count,
         'capacity': max(1, int(os.getenv('PLT_QUEUE_MAX_PENDING', '20'))),
+    }
+
+
+def pdf_layout_queue_load(connection=None):
+    connection = connection or redis_connection()
+    queue = pdf_layout_queue(connection)
+    started = StartedJobRegistry(queue.name, connection=connection)
+    return {
+        'queued': queue.count,
+        'processing': started.count,
+        'capacity': max(1, int(os.getenv('PDF_LAYOUT_QUEUE_MAX_PENDING', '20'))),
     }
 
 
@@ -285,6 +318,88 @@ def submit_job(job_type, source, filename, options, user_key, connection=None, b
         lock.release()
 
 
+def enqueue_pdf_layout_suggestion(job_id, user_key, connection=None, retry_failed=False):
+    """Queue one layout analysis for an already completed, owned PDF preview."""
+    connection = connection or redis_connection()
+    lock = acquire_job_lock(job_id, connection)
+    try:
+        record = load_job(job_id, connection)
+        if not record or record.get('job_type') != 'pdf_preview':
+            raise ValueError('PDF 预览不存在或已过期')
+        if record.get('user_key') != user_key:
+            raise PermissionError('无权分析该 PDF 预览')
+        if record.get('status') != 'done':
+            raise ValueError('PDF 预览尚未完成，请稍后再试')
+
+        result = dict(record.get('result') or {})
+        analysis_status = result.get('layout_suggestion_status')
+        if result.get('layout_suggestion') or analysis_status in {'queued', 'processing'}:
+            return record
+        if analysis_status == 'failed' and not retry_failed:
+            return record
+
+        enforce_rate_limit(
+            user_key,
+            connection,
+            scope='pdf-layout-optimize',
+            limit_env='PDF_LAYOUT_OPTIMIZE_RATE_LIMIT_PER_MINUTE',
+        )
+        queue_lock = connection.lock(
+            'plt-converter:pdf-layout-submit-lock',
+            timeout=15,
+            blocking_timeout=5,
+        )
+        if not queue_lock.acquire(blocking=True):
+            raise QueueRejected('智能排版队列正在更新，请稍后重试', retry_after=2)
+        try:
+            load = pdf_layout_queue_load(connection)
+            if load['queued'] + load['processing'] >= load['capacity']:
+                connection.hincrby(metric_key(), 'rejected_pdf_layout_queue_full', 1)
+                raise QueueRejected('智能排版任务已排满，请稍后重试', retry_after=10)
+            attempt = int(result.get('layout_suggestion_attempt', 0)) + 1
+            result.update({
+                'layout_suggestion_status': 'queued',
+                'layout_suggestion_error': None,
+                'layout_suggestion_attempt': attempt,
+            })
+            record = update_job(job_id, connection, result=result)
+
+            retention = max(60, int(os.getenv('PLT_JOB_RETENTION_SECONDS', '1800')))
+            timeout = max(10, int(os.getenv(
+                'PDF_LAYOUT_OPTIMIZER_TIMEOUT_SECONDS',
+                os.getenv('PLT_JOB_TIMEOUT_SECONDS', '90'),
+            )))
+            from .tasks import (
+                mark_pdf_layout_suggestion_failed,
+                mark_pdf_layout_suggestion_stopped,
+            )
+            try:
+                pdf_layout_queue(connection).enqueue_call(
+                    'app.tasks.execute_pdf_layout_suggestion',
+                    args=(job_id, attempt),
+                    job_id=f'{job_id}:layout-suggestion:{attempt}',
+                    timeout=timeout,
+                    result_ttl=retention,
+                    failure_ttl=retention,
+                    on_failure=Callback(mark_pdf_layout_suggestion_failed),
+                    on_stopped=Callback(mark_pdf_layout_suggestion_stopped),
+                )
+            except Exception as error:
+                result.update({
+                    'layout_suggestion_status': 'failed',
+                    'layout_suggestion_error': '智能排版任务入队失败，请稍后重试',
+                })
+                update_job(job_id, connection, result=result)
+                raise QueueRejected(
+                    '智能排版任务入队失败，请稍后重试', retry_after=3
+                ) from error
+            return record
+        finally:
+            queue_lock.release()
+    finally:
+        lock.release()
+
+
 def cancel_job(job_id, user_key=None, connection=None):
     connection = connection or redis_connection()
     lock = acquire_job_lock(job_id, connection)
@@ -390,10 +505,23 @@ def cleanup_expired_job_files(connection=None):
             if not job_folder.is_dir() or job_folder.stat().st_mtime >= cutoff:
                 continue
             record = load_job(job_folder.name, connection)
-            if record and record.get('status') in ACTIVE_STATUSES:
+            layout_status = ((record or {}).get('result') or {}).get(
+                'layout_suggestion_status'
+            )
+            if record and (
+                record.get('status') in ACTIVE_STATUSES
+                or layout_status in {'queued', 'processing'}
+            ):
                 continue
             if record:
-                retained_from = record.get('finished_at') or record.get('updated_at')
+                retained_from = max(
+                    (
+                        value
+                        for value in (record.get('finished_at'), record.get('updated_at'))
+                        if isinstance(value, (int, float))
+                    ),
+                    default=None,
+                )
                 if retained_from and retained_from >= cutoff:
                     continue
             if job_folder.is_dir():

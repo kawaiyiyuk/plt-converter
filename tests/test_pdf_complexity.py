@@ -129,6 +129,116 @@ class PdfComplexityTest(unittest.TestCase):
         self.assertAlmostEqual(result['shapes'][0][1]['x'], 80)
         self.assertAlmostEqual(result['shapes'][0][0]['y'], 30)
 
+    def test_merges_contiguous_items_from_same_pdf_drawing(self):
+        class VectorPage:
+            rect = pymupdf.Rect(0, 0, 100, 100)
+
+            def get_drawings(self):
+                return [{
+                    'color': (0.0, 0.0, 0.0),
+                    'items': [
+                        ('l', pymupdf.Point(10, 50), pymupdf.Point(50, 50)),
+                        ('l', pymupdf.Point(50, 50), pymupdf.Point(90, 50)),
+                    ],
+                }]
+
+        result = _extract_page(
+            VectorPage(),
+            72,
+            pymupdf,
+            100,
+            pymupdf.Rect(0, 0, 100, 100),
+        )
+
+        self.assertEqual(len(result['shapes']), 1)
+        self.assertEqual(result['shapes'][0], [
+            {'x': 10.0, 'y': 50.0},
+            {'x': 50.0, 'y': 50.0},
+            {'x': 90.0, 'y': 50.0},
+        ])
+
+    def test_generated_pdf_filter_removes_internal_guides_only_when_verified(self):
+        class VectorPage:
+            rect = pymupdf.Rect(0, 0, 100, 100)
+
+            def get_drawings(self):
+                return [
+                    {
+                        'color': (0.0, 0.55, 0.55),
+                        'items': [('l', pymupdf.Point(10, 20), pymupdf.Point(10, 80))],
+                    },
+                    {
+                        'color': (1.0, 0.0, 0.0),
+                        'items': [('l', pymupdf.Point(40, 40), pymupdf.Point(60, 40))],
+                    },
+                    {
+                        'color': (0.0, 0.0, 0.0),
+                        'items': [('l', pymupdf.Point(0, 50), pymupdf.Point(100, 50))],
+                    },
+                ]
+
+        crop = pymupdf.Rect(10, 20, 90, 80)
+        generated = _extract_page(
+            VectorPage(), 72, pymupdf, 100, crop, ignore_internal_guides=True
+        )
+        external = _extract_page(
+            VectorPage(), 72, pymupdf, 100, crop, ignore_internal_guides=False
+        )
+
+        self.assertEqual(len(generated['shapes']), 1)
+        self.assertEqual(len(external['shapes']), 3)
+
+    def test_ignores_red_crop_guide_on_exact_crop_boundary(self):
+        class VectorPage:
+            rect = pymupdf.Rect(0, 0, 100, 100)
+
+            def get_drawings(self):
+                return [
+                    {
+                        'color': (1.0, 0.0, 0.0),
+                        'rect': pymupdf.Rect(10, 20, 10, 80),
+                        'items': [('l', pymupdf.Point(10, 20), pymupdf.Point(10, 80))],
+                    },
+                    {
+                        'color': (0.0, 0.0, 0.0),
+                        'rect': pymupdf.Rect(0, 50, 100, 50),
+                        'items': [('l', pymupdf.Point(0, 50), pymupdf.Point(100, 50))],
+                    },
+                ]
+
+        result = _extract_page(
+            VectorPage(),
+            72,
+            pymupdf,
+            100,
+            pymupdf.Rect(10, 20, 90, 80),
+        )
+
+        self.assertEqual(len(result['shapes']), 1)
+        self.assertEqual(result['shapes'][0][0], {'x': 0.0, 'y': 30.0})
+        self.assertEqual(result['shapes'][0][1], {'x': 80.0, 'y': 30.0})
+
+    def test_preserves_red_pattern_line_away_from_crop_boundary(self):
+        class VectorPage:
+            rect = pymupdf.Rect(0, 0, 100, 100)
+
+            def get_drawings(self):
+                return [{
+                    'color': (1.0, 0.0, 0.0),
+                    'rect': pymupdf.Rect(50, 20, 50, 80),
+                    'items': [('l', pymupdf.Point(50, 20), pymupdf.Point(50, 80))],
+                }]
+
+        result = _extract_page(
+            VectorPage(),
+            72,
+            pymupdf,
+            100,
+            pymupdf.Rect(10, 20, 90, 80),
+        )
+
+        self.assertEqual(len(result['shapes']), 1)
+
     def test_real_pdf_crop_updates_hpgl_origin_and_layout_size(self):
         document = pymupdf.open()
         page = document.new_page(width=100, height=100)

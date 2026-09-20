@@ -26,6 +26,7 @@ rollback_enabled=0
 replacement_started=0
 old_api_image=""
 old_worker_image=""
+old_layout_worker_present=0
 build_context=""
 candidate_api_image=""
 candidate_worker_image=""
@@ -131,14 +132,22 @@ rollback() {
     fi
     if [[ "$image_restore_failed" == "1" ]]; then
       recovery_failed=1
-    elif ! "${compose[@]}" up -d --no-build --no-deps --force-recreate --wait --wait-timeout 120 api worker; then
-      printf '上一版转换服务容器恢复失败。\n' >&2
-      recovery_failed=1
-    elif ! verify_runtime_health >&2; then
-      printf '上一版转换服务已启动，但健康检查未通过。\n' >&2
-      recovery_failed=1
     else
-      printf '上一版转换服务容器已恢复。\n' >&2
+      local restore_services=(api worker)
+      if [[ "$old_layout_worker_present" == "1" ]]; then
+        restore_services+=(layout-worker)
+      else
+        "${compose[@]}" rm -sf layout-worker >/dev/null 2>&1 || true
+      fi
+      if ! "${compose[@]}" up -d --no-build --no-deps --force-recreate --wait --wait-timeout 120 "${restore_services[@]}"; then
+        printf '上一版转换服务容器恢复失败。\n' >&2
+        recovery_failed=1
+      elif ! verify_runtime_health >&2; then
+        printf '上一版转换服务已启动，但健康检查未通过。\n' >&2
+        recovery_failed=1
+      else
+        printf '上一版转换服务容器已恢复。\n' >&2
+      fi
     fi
   else
     printf '没有可自动恢复的上一版镜像，现有容器未被主动删除。\n' >&2
@@ -203,11 +212,28 @@ wait_for_idle_queue() {
   for attempt in $(seq 1 60); do
     if queue_json="$("${compose[@]}" exec -T worker python -c '
 import json
-from app.job_queue import queue_load
+import os
+from redis import Redis
+from rq import Queue
+from rq.registry import StartedJobRegistry
 
-queue = queue_load()
-print(json.dumps(queue, ensure_ascii=False))
-raise SystemExit(0 if queue["queued"] == 0 and queue["processing"] == 0 else 1)
+connection = Redis.from_url(os.environ["REDIS_URL"])
+names = (
+    os.getenv("PLT_QUEUE_NAME", "conversions"),
+    os.getenv("PDF_LAYOUT_QUEUE_NAME", "pdf-layout-analysis"),
+)
+queues = {
+    name: {
+        "queued": Queue(name, connection=connection).count,
+        "processing": StartedJobRegistry(name, connection=connection).count,
+    }
+    for name in names
+}
+print(json.dumps(queues, ensure_ascii=False))
+raise SystemExit(0 if all(
+    item["queued"] == 0 and item["processing"] == 0
+    for item in queues.values()
+) else 1)
 ')"; then
       printf '%s\n' "$queue_json"
       return
@@ -302,12 +328,15 @@ main() {
 
   local services
   services="$("${build_compose[@]}" config --services | LC_ALL=C sort | tr '\n' ' ')"
-  [[ "$services" == "api redis worker " ]] || fail "Compose 服务边界异常：$services"
+  [[ "$services" == "api layout-worker redis worker " ]] || fail "Compose 服务边界异常：$services"
   "${build_compose[@]}" config --quiet
   check_redis
 
   old_api_image="$(container_image_id api)"
   old_worker_image="$(container_image_id worker)"
+  if [[ -n "$("${compose[@]}" ps -q layout-worker)" ]]; then
+    old_layout_worker_present=1
+  fi
   [[ -n "$old_api_image" && -n "$old_worker_image" ]] || fail "未找到当前生产 API/Worker；首次部署请按 README 执行"
   rollback_enabled=1
 
@@ -327,7 +356,7 @@ main() {
   replacement_started=1
   docker image tag "$candidate_api_image" "$API_IMAGE"
   docker image tag "$candidate_worker_image" "$WORKER_IMAGE"
-  "${compose[@]}" up -d --no-build --no-deps --wait --wait-timeout 120 api worker
+  "${compose[@]}" up -d --no-build --no-deps --wait --wait-timeout 120 api worker layout-worker
 
   log "验证转换服务健康状态"
   verify_runtime_health

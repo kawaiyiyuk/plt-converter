@@ -4,7 +4,7 @@ from pathlib import Path
 from flask import Flask, jsonify
 from redis.exceptions import RedisError
 
-from .job_queue import conversion_queue, queue_load, redis_connection
+from .job_queue import conversion_queue, pdf_layout_queue, queue_load, redis_connection
 
 from .routes import pdf_bp, plt_bp
 
@@ -24,18 +24,42 @@ def create_app():
     app.register_blueprint(plt_bp)
     app.register_blueprint(pdf_bp)
 
+    def worker_status(connection):
+        from rq import Worker
+
+        workers = Worker.all(connection=connection)
+        required_queues = {
+            conversion_queue(connection).name,
+            pdf_layout_queue(connection).name,
+        }
+        worker_queue_sets = [
+            {queue.name for queue in worker.queues}
+            for worker in workers
+        ]
+        active_queues = {
+            queue_name
+            for queue_names in worker_queue_sets
+            for queue_name in queue_names
+        }
+        workers_ok = len(required_queues) == 2 and all(
+            {queue_name} in worker_queue_sets
+            for queue_name in required_queues
+        )
+        return workers, workers_ok, active_queues
+
     @app.get('/health')
     def health():
         redis_ok = False
         worker_count = 0
+        workers_ok = False
         try:
             connection = redis_connection()
             redis_ok = bool(connection.ping())
-            from rq import Worker
-            worker_count = len(Worker.all(connection=connection))
+            workers, workers_ok, _active_queues = worker_status(connection)
+            worker_count = len(workers)
         except Exception:
             pass
-        healthy = redis_ok and worker_count > 0
+        healthy = redis_ok and workers_ok
         return jsonify({
             'status': 'healthy' if healthy else 'degraded',
             'service': 'plt-converter',
@@ -56,10 +80,14 @@ def create_app():
     def health_worker():
         try:
             connection = redis_connection()
-            from rq import Worker
-            workers = Worker.all(connection=connection)
-            if workers:
-                return jsonify({'status': 'healthy', 'workers': len(workers), 'queue': queue_load(connection)})
+            workers, workers_ok, active_queues = worker_status(connection)
+            if workers_ok:
+                return jsonify({
+                    'status': 'healthy',
+                    'workers': len(workers),
+                    'queues': sorted(active_queues),
+                    'queue': queue_load(connection),
+                })
         except Exception:
             pass
         return jsonify({'status': 'unavailable', 'workers': 0}), 503
