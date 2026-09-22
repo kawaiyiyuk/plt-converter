@@ -68,6 +68,20 @@ def commit_successful_pdf_to_pdf_billing(record):
     return True
 
 
+def _update_job_progress(job_id, connection, progress):
+    """Update progress without racing cancellation or a terminal transition."""
+    lock = acquire_job_lock(job_id, connection)
+    try:
+        record = load_job(job_id, connection)
+        if not record or record.get('status') in TERMINAL_STATUSES:
+            return record
+        if record.get('cancel_requested') or record.get('status') == 'cancelling':
+            return record
+        return update_job(job_id, connection, progress=progress)
+    finally:
+        lock.release()
+
+
 def execute_job(job_id):
     connection = redis_connection()
     confirmation_deadline = time.monotonic() + max(
@@ -454,26 +468,26 @@ def _execute(record, connection):
     source = Path(record['input_path']).read_bytes()
     options = record.get('options') or {}
     job_root = Path(record['input_path']).parent
-    update_job(job_id, connection, progress=15)
+    _update_job_progress(job_id, connection, progress=15)
 
     if job_type == 'plt_to_pdf':
         document = parse_plt(source, int(options.get('units_per_inch', 1016)))
         validate_parsed_plt(document)
-        update_job(job_id, connection, progress=45)
+        _update_job_progress(job_id, connection, progress=45)
         pdf, layout = render_pdf(document, options)
         output_path = job_root / f"{Path(record['filename']).stem}.pdf"
         output_path.write_bytes(pdf)
         return {'result_path': str(output_path), 'filename': output_path.name, 'layout': layout, 'mime_type': 'application/pdf'}
 
     if job_type == 'pdf_to_plt':
-        update_job(job_id, connection, progress=35)
+        _update_job_progress(job_id, connection, progress=35)
         plt, layout = convert_pdf_to_plt(source, options)
         output_path = job_root / f"{Path(record['filename']).stem}.plt"
         output_path.write_bytes(plt)
         return {'result_path': str(output_path), 'filename': output_path.name, 'layout': layout, 'mime_type': 'application/octet-stream'}
 
     if job_type == 'pdf_to_pdf':
-        update_job(job_id, connection, progress=25)
+        _update_job_progress(job_id, connection, progress=25)
         pdf, conversion = convert_pdf_to_pdf(source, options)
         paper_size = str(options.get('paper_size', 'A4')).upper()
         output_path = job_root / f"{Path(record['filename']).stem}-{paper_size}.pdf"

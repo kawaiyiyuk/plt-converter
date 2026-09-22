@@ -1,6 +1,7 @@
 import io
 import os
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -10,7 +11,7 @@ import pymupdf
 from app import create_app
 from app.billing import BillingRejected
 from app.job_queue import confirm_job_billing, job_record_ttl, load_job, submit_job, update_job
-from app.tasks import execute_job, mark_job_stopped
+from app.tasks import _execute, execute_job, mark_job_stopped
 
 
 class MemoryLock:
@@ -19,6 +20,14 @@ class MemoryLock:
 
     def release(self):
         return None
+
+
+class AcquiredThreadLock:
+    def __init__(self, lock):
+        self.lock = lock
+
+    def release(self):
+        self.lock.release()
 
 
 class PdfToPdfTest(unittest.TestCase):
@@ -59,6 +68,38 @@ class PdfToPdfTest(unittest.TestCase):
         self.assertEqual(record['user_key'], 'page-count-client')
         with open(record['input_path'], 'rb') as source_file:
             self.assertEqual(source_file.read(), b'%PDF-source')
+
+    def test_inspect_accepts_a_pdf_at_the_configured_file_size_limit(self):
+        with patch.dict(os.environ, {'PLT_MAX_UPLOAD_MB': '1'}):
+            app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.pdf_page_count', return_value=1), \
+                patch('app.routes.store_source_upload', return_value={'job_id': 'source-at-limit'}):
+            response = app.test_client().post(
+                '/api/v1/pdf/repage/inspect',
+                headers={'X-Client-Key': 'file-size-client'},
+                data={'file': (io.BytesIO(b'x' * (1024 * 1024)), 'limit.pdf')},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['source_id'], 'source-at-limit')
+
+    def test_inspect_rejects_a_pdf_above_the_configured_file_size_limit(self):
+        with patch.dict(os.environ, {'PLT_MAX_UPLOAD_MB': '1'}):
+            app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.pdf_page_count') as page_count:
+            response = app.test_client().post(
+                '/api/v1/pdf/repage/inspect',
+                headers={'X-Client-Key': 'file-size-client'},
+                data={'file': (io.BytesIO(b'x' * (1024 * 1024 + 1)), 'too-large.pdf')},
+            )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertIn('1MB', response.get_json()['error'])
+        page_count.assert_not_called()
 
     def test_new_inspection_replaces_previous_source_for_same_client(self):
         app = create_app()
@@ -350,6 +391,92 @@ class PdfToPdfTest(unittest.TestCase):
         cancelled = load_job(record['job_id'], self.redis)
         self.assertEqual(cancelled['status'], 'cancelled')
         self.assertIs(cancelled['billing_released'], False)
+
+    def test_progress_update_cannot_overwrite_concurrent_cancellation(self):
+        with patch('app.job_queue.redis_connection', return_value=self.redis):
+            record = submit_job(
+                'pdf_to_pdf',
+                b'%PDF-source',
+                'sample.pdf',
+                {'paper_size': 'A4', 'source_page_count': 1},
+                'user:7',
+                billing_request_id='pdf-to-pdf-progress-race',
+            )
+            confirm_job_billing(record['job_id'], 'user:7')
+            update_job(record['job_id'], self.redis, status='processing', progress=5)
+
+        from app import job_queue
+
+        original_load_job = job_queue.load_job
+        original_save_job = job_queue.save_job
+        shared_lock = threading.Lock()
+        worker_loaded = threading.Event()
+        cancel_attempted = threading.Event()
+        cancel_written = threading.Event()
+        progress_load_blocked = threading.Event()
+        thread_errors = []
+
+        def acquire_shared_lock(_job_id, _connection):
+            if not shared_lock.acquire(timeout=2):
+                raise AssertionError('job lock was not released')
+            return AcquiredThreadLock(shared_lock)
+
+        def interleaving_load(job_id, connection=None):
+            current = original_load_job(job_id, connection)
+            if (
+                threading.current_thread().name == 'conversion-worker'
+                and not progress_load_blocked.is_set()
+            ):
+                progress_load_blocked.set()
+                worker_loaded.set()
+                self.assertTrue(cancel_attempted.wait(1))
+                cancel_written.wait(0.1)
+            return current
+
+        def cancel_while_progress_is_saving():
+            self.assertTrue(worker_loaded.wait(1))
+            cancel_attempted.set()
+            lock = acquire_shared_lock(record['job_id'], self.redis)
+            try:
+                latest = original_load_job(record['job_id'], self.redis)
+                latest.update(status='cancelling', cancel_requested=True, progress=0)
+                original_save_job(latest, self.redis)
+                cancel_written.set()
+            finally:
+                lock.release()
+
+        def converted(_source, _options):
+            self.assertTrue(cancel_written.wait(1))
+            return b'%PDF-result', {'paper_size': 'A4'}
+
+        def run_in_thread(target):
+            try:
+                target()
+            except BaseException as error:
+                thread_errors.append(error)
+
+        worker = threading.Thread(
+            target=lambda: run_in_thread(lambda: _execute(record, self.redis)),
+            name='conversion-worker',
+        )
+        canceller = threading.Thread(
+            target=lambda: run_in_thread(cancel_while_progress_is_saving),
+        )
+        with patch('app.job_queue.load_job', side_effect=interleaving_load), \
+                patch('app.tasks.acquire_job_lock', side_effect=acquire_shared_lock), \
+                patch('app.tasks.convert_pdf_to_pdf', side_effect=converted):
+            worker.start()
+            canceller.start()
+            worker.join(2)
+            canceller.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(canceller.is_alive())
+        self.assertEqual(thread_errors, [])
+        latest = original_load_job(record['job_id'], self.redis)
+        self.assertEqual(latest['status'], 'cancelling')
+        self.assertTrue(latest['cancel_requested'])
+        self.assertEqual(latest['progress'], 0)
 
     def test_composite_conversion_reuses_both_existing_converters_in_memory(self):
         from app.services.pdf_to_pdf import convert_pdf_to_pdf
