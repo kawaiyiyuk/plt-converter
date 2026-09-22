@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from app.services.pdf_to_plt import convert_pdf_to_plt, serialize_hpgl
+from app.services.pdf_to_plt import convert_pdf_to_plt, serialize_hpgl, validate_generated_plt
 
 
 class FakePage:
@@ -105,6 +105,19 @@ class PdfOptionsTest(unittest.TestCase):
                     'enabled_pages': [0],
                 })
 
+    def test_rejects_generated_plt_when_metric_width_command_exceeds_parser_limit(self):
+        shapes = [
+            [{'x': index, 'y': 0}, {'x': index, 'y': 10}]
+            for index in range(498)
+        ]
+        serialized = serialize_hpgl(shapes, units_per_inch=1016, line_width_mm=1)
+
+        self.assertEqual(serialized.count(b';'), 1002)
+
+        with patch.dict('os.environ', {'PLT_MAX_COMMANDS': '1001'}):
+            with self.assertRaisesRegex(ValueError, 'PLT 命令数量过多'):
+                validate_generated_plt(shapes, units_per_inch=1016)
+
     def test_rejects_generated_plt_above_existing_dimension_limit(self):
         page = extracted_page()
         page['width_units'] = 5000
@@ -132,6 +145,17 @@ class PdfOptionsTest(unittest.TestCase):
 
         self.assertEqual(result.count(b'PU;'), 1)
         self.assertIn(b'PD0,0,10,10;PU20,20;PD20,20,30,30;PU;SP0;', result)
+
+    def test_hpgl_serializer_writes_pen_width_in_explicit_millimeters(self):
+        shapes = [[{'x': 0, 'y': 0}, {'x': 10, 'y': 10}]]
+
+        one_mm = serialize_hpgl(shapes, units_per_inch=1016, line_width_mm=1)
+        one_and_half_mm = serialize_hpgl(shapes, units_per_inch=1016, line_width_mm=1.5)
+
+        self.assertTrue(one_mm.startswith(b'IN;WU0;SP1;PW1;'))
+        self.assertTrue(one_and_half_mm.startswith(b'IN;WU0;SP1;PW1.5;'))
+        self.assertNotIn(b'PW40;', one_mm)
+        self.assertNotIn(b'PW60;', one_and_half_mm)
 
 
 if __name__ == '__main__':

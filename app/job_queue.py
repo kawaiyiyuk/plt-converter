@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -17,7 +18,8 @@ TERMINAL_STATUSES = {'done', 'failed', 'cancelled', 'expired'}
 ACTIVE_STATUSES = {'billing_pending', 'queued', 'processing', 'cancelling'}
 JOB_OUTPUT_VERSIONS = {
     'plt_to_pdf': '4-single-page-selection',
-    'pdf_to_plt': '3-page-cropped',
+    'pdf_to_plt': '4-metric-pen-width',
+    'pdf_to_pdf': '1-auto-repage',
     'pdf_preview': '2-editor-preview',
 }
 
@@ -102,7 +104,13 @@ def job_record_ttl(record=None):
         )))
     else:
         queue_capacity = max(1, int(os.getenv('PLT_QUEUE_MAX_PENDING', '20')))
-        timeout = max(10, int(os.getenv('PLT_JOB_TIMEOUT_SECONDS', '90')))
+        timeout_environment = (
+            'PDF_TO_PDF_JOB_TIMEOUT_SECONDS'
+            if (record or {}).get('job_type') == 'pdf_to_pdf'
+            else 'PLT_JOB_TIMEOUT_SECONDS'
+        )
+        default_timeout = '210' if timeout_environment == 'PDF_TO_PDF_JOB_TIMEOUT_SECONDS' else '90'
+        timeout = max(10, int(os.getenv(timeout_environment, default_timeout)))
     maximum_attempts = 2
     return max(retention, queue_capacity * timeout * maximum_attempts + 300)
 
@@ -199,6 +207,101 @@ def completed_result_available(record):
     return bool(result_path and Path(result_path).exists())
 
 
+def source_upload_slot_key(job_type, user_key):
+    owner_digest = hashlib.sha256(str(user_key).encode('utf-8')).hexdigest()
+    return f'plt-converter:source-upload:{job_type}:{owner_digest}'
+
+
+def read_source_upload(job_id, expected_type, user_key, connection=None):
+    """Read one owned temporary source while replacement cleanup is locked out."""
+    connection = connection or redis_connection()
+    lock = acquire_job_lock(job_id, connection)
+    try:
+        record = load_job(job_id, connection)
+        if not record or record.get('job_type') != expected_type:
+            return None
+        if record.get('user_key') != user_key:
+            raise PermissionError('无权使用该 PDF')
+        input_path = record.get('input_path')
+        source_path = Path(input_path) if input_path else None
+        if source_path is None or not source_path.is_file():
+            return None
+        return record, source_path.read_bytes()
+    finally:
+        lock.release()
+
+
+def remove_source_upload(job_id, expected_type, user_key, connection=None):
+    """Remove a superseded source only when its owner and type still match."""
+    connection = connection or redis_connection()
+    lock = acquire_job_lock(job_id, connection)
+    try:
+        record = load_job(job_id, connection)
+        if not record:
+            return False
+        if record.get('job_type') != expected_type or record.get('user_key') != user_key:
+            return False
+        input_path = record.get('input_path')
+        connection.delete(job_key(job_id))
+        if input_path:
+            shutil.rmtree(Path(input_path).parent, ignore_errors=True)
+        return True
+    finally:
+        lock.release()
+
+
+def store_source_upload(job_type, source, filename, options, user_key, connection=None):
+    """Store one validated source file for a later queued conversion."""
+    connection = connection or redis_connection()
+    cleanup_expired_job_files(connection)
+    slot_key = source_upload_slot_key(job_type, user_key)
+    slot_lock = connection.lock(f'{slot_key}:lock', timeout=15, blocking_timeout=5)
+    if not slot_lock.acquire(blocking=True):
+        raise QueueRejected('PDF 临时文件正在更新，请稍后重试', retry_after=2)
+    try:
+        previous_job_id = connection.get(slot_key)
+        if isinstance(previous_job_id, bytes):
+            previous_job_id = previous_job_id.decode('utf-8')
+
+        job_id = uuid4().hex
+        root = Path(os.getenv('PLT_TEMP_FOLDER', '/tmp/plt-converter')) / 'jobs' / job_id
+        root.mkdir(parents=True, exist_ok=True)
+        suffix = Path(filename).suffix.lower() or '.pdf'
+        input_path = root / f'input{suffix}'
+        input_path.write_bytes(source)
+        now = time.time()
+        record = {
+            'job_id': job_id,
+            'job_type': job_type,
+            'output_version': JOB_OUTPUT_VERSIONS.get(job_type, '1'),
+            'user_key': user_key,
+            'status': 'done',
+            'progress': 100,
+            'filename': filename,
+            'options': options,
+            'input_path': str(input_path),
+            'result_path': None,
+            'result': dict(options),
+            'error': None,
+            'created_at': now,
+            'updated_at': now,
+            'started_at': now,
+            'finished_at': now,
+            'deduplicated': False,
+            'retry_count': 0,
+            'rq_job_id': None,
+            'billing_request_id': None,
+            'billing_confirmed': False,
+        }
+        record = save_job(record, connection)
+        connection.setex(slot_key, job_record_ttl(record), job_id)
+        if previous_job_id and previous_job_id != job_id:
+            remove_source_upload(previous_job_id, job_type, user_key, connection)
+        return record
+    finally:
+        slot_lock.release()
+
+
 def submit_job(job_type, source, filename, options, user_key, connection=None, billing_request_id=None):
     connection = connection or redis_connection()
     cleanup_expired_job_files(connection)
@@ -239,7 +342,11 @@ def submit_job(job_type, source, filename, options, user_key, connection=None, b
         if isinstance(existing_id, bytes):
             existing_id = existing_id.decode('utf-8')
         existing = load_job(existing_id, connection) if existing_id else None
-        if existing and existing.get('status') in ACTIVE_STATUSES | {'done'}:
+        same_billing_request = (
+            not billing_request_id
+            or existing and existing.get('billing_request_id') == billing_request_id
+        )
+        if existing and same_billing_request and existing.get('status') in ACTIVE_STATUSES | {'done'}:
             if existing.get('status') in ACTIVE_STATUSES or completed_result_available(existing):
                 existing['deduplicated'] = True
                 if billing_key:
@@ -296,11 +403,17 @@ def submit_job(job_type, source, filename, options, user_key, connection=None, b
         from .tasks import mark_job_failed, mark_job_stopped
 
         try:
+            timeout_environment = (
+                'PDF_TO_PDF_JOB_TIMEOUT_SECONDS'
+                if job_type == 'pdf_to_pdf'
+                else 'PLT_JOB_TIMEOUT_SECONDS'
+            )
+            default_timeout = '210' if job_type == 'pdf_to_pdf' else '90'
             queue.enqueue_call(
                 'app.tasks.execute_job',
                 args=(job_id,),
                 job_id=record['rq_job_id'],
-                timeout=max(10, int(os.getenv('PLT_JOB_TIMEOUT_SECONDS', '90'))),
+                timeout=max(10, int(os.getenv(timeout_environment, default_timeout))),
                 result_ttl=retention,
                 failure_ttl=retention,
                 on_failure=Callback(mark_job_failed),

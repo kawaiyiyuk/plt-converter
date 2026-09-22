@@ -9,6 +9,8 @@ from flask import Blueprint, jsonify, request, send_file, url_for
 
 from .billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
 from .services.plt_metadata import inspect_plt
+from .services.pdf_to_pdf import pdf_page_count
+from .services.pdf_to_plt import DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM
 from .job_queue import (
     QueueRejected,
     cancel_job,
@@ -17,7 +19,9 @@ from .job_queue import (
     enqueue_pdf_layout_suggestion,
     load_job,
     queue_position,
+    read_source_upload,
     redis_connection,
+    store_source_upload,
     submit_job,
     update_job,
 )
@@ -38,10 +42,12 @@ def conversion_allow_charge():
     return (request.headers.get('X-Conversion-Allow-Charge') or '').lower() == 'true'
 
 
-def billing_error(error):
+def billing_error(error, extra=None):
     payload = {'error': str(error), 'status': 'billing_rejected'}
     if error.data:
         payload.update(error.data)
+    if extra:
+        payload.update(extra)
     return jsonify(payload), error.status_code
 
 
@@ -152,10 +158,18 @@ def job_response(record):
     if record.get('status') == 'queued':
         response['queue_position'] = queue_position(record['job_id'])
     result = record.get('result') or {}
+    if record.get('job_type') == 'pdf_to_pdf':
+        source_page_count = (record.get('options') or {}).get('source_page_count')
+        if source_page_count:
+            response['source_page_count'] = int(source_page_count)
+        if 'billing_released' in record:
+            response['billing_released'] = bool(record.get('billing_released'))
     if record.get('status') == 'done':
         response.update({key: value for key, value in result.items() if key not in {'result_path', 'mime_type'}})
         if record.get('job_type') == 'plt_to_pdf':
             response['pdf_path'] = url_for('plt.download_pdf', job_id=record['job_id'])
+        elif record.get('job_type') == 'pdf_to_pdf':
+            response['pdf_path'] = url_for('pdf.download_repaged_pdf', job_id=record['job_id'])
         elif record.get('job_type') == 'pdf_to_plt':
             response['plt_path'] = url_for('pdf.download_plt', job_id=record['job_id'])
         elif record.get('job_type') == 'pdf_preview':
@@ -405,6 +419,169 @@ def get_pdf_to_plt_job(job_id):
     if record:
         return jsonify(job_response(record))
     return jsonify({'error': '任务不存在或已过期'}), 404
+
+
+@pdf_bp.post('/repage/jobs')
+def create_pdf_to_pdf_job():
+    source_id = str(request.form.get('source_id') or '').strip()
+    uploaded = request.files.get('file')
+    if source_id:
+        try:
+            stored_source = read_source_upload(
+                source_id,
+                'pdf_to_pdf_source',
+                request_user_key(),
+            )
+        except RedisError as error:
+            return redis_unavailable(error)
+        except PermissionError as error:
+            return jsonify({'error': str(error)}), 403
+        if not stored_source:
+            return jsonify({'error': '页数识别结果已过期，请重新选择 PDF'}), 404
+        source_record, source = stored_source
+    else:
+        validation_error = validate_pdf_upload(uploaded)
+        if validation_error:
+            return validation_error
+    billing = None
+    record = None
+    billing_confirmed = False
+    source_page_count = None
+    try:
+        options = parse_pdf_to_pdf_options(request.form)
+        if source_id:
+            source_page_count = int(
+                (source_record.get('options') or {}).get('source_page_count')
+                or pdf_page_count(source)
+            )
+            source_filename = source_record.get('filename') or 'upload.pdf'
+        else:
+            source = uploaded.read()
+            source_page_count = pdf_page_count(source)
+            source_filename = uploaded.filename
+        options['source_page_count'] = source_page_count
+        billing = authorize_job('pdf_to_pdf')
+        record = submit_job(
+            'pdf_to_pdf',
+            source,
+            safe_uploaded_filename(request.form.get('original_filename') or source_filename),
+            options,
+            f"user:{billing['user_id']}",
+            billing_request_id=billing['request_id'],
+        )
+        record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
+        billing_confirmed = True
+    except BillingRejected as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        return billing_error(error, {'source_page_count': source_page_count})
+    except RedisError as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        return redis_unavailable(error)
+    except QueueRejected as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        return queue_error(error)
+    except ValueError as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        return jsonify({'error': str(error)}), 422
+    except Exception:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        raise
+    return jsonify(job_response(record)), 200
+
+
+@pdf_bp.post('/repage/inspect')
+def inspect_pdf_to_pdf_source():
+    uploaded = request.files.get('file')
+    validation_error = validate_pdf_upload(uploaded)
+    if validation_error:
+        return validation_error
+    try:
+        source = uploaded.read()
+        source_page_count = pdf_page_count(source)
+        record = store_source_upload(
+            'pdf_to_pdf_source',
+            source,
+            safe_uploaded_filename(uploaded.filename),
+            {'source_page_count': source_page_count},
+            request_user_key(),
+        )
+    except RedisError as error:
+        return redis_unavailable(error)
+    except QueueRejected as error:
+        return queue_error(error)
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 422
+    return jsonify({
+        'source_id': record['job_id'],
+        'source_page_count': source_page_count,
+    }), 200
+
+
+@pdf_bp.get('/repage/jobs/<job_id>')
+def get_pdf_to_pdf_job(job_id):
+    try:
+        record = owned_job(job_id, 'pdf_to_pdf')
+    except BillingRejected as error:
+        return billing_error(error)
+    if record:
+        return jsonify(job_response(record))
+    return jsonify({'error': '任务不存在或已过期'}), 404
+
+
+@pdf_bp.delete('/repage/jobs/<job_id>')
+def cancel_pdf_to_pdf_job(job_id):
+    billing_released = None
+    try:
+        user_key = authenticated_user_key()
+        owned = owned_job(job_id, 'pdf_to_pdf')
+        if not owned:
+            return jsonify({'error': '任务不存在或已过期'}), 404
+        record = cancel_job(job_id, user_key)
+        if record and record.get('status') == 'cancelled' and record.get('billing_request_id'):
+            billing_released = release_conversion(
+                int(user_key.split(':', 1)[1]),
+                record['billing_request_id'],
+                record['job_id'],
+            )
+            record = update_job(
+                record['job_id'],
+                billing_released=bool(billing_released),
+            )
+    except BillingRejected as error:
+        return billing_error(error)
+    except PermissionError as error:
+        return jsonify({'error': str(error)}), 403
+    except QueueRejected as error:
+        return queue_error(error)
+    except RedisError as error:
+        return redis_unavailable(error)
+    if not record:
+        return jsonify({'error': '任务不存在或已过期'}), 404
+    response = job_response(record)
+    if billing_released is not None:
+        response['billing_released'] = bool(billing_released)
+    return jsonify(response)
+
+
+@pdf_bp.get('/repage/files/<job_id>.pdf')
+def download_repaged_pdf(job_id):
+    try:
+        record = owned_job(job_id, 'pdf_to_pdf')
+    except BillingRejected as error:
+        return billing_error(error)
+    if not record:
+        return jsonify({'error': 'PDF 文件不存在或已过期'}), 404
+    output_path = Path(record.get('result_path')) if record.get('result_path') else None
+    if output_path is None or not output_path.exists():
+        return jsonify({'error': 'PDF 文件不存在或已过期'}), 404
+    filename = (record.get('result') or {}).get('filename', f'{job_id}.pdf')
+    return send_file(
+        output_path,
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
 
 
 @pdf_bp.get('/preview/jobs/<job_id>')
@@ -695,8 +872,15 @@ def parse_pdf_render_options(form):
         'crop_right_mm': non_negative_number('crop_right_mm'),
         'crop_top_mm': non_negative_number('crop_top_mm'),
         'crop_bottom_mm': non_negative_number('crop_bottom_mm'),
-        'line_width_mm': number('line_width_mm', 0.265),
+        'line_width_mm': number('line_width_mm', DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM),
         'enabled_pages': enabled_pages,
         'page_slots': page_slots,
         'output_rotation': output_rotation,
     }
+
+
+def parse_pdf_to_pdf_options(form):
+    paper_size = str(form.get('paper_size', '')).upper()
+    if paper_size not in {'A0', 'A1', 'A2', 'A3', 'A4'}:
+        raise ValueError('目标纸张只支持 A0、A1、A2、A3 或 A4')
+    return {'paper_size': paper_size}
