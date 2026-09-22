@@ -133,6 +133,35 @@ class JobQueueTest(unittest.TestCase):
         self.assertNotEqual(replacement['job_id'], first['job_id'])
         self.assertEqual(replacement['output_version'], 'next-version')
 
+    def test_pdf_to_plt_metric_pen_width_version_invalidates_old_completed_result(self):
+        options = {'units_per_inch': 1016, 'line_width_mm': 1.0}
+        with patch.dict(JOB_OUTPUT_VERSIONS, {'pdf_to_plt': '3-page-cropped'}):
+            first = submit_job(
+                'pdf_to_plt',
+                b'%PDF-old-width',
+                'sample.pdf',
+                options,
+                'user-a',
+                connection=self.redis,
+            )
+        from app.job_queue import update_job
+        result_path = Path(first['input_path']).parent / 'sample.plt'
+        result_path.write_bytes(b'IN;SP1;PW40;')
+        update_job(first['job_id'], self.redis, status='done', result_path=str(result_path))
+
+        replacement = submit_job(
+            'pdf_to_plt',
+            b'%PDF-old-width',
+            'sample.pdf',
+            options,
+            'user-a',
+            connection=self.redis,
+        )
+
+        self.assertEqual(JOB_OUTPUT_VERSIONS['pdf_to_plt'], '4-metric-pen-width')
+        self.assertNotEqual(replacement['job_id'], first['job_id'])
+        self.assertEqual(replacement['output_version'], '4-metric-pen-width')
+
     def test_transient_failure_retries_once(self):
         record = self.submit()
 
@@ -966,6 +995,9 @@ class JobQueueTest(unittest.TestCase):
         for value in ('45', '-90', 'abc'):
             with self.assertRaisesRegex(ValueError, 'output_rotation'):
                 parse_pdf_render_options({'output_rotation': value})
+
+    def test_pdf_render_options_default_to_one_mm_export_line_width(self):
+        self.assertEqual(parse_pdf_render_options({})['line_width_mm'], 1.0)
 
     def test_route_cancels_job_and_forwards_commit_balance_rejection(self):
         app = create_app()

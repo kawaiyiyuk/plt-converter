@@ -16,7 +16,7 @@ from .job_queue import (
     TERMINAL_STATUSES,
     update_job,
 )
-from .billing import release_conversion
+from .billing import commit_conversion, release_conversion
 from .services.pdf_renderer import render_pdf
 from .services.pdf_layout_optimizer import optimize_pdf_layout
 from .services.pdf_to_plt import (
@@ -24,7 +24,48 @@ from .services.pdf_to_plt import (
     inspect_pdf,
     read_pdf_layout_metadata,
 )
+from .services.pdf_to_pdf import convert_pdf_to_pdf
 from .services.plt_parser import parse_plt
+
+
+def release_failed_pdf_to_pdf_billing(record):
+    if not record or record.get('job_type') != 'pdf_to_pdf':
+        return False
+    user_key = str(record.get('user_key') or '')
+    request_id = record.get('billing_request_id')
+    job_id = record.get('job_id')
+    if not user_key.startswith('user:') or not request_id or not job_id:
+        return False
+    try:
+        return bool(release_conversion(int(user_key.split(':', 1)[1]), request_id, job_id))
+    except Exception:
+        # Preserve the original conversion failure. A reserved usage that cannot be
+        # released immediately still expires in the main backend.
+        return False
+
+
+def persist_cancelled_pdf_to_pdf_billing_release(record, connection):
+    """Release one cancelled composite reservation and persist the visible result."""
+    if not record or record.get('job_type') != 'pdf_to_pdf':
+        return record
+    billing_released = release_failed_pdf_to_pdf_billing(record)
+    return update_job(
+        record['job_id'],
+        connection,
+        billing_released=bool(billing_released),
+    )
+
+
+def commit_successful_pdf_to_pdf_billing(record):
+    if not record or record.get('job_type') != 'pdf_to_pdf':
+        return False
+    user_key = str(record.get('user_key') or '')
+    request_id = record.get('billing_request_id')
+    job_id = record.get('job_id')
+    if not user_key.startswith('user:') or not request_id or not job_id:
+        raise ValueError('PDF 纸张转换缺少计费信息')
+    commit_conversion(int(user_key.split(':', 1)[1]), request_id, job_id)
+    return True
 
 
 def execute_job(job_id):
@@ -69,7 +110,14 @@ def execute_job(job_id):
             release_user_job(record, connection)
             return None
         if record.get('cancel_requested'):
-            update_job(job_id, connection, status='cancelled', finished_at=time.time(), progress=0)
+            cancelled = update_job(
+                job_id,
+                connection,
+                status='cancelled',
+                finished_at=time.time(),
+                progress=0,
+            )
+            persist_cancelled_pdf_to_pdf_billing_release(cancelled, connection)
             release_user_job(load_job(job_id, connection), connection)
             return None
         started = time.time()
@@ -82,9 +130,17 @@ def execute_job(job_id):
         try:
             latest = load_job(job_id, connection)
             if latest and latest.get('cancel_requested'):
-                update_job(job_id, connection, status='cancelled', finished_at=time.time(), progress=0)
+                cancelled = update_job(
+                    job_id,
+                    connection,
+                    status='cancelled',
+                    finished_at=time.time(),
+                    progress=0,
+                )
+                persist_cancelled_pdf_to_pdf_billing_release(cancelled, connection)
                 release_user_job(load_job(job_id, connection), connection)
                 return None
+            commit_successful_pdf_to_pdf_billing(latest or record)
             finished = time.time()
             update_job(
                 job_id,
@@ -107,7 +163,14 @@ def execute_job(job_id):
         try:
             latest = load_job(job_id, connection)
             if latest and (latest.get('cancel_requested') or latest.get('status') == 'cancelling'):
-                update_job(job_id, connection, status='cancelled', progress=0, finished_at=time.time())
+                cancelled = update_job(
+                    job_id,
+                    connection,
+                    status='cancelled',
+                    progress=0,
+                    finished_at=time.time(),
+                )
+                persist_cancelled_pdf_to_pdf_billing_release(cancelled, connection)
                 release_user_job(load_job(job_id, connection), connection)
                 record_metric('cancelled', connection=connection)
                 return None
@@ -127,6 +190,7 @@ def execute_job(job_id):
             )
             release_user_job(load_job(job_id, connection), connection)
             record_metric('failed', connection=connection)
+            release_failed_pdf_to_pdf_billing(latest or record)
         finally:
             lock.release()
         raise
@@ -149,6 +213,13 @@ def execute_job(job_id):
             )
             release_user_job(load_job(job_id, connection), connection)
             record_metric('cancelled' if cancelled else 'failed', connection=connection)
+            if cancelled:
+                persist_cancelled_pdf_to_pdf_billing_release(
+                    load_job(job_id, connection),
+                    connection,
+                )
+            else:
+                release_failed_pdf_to_pdf_billing(latest or record)
         finally:
             lock.release()
         raise
@@ -165,7 +236,14 @@ def mark_job_failed(job, connection, type_, value, traceback):
             release_user_job(record, connection)
             return
         if record.get('cancel_requested') or record.get('status') == 'cancelling':
-            update_job(task_id, connection, status='cancelled', progress=0, finished_at=time.time())
+            cancelled = update_job(
+                task_id,
+                connection,
+                status='cancelled',
+                progress=0,
+                finished_at=time.time(),
+            )
+            persist_cancelled_pdf_to_pdf_billing_release(cancelled, connection)
             release_user_job(load_job(task_id, connection), connection)
             record_metric('cancelled', connection=connection)
             return
@@ -184,6 +262,7 @@ def mark_job_failed(job, connection, type_, value, traceback):
         )
         release_user_job(load_job(task_id, connection), connection)
         record_metric('failed', connection=connection)
+        release_failed_pdf_to_pdf_billing(record)
     finally:
         lock.release()
 
@@ -199,12 +278,19 @@ def enqueue_retry(task_id, connection, retries):
         rq_job_id=rq_job_id,
         error=None,
     )
+    record = load_job(task_id, connection)
+    timeout_environment = (
+        'PDF_TO_PDF_JOB_TIMEOUT_SECONDS'
+        if record and record.get('job_type') == 'pdf_to_pdf'
+        else 'PLT_JOB_TIMEOUT_SECONDS'
+    )
+    default_timeout = '210' if timeout_environment == 'PDF_TO_PDF_JOB_TIMEOUT_SECONDS' else '90'
     try:
         conversion_queue(connection).enqueue_call(
             'app.tasks.execute_job',
             args=(task_id,),
             job_id=rq_job_id,
-            timeout=max(10, int(os.getenv('PLT_JOB_TIMEOUT_SECONDS', '90'))),
+            timeout=max(10, int(os.getenv(timeout_environment, default_timeout))),
             result_ttl=max(60, int(os.getenv('PLT_JOB_RETENTION_SECONDS', '1800'))),
             failure_ttl=max(60, int(os.getenv('PLT_JOB_RETENTION_SECONDS', '1800'))),
             on_failure=Callback(mark_job_failed),
@@ -219,6 +305,7 @@ def enqueue_retry(task_id, connection, retries):
             error=f'任务重试入队失败: {error}',
             finished_at=time.time(),
         )
+        release_failed_pdf_to_pdf_billing(record)
         release_user_job(load_job(task_id, connection), connection)
         record_metric('failed', connection=connection)
         return False
@@ -236,13 +323,14 @@ def mark_job_stopped(job, connection):
         if record.get('status') in {'done', 'failed', 'cancelled'}:
             release_user_job(record, connection)
             return
-        update_job(
+        cancelled = update_job(
             task_id,
             connection,
             status='cancelled',
             progress=0,
             finished_at=time.time(),
         )
+        persist_cancelled_pdf_to_pdf_billing_release(cancelled, connection)
     finally:
         lock.release()
     release_user_job(load_job(task_id, connection), connection)
@@ -383,6 +471,19 @@ def _execute(record, connection):
         output_path = job_root / f"{Path(record['filename']).stem}.plt"
         output_path.write_bytes(plt)
         return {'result_path': str(output_path), 'filename': output_path.name, 'layout': layout, 'mime_type': 'application/octet-stream'}
+
+    if job_type == 'pdf_to_pdf':
+        update_job(job_id, connection, progress=25)
+        pdf, conversion = convert_pdf_to_pdf(source, options)
+        paper_size = str(options.get('paper_size', 'A4')).upper()
+        output_path = job_root / f"{Path(record['filename']).stem}-{paper_size}.pdf"
+        output_path.write_bytes(pdf)
+        return {
+            'result_path': str(output_path),
+            'filename': output_path.name,
+            **conversion,
+            'mime_type': 'application/pdf',
+        }
 
     if job_type == 'pdf_preview':
         preview_folder = job_root / 'previews'

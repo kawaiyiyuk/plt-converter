@@ -12,7 +12,8 @@
 - PDF 页面预览和页数识别
 - PDF 矢量路径转 HPGL/PLT，图片 PDF 提供降级描边转换
 - Python HPGL/PLT 矢量解析
-- A4/A3/A1/A0/Letter 分页 PDF 生成
+- A4/A3/A2/A1/A0/Letter 分页 PDF 生成
+- PDF 一键转换为 A0～A4 目标纸张，内部自动完成可靠拼版识别、PDF→PLT→PDF，不向客户端暴露中间文件
 - 页边距、页码、单页输出和指定页选择
 - Docker/Gunicorn 启动配置
 - Redis + RQ 异步任务队列，带队列容量、用户并发、限流、去重和取消
@@ -64,6 +65,11 @@ GET  /api/v1/pdf/preview/jobs/<job_id>
 POST /api/v1/pdf/jobs
 GET  /api/v1/pdf/jobs/<job_id>
 DELETE /api/v1/pdf/jobs/<job_id>
+POST /api/v1/pdf/repage/jobs
+POST /api/v1/pdf/repage/inspect
+GET  /api/v1/pdf/repage/jobs/<job_id>
+DELETE /api/v1/pdf/repage/jobs/<job_id>
+GET  /api/v1/pdf/repage/files/<job_id>.pdf
 GET  /api/v1/pdf/previews/<preview_id>/<page>.png
 ```
 
@@ -72,6 +78,8 @@ GET  /api/v1/pdf/previews/<preview_id>/<page>.png
 PDF→PLT 生成结果同样受 `PLT_MAX_PATHS`、`PLT_MAX_COMMANDS`、`PLT_MAX_POINTS` 和 `PLT_MAX_DIMENSION_MM` 约束；超限时任务失败，不返回本服务随后无法重新解析的 PLT。
 
 `GET /api/v1/pdf/preview/jobs/<job_id>/layout-suggestion` 不在 API 请求线程内直接扫描 PDF。首次调用把分析放入 `pdf-layout-analysis` 队列并返回 HTTP 202 / `analyzing`，客户端继续轮询；完成后同一接口返回缓存建议。正式转换和排版分析分别由独立 RQ Worker 消费，两个队列互不等待；健康检查要求两个队列都存在活跃消费者。
+
+`POST /api/v1/pdf/repage/inspect` 在用户选择 PDF 后立即返回原 PDF 页数和可复用的 `source_id`；临时源文件默认保留 1800 秒。`POST /api/v1/pdf/repage/jobs` 通过同一客户端的 `source_id` 复用文件，不再重复上传，且只接受 A0～A4。成功结果同时返回原 PDF 页数和输出 PDF 页数。单页 PDF 按 1×1 处理；多页 PDF 仅在本服务排版元数据有效，或矢量接缝分析达到中/高可信度时自动转换。证据不足、纯图片多页或版式歧义会明确失败，不猜测拼版。该组合任务先预留一次额度，超额时暂时冻结 50 布豆，只有 PDF 成功生成后才转为正式消费；失败或完成前取消会释放预留并退回冻结布豆。预留有效期默认 150 分钟，覆盖 20 个队列任务、210 秒单次超时及一次重试的最坏生命周期。
 
 ## Docker
 
@@ -131,6 +139,7 @@ cd /opt/plt-converter
 ```text
 PLT_QUEUE_MAX_PENDING=20
 PLT_JOB_TIMEOUT_SECONDS=90
+PDF_TO_PDF_JOB_TIMEOUT_SECONDS=210
 PLT_JOB_RETENTION_SECONDS=1800
 PLT_RATE_LIMIT_PER_MINUTE=3
 PLT_PREVIEW_RATE_LIMIT_PER_MINUTE=12

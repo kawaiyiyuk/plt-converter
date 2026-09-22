@@ -11,6 +11,7 @@ EDITOR_PREVIEW_WIDTH_PX = 1080
 RASTER_DPI = 96
 MAX_RASTER_SEGMENTS = 60000
 MM_TO_PT = 72 / 25.4
+DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM = 1.0
 
 
 def inspect_pdf(source, preview_folder, preview_id):
@@ -84,7 +85,10 @@ def convert_pdf_to_plt(source, options=None):
     options = options or {}
     fitz = load_fitz()
     units_per_inch = positive_int(options.get('units_per_inch', 1016), 'units_per_inch', 100000)
-    line_width_mm = max(0.03, float(options.get('line_width_mm', 0.265)))
+    line_width_mm = max(
+        0.03,
+        float(options.get('line_width_mm', DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM)),
+    )
     margin_mm = clamp(float(options.get('margin_mm', 0)), 0, 100)
     crop_margins = parse_crop_margins(options)
     rows = positive_int(options.get('rows', 1), 'rows')
@@ -642,9 +646,8 @@ def offset_shape(shape, offset_x, offset_y):
 
 
 def serialize_hpgl(shapes, units_per_inch, line_width_mm):
-    commands = ['IN;', 'SP1;']
-    width_units = max(1, round(line_width_mm * units_per_inch / 25.4))
-    commands.append(f'PW{width_units};')
+    commands = ['IN;', 'WU0;', 'SP1;']
+    commands.append(f'PW{format_hpgl_decimal(line_width_mm)};')
     for shape in shapes:
         if len(shape) < 2:
             continue
@@ -666,7 +669,7 @@ def validate_generated_plt(shapes, units_per_inch):
     if emitted_points > maximum_points:
         raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
 
-    emitted_commands = 5 + len(valid_shapes) * 2
+    emitted_commands = 6 + len(valid_shapes) * 2
     maximum_commands = max(1000, int(os.getenv('PLT_MAX_COMMANDS', '250000')))
     if emitted_commands > maximum_commands:
         raise ValueError(f'PLT 命令数量过多，最多支持 {maximum_commands} 条')
@@ -684,6 +687,10 @@ def validate_generated_plt(shapes, units_per_inch):
 
 def format_point(point):
     return f"{int(round(point['x']))},{int(round(point['y']))}"
+
+
+def format_hpgl_decimal(value):
+    return f'{float(value):.6f}'.rstrip('0').rstrip('.')
 
 
 def positive_int(value, name, maximum=24):
