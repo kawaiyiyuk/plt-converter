@@ -5,7 +5,7 @@ import re
 import unicodedata
 from pathlib import Path
 
-from flask import Blueprint, jsonify, request, send_file, url_for
+from flask import Blueprint, current_app, jsonify, request, send_file, url_for
 
 from .billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
 from .services.plt_metadata import inspect_plt
@@ -743,6 +743,9 @@ def validate_upload(uploaded):
     extension = uploaded.filename.rsplit('.', 1)[-1].lower() if '.' in uploaded.filename else ''
     if extension not in ALLOWED_EXTENSIONS:
         return jsonify({'error': '只支持 .plt、.hpgl 或 .txt 文件'}), 415
+    size_error = validate_uploaded_file_size(uploaded)
+    if size_error:
+        return size_error
     return None
 
 
@@ -752,6 +755,24 @@ def validate_pdf_upload(uploaded):
     extension = uploaded.filename.rsplit('.', 1)[-1].lower() if '.' in uploaded.filename else ''
     if extension not in PDF_ALLOWED_EXTENSIONS:
         return jsonify({'error': '只支持 .pdf 文件'}), 415
+    size_error = validate_uploaded_file_size(uploaded)
+    if size_error:
+        return size_error
+    return None
+
+
+def validate_uploaded_file_size(uploaded):
+    maximum_bytes = int(current_app.config['PLT_MAX_UPLOAD_BYTES'])
+    try:
+        position = uploaded.stream.tell()
+        uploaded.stream.seek(0, os.SEEK_END)
+        size = uploaded.stream.tell()
+        uploaded.stream.seek(position)
+    except (AttributeError, OSError, ValueError):
+        return None
+    if size > maximum_bytes:
+        maximum_mb = int(current_app.config['PLT_MAX_UPLOAD_MB'])
+        return jsonify({'error': f'上传文件不能超过 {maximum_mb}MB'}), 413
     return None
 
 

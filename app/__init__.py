@@ -12,11 +12,16 @@ from .routes import pdf_bp, plt_bp
 def create_app():
     app = Flask(__name__)
     max_upload_mb = max(1, int(os.getenv('PLT_MAX_UPLOAD_MB', '20')))
+    max_upload_bytes = max_upload_mb * 1024 * 1024
     temp_folder = Path(os.getenv('PLT_TEMP_FOLDER', '/tmp/plt-converter'))
     temp_folder.mkdir(parents=True, exist_ok=True)
     app.config.update(
-        MAX_CONTENT_LENGTH=max_upload_mb * 1024 * 1024,
+        # Flask applies this limit to the complete multipart request, not just the
+        # selected file. Keep room for multipart headers and enforce the exact file
+        # limit in the upload validators.
+        MAX_CONTENT_LENGTH=max_upload_bytes + 1024 * 1024,
         PLT_MAX_UPLOAD_MB=max_upload_mb,
+        PLT_MAX_UPLOAD_BYTES=max_upload_bytes,
         PLT_TEMP_FOLDER=str(temp_folder),
         PLT_TEMP_RETENTION_SECONDS=max(60, int(os.getenv('PLT_TEMP_RETENTION_SECONDS', '1800'))),
     )
