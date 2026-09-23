@@ -172,9 +172,13 @@ CONVERSION_SERVICE_TOKEN=<与主后台相同的服务密钥>
 
 ## 验证
 
+按改动选择下列现有命令，从仓库根目录运行。单元测试使用本地 `.venv` 和 `requirements-dev.txt`；`compileall` 检查语法，`bash -n` 检查部署脚本语法，`docker compose config` 只解析本地 Compose 配置。它们不证明 Redis 队列、真实转换文件、主后台回调或目标环境已通过。
+
 ```bash
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 .venv/bin/python -m compileall -q app worker.py
 bash -n scripts/deploy-production.sh
 docker compose config
 ```
+
+只修改相关 Python 行为时可用 `.venv/bin/python -m unittest discover -s tests -p 'test_pdf_options.py'` 之类的实际测试文件先做定向验证，再按风险扩展。仅改文档时核对链接、`git diff --check` 与 `git status --short` 即可。验证报告需写明实际运行的命令、环境、结果和未验证边界；生产读取、预检或部署需要当前任务对具体操作的明确授权。
