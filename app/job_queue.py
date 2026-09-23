@@ -302,7 +302,10 @@ def store_source_upload(job_type, source, filename, options, user_key, connectio
         slot_lock.release()
 
 
-def submit_job(job_type, source, filename, options, user_key, connection=None, billing_request_id=None):
+def submit_job(
+    job_type, source, filename, options, user_key, connection=None,
+    billing_request_id=None, billing_access_method=None,
+):
     connection = connection or redis_connection()
     cleanup_expired_job_files(connection)
     output_version = JOB_OUTPUT_VERSIONS.get(job_type, '1')
@@ -389,6 +392,7 @@ def submit_job(job_type, source, filename, options, user_key, connection=None, b
             'retry_count': 0,
             'rq_job_id': f'{job_id}:0',
             'billing_request_id': billing_request_id,
+            'billing_access_method': billing_access_method,
             'billing_confirmed': not bool(billing_request_id),
         }
         save_job(record, connection)

@@ -195,15 +195,13 @@ class PdfToPdfTest(unittest.TestCase):
         authorize.assert_called_once_with('pdf_to_pdf')
         commit.assert_not_called()
 
-    def test_paid_confirmation_response_includes_source_page_count(self):
+    def test_ad_required_response_includes_source_page_count(self):
         app = create_app()
         rejection = BillingRejected(
             '今日免费额度已用完',
             402,
             {
-                'charge_required': True,
-                'required_points': 50,
-                'current_balance': 120,
+                'ad_required': True,
             },
         )
         with patch('app.routes.redis_connection', return_value=self.redis), \
@@ -220,8 +218,28 @@ class PdfToPdfTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 402)
         body = response.get_json()
-        self.assertTrue(body['charge_required'])
+        self.assertTrue(body['ad_required'])
         self.assertEqual(body['source_page_count'], 9)
+
+    def test_ad_backed_paper_job_starts_attempt_before_worker_runs(self):
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.pdf_page_count', return_value=1), \
+                patch('app.routes.authorize_job', return_value={
+                    'user_id': 7,
+                    'request_id': 'ad-paper-request',
+                    'access_method': 'ad',
+                }), \
+                patch('app.routes.commit_conversion', return_value={'success': True}) as commit:
+            response = app.test_client().post(
+                '/api/v1/pdf/repage/jobs',
+                data={'paper_size': 'A4', 'file': (io.BytesIO(b'%PDF'), 'sample.pdf')},
+            )
+        self.assertEqual(response.status_code, 200)
+        record = load_job(response.get_json()['job_id'], self.redis)
+        self.assertEqual(record['billing_access_method'], 'ad')
+        commit.assert_called_once_with(7, 'ad-paper-request', record['job_id'])
 
     def test_distinct_billing_request_does_not_reuse_same_fingerprint_job(self):
         with patch('app.job_queue.redis_connection', return_value=self.redis):
@@ -280,7 +298,7 @@ class PdfToPdfTest(unittest.TestCase):
                 }) as commit:
             result = execute_job(record['job_id'])
 
-        commit.assert_called_once_with(7, 'pdf-to-pdf-success', record['job_id'])
+        commit.assert_called_once_with(7, 'pdf-to-pdf-success', record['job_id'], completed=True)
         self.assertEqual(result['filename'], 'sample-A2.pdf')
         self.assertEqual(load_job(record['job_id'], self.redis)['status'], 'done')
 

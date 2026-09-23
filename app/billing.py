@@ -92,13 +92,18 @@ def release_conversion(user_id, request_id, job_id=None):
         return False
 
 
-def commit_conversion(user_id, request_id, job_id):
+def commit_conversion(user_id, request_id, job_id, completed=False):
     service_token = os.getenv('CONVERSION_SERVICE_TOKEN', '')
     if not service_token:
         raise BillingRejected('转换计费服务未配置', 503)
     status, body = _json_request(
         '/api/v1/points/conversion/commit',
-        {'user_id': user_id, 'request_id': request_id, 'job_id': job_id},
+        {
+            'user_id': user_id,
+            'request_id': request_id,
+            'job_id': job_id,
+            'completed': bool(completed),
+        },
         {'X-Conversion-Service-Token': service_token},
     )
     if status != 200:

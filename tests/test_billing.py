@@ -2,9 +2,38 @@ import unittest
 from unittest.mock import patch
 
 from app.billing import BillingRejected, authorize_conversion, commit_conversion, identify_user
+from app.tasks import commit_successful_conversion_billing, release_failed_conversion_billing
 
 
 class BillingTest(unittest.TestCase):
+    @patch('app.tasks.release_conversion', return_value=True)
+    def test_failed_ad_job_releases_credit_but_old_regular_job_does_not(self, release):
+        record = {
+            'job_type': 'plt_to_pdf',
+            'billing_access_method': 'ad',
+            'user_key': 'user:42',
+            'billing_request_id': 'ad-request',
+            'job_id': 'job-1',
+        }
+        self.assertTrue(release_failed_conversion_billing(record))
+        release.assert_called_once_with(42, 'ad-request', 'job-1')
+        release.reset_mock()
+        record['billing_access_method'] = 'points'
+        self.assertFalse(release_failed_conversion_billing(record))
+        release.assert_not_called()
+
+    @patch('app.tasks.commit_conversion', return_value={})
+    def test_successful_ad_job_finalizes_credit(self, commit):
+        record = {
+            'job_type': 'pdf_to_plt',
+            'billing_access_method': 'ad',
+            'user_key': 'user:42',
+            'billing_request_id': 'ad-request',
+            'job_id': 'job-1',
+        }
+        self.assertTrue(commit_successful_conversion_billing(record))
+        commit.assert_called_once_with(42, 'ad-request', 'job-1', completed=True)
+
     def test_job_authorization_requires_login(self):
         with self.assertRaises(BillingRejected) as raised:
             authorize_conversion('', 'request-1', 'pdf_to_plt')
@@ -12,21 +41,17 @@ class BillingTest(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 401)
 
     @patch('app.billing._json_request')
-    def test_charge_required_is_forwarded(self, request):
+    def test_ad_required_is_forwarded(self, request):
         request.return_value = (402, {
-            'message': '需要付费',
-            'data': {
-                'charge_required': True,
-                'required_points': 50,
-                'current_balance': 100,
-            },
+            'message': '需要观看广告',
+            'data': {'ad_required': True},
         })
 
         with self.assertRaises(BillingRejected) as raised:
             authorize_conversion('Bearer token', 'request-2', 'plt_to_pdf')
 
         self.assertEqual(raised.exception.status_code, 402)
-        self.assertTrue(raised.exception.data['charge_required'])
+        self.assertTrue(raised.exception.data['ad_required'])
 
     @patch('app.billing._json_request')
     def test_identity_uses_verified_backend_user(self, request):
@@ -44,21 +69,22 @@ class BillingTest(unittest.TestCase):
             request.call_args.args[2]['X-Conversion-Service-Token'],
             'service-token',
         )
+        self.assertFalse(request.call_args.args[1]['completed'])
 
     @patch.dict('os.environ', {'CONVERSION_SERVICE_TOKEN': 'service-token'})
     @patch('app.billing._json_request')
-    def test_commit_rejection_forwards_balance_details(self, request):
-        request.return_value = (400, {
-            'message': '布豆余额不足',
-            'data': {'required_points': 50, 'current_balance': 20},
+    def test_commit_rejection_forwards_ad_details(self, request):
+        request.return_value = (409, {
+            'message': '广告资格已失效',
+            'data': {'ad_required': True},
         })
 
         with self.assertRaises(BillingRejected) as raised:
-            commit_conversion(42, 'request-4', 'job-4')
+            commit_conversion(42, 'request-4', 'job-4', completed=True)
 
-        self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(raised.exception.data['required_points'], 50)
-        self.assertEqual(raised.exception.data['current_balance'], 20)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertTrue(raised.exception.data['ad_required'])
+        self.assertTrue(request.call_args.args[1]['completed'])
 
 
 if __name__ == '__main__':

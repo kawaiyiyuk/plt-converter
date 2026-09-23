@@ -250,6 +250,7 @@ def create_conversion_job():
             },
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
+            billing_access_method=billing.get('access_method'),
         )
         commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         billing_confirmed = True
@@ -288,6 +289,16 @@ def cancel_conversion_job(job_id):
     try:
         user_key = authenticated_user_key()
         record = cancel_job(job_id, user_key)
+        if (
+            record and record.get('status') == 'cancelled'
+            and record.get('billing_access_method') == 'ad'
+            and record.get('billing_request_id')
+        ):
+            release_conversion(
+                int(user_key.split(':', 1)[1]),
+                record['billing_request_id'],
+                record['job_id'],
+            )
     except BillingRejected as error:
         return billing_error(error)
     except PermissionError as error:
@@ -388,6 +399,7 @@ def create_pdf_to_plt_job():
             parse_pdf_render_options(request.form),
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
+            billing_access_method=billing.get('access_method'),
         )
         commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         billing_confirmed = True
@@ -468,7 +480,10 @@ def create_pdf_to_pdf_job():
             options,
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
+            billing_access_method=billing.get('access_method'),
         )
+        if billing.get('access_method') == 'ad':
+            commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
         billing_confirmed = True
     except BillingRejected as error:
@@ -686,6 +701,16 @@ def cancel_pdf_to_plt_job(job_id):
     try:
         user_key = authenticated_user_key()
         record = cancel_job(job_id, user_key)
+        if (
+            record and record.get('status') == 'cancelled'
+            and record.get('billing_access_method') == 'ad'
+            and record.get('billing_request_id')
+        ):
+            release_conversion(
+                int(user_key.split(':', 1)[1]),
+                record['billing_request_id'],
+                record['job_id'],
+            )
     except BillingRejected as error:
         return billing_error(error)
     except PermissionError as error:
