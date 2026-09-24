@@ -77,17 +77,23 @@ def identify_user(authorization):
     return f'user:{user_id}'
 
 
-def release_conversion(user_id, request_id, job_id=None):
+def release_conversion(user_id, request_id, job_id=None, rollback_completed=False):
     service_token = os.getenv('CONVERSION_SERVICE_TOKEN', '')
     if not service_token:
         return False
     try:
-        status, _body = _json_request(
+        payload = {'user_id': user_id, 'request_id': request_id, 'job_id': job_id}
+        if rollback_completed:
+            payload['rollback_completed'] = True
+        status, body = _json_request(
             '/api/v1/points/conversion/release',
-            {'user_id': user_id, 'request_id': request_id, 'job_id': job_id},
+            payload,
             {'X-Conversion-Service-Token': service_token},
         )
-        return status == 200
+        if status != 200:
+            return False
+        data = body.get('data') or {}
+        return data.get('released') is True or data.get('idempotent') is True
     except BillingRejected:
         return False
 

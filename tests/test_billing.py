@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from app.billing import BillingRejected, authorize_conversion, commit_conversion, identify_user
+from app.billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
 from app.tasks import commit_successful_conversion_billing, release_failed_conversion_billing
 
 
@@ -85,6 +85,23 @@ class BillingTest(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertTrue(raised.exception.data['ad_required'])
         self.assertTrue(request.call_args.args[1]['completed'])
+
+    @patch.dict('os.environ', {'CONVERSION_SERVICE_TOKEN': 'service-token'})
+    @patch('app.billing._json_request')
+    def test_release_checks_whether_backend_actually_released_usage(self, request):
+        request.return_value = (200, {'data': {'released': False, 'points_refunded': 0}})
+        self.assertFalse(release_conversion(42, 'completed-free', 'job-1'))
+
+        request.return_value = (200, {'data': {'released': True, 'points_refunded': 0}})
+        self.assertTrue(release_conversion(42, 'failed-free', 'job-2'))
+
+        request.return_value = (200, {'data': {'released': False, 'idempotent': True}})
+        self.assertTrue(release_conversion(42, 'already-released', 'job-3'))
+
+        self.assertTrue(release_conversion(
+            42, 'lost-output', 'job-4', rollback_completed=True,
+        ))
+        self.assertTrue(request.call_args.args[1]['rollback_completed'])
 
 
 if __name__ == '__main__':

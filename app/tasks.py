@@ -7,6 +7,7 @@ from rq.job import Callback
 from rq.timeouts import JobTimeoutException
 
 from .job_queue import (
+    QueueRejected,
     acquire_job_lock,
     conversion_queue,
     load_job,
@@ -16,7 +17,7 @@ from .job_queue import (
     TERMINAL_STATUSES,
     update_job,
 )
-from .billing import commit_conversion, release_conversion
+from .billing import BillingRejected, commit_conversion, release_conversion
 from .services.pdf_renderer import render_pdf
 from .services.pdf_layout_optimizer import optimize_pdf_layout
 from .services.pdf_to_plt import (
@@ -28,11 +29,15 @@ from .services.pdf_to_pdf import convert_pdf_to_pdf
 from .services.plt_parser import parse_plt
 
 
+def _requires_conversion_billing(record):
+    return bool(record and (
+        record.get('job_type') == 'pdf_to_pdf'
+        or record.get('billing_access_method') in {'ad', 'free'}
+    ))
+
+
 def release_failed_conversion_billing(record):
-    if not record or (
-        record.get('job_type') != 'pdf_to_pdf'
-        and record.get('billing_access_method') not in {'ad', 'free'}
-    ):
+    if not _requires_conversion_billing(record):
         return False
     user_key = str(record.get('user_key') or '')
     request_id = record.get('billing_request_id')
@@ -40,7 +45,8 @@ def release_failed_conversion_billing(record):
     if not user_key.startswith('user:') or not request_id or not job_id:
         return False
     try:
-        return bool(release_conversion(int(user_key.split(':', 1)[1]), request_id, job_id))
+        options = {'rollback_completed': True} if record.get('billing_release_completed') else {}
+        return bool(release_conversion(int(user_key.split(':', 1)[1]), request_id, job_id, **options))
     except Exception:
         # Preserve the original conversion failure. A reserved usage that cannot be
         # released immediately still expires in the main backend.
@@ -49,10 +55,7 @@ def release_failed_conversion_billing(record):
 
 def persist_terminal_conversion_billing_release(record, connection):
     """Release a failed/cancelled free or ad-backed job and persist the result."""
-    if not record or (
-        record.get('job_type') != 'pdf_to_pdf'
-        and record.get('billing_access_method') not in {'ad', 'free'}
-    ):
+    if not _requires_conversion_billing(record):
         return record
     billing_released = release_failed_conversion_billing(record)
     return update_job(
@@ -63,10 +66,7 @@ def persist_terminal_conversion_billing_release(record, connection):
 
 
 def commit_successful_conversion_billing(record):
-    if not record or (
-        record.get('job_type') != 'pdf_to_pdf'
-        and record.get('billing_access_method') not in {'ad', 'free'}
-    ):
+    if not _requires_conversion_billing(record):
         return False
     user_key = str(record.get('user_key') or '')
     request_id = record.get('billing_request_id')
@@ -75,6 +75,67 @@ def commit_successful_conversion_billing(record):
         raise ValueError('转换任务缺少额度信息')
     commit_conversion(int(user_key.split(':', 1)[1]), request_id, job_id, completed=True)
     return True
+
+
+def finalize_ready_conversion_job(job_id, connection=None):
+    """Retry billing for a saved output before making the result visible."""
+    connection = connection or redis_connection()
+    lock = acquire_job_lock(job_id, connection)
+    try:
+        record = load_job(job_id, connection)
+        if not record or record.get('status') != 'finalizing':
+            return record
+        missing_output = not record.get('result_path') or not Path(record['result_path']).is_file()
+        try:
+            if missing_output:
+                raise ValueError('转换结果文件不存在')
+            commit_successful_conversion_billing(record)
+        except BillingRejected as error:
+            if error.status_code >= 500:
+                raise
+            failure = str(error)
+        except ValueError as error:
+            failure = str(error)
+        else:
+            done = update_job(
+                job_id, connection, status='done', progress=100,
+                finished_at=time.time(),
+            )
+            release_user_job(done, connection)
+            return done
+
+        failed = update_job(
+            job_id, connection, status='failed', progress=0,
+            error=failure, finished_at=time.time(),
+            billing_release_completed=missing_output,
+        )
+        persist_terminal_conversion_billing_release(failed, connection)
+        release_user_job(load_job(job_id, connection), connection)
+        return load_job(job_id, connection)
+    finally:
+        lock.release()
+
+
+def reconcile_finalizing_jobs(connection=None):
+    """Retry saved outputs even when the user is not polling the job."""
+    connection = connection or redis_connection()
+    jobs_root = Path(os.getenv('PLT_TEMP_FOLDER', '/tmp/plt-converter')) / 'jobs'
+    if not jobs_root.exists():
+        return 0
+    completed = 0
+    for job_folder in jobs_root.iterdir():
+        if not job_folder.is_dir():
+            continue
+        record = load_job(job_folder.name, connection)
+        if not record or record.get('status') != 'finalizing':
+            continue
+        try:
+            finalized = finalize_ready_conversion_job(record['job_id'], connection)
+        except (BillingRejected, QueueRejected):
+            continue
+        if finalized and finalized.get('status') == 'done':
+            completed += 1
+    return completed
 
 
 def _update_job_progress(job_id, connection, progress):
@@ -120,11 +181,17 @@ def execute_job(job_id):
             return None
         time.sleep(0.05)
 
+    if pending and pending.get('status') == 'finalizing':
+        finalized = finalize_ready_conversion_job(job_id, connection)
+        return (finalized or {}).get('result') if finalized and finalized.get('status') == 'done' else None
+
     lock = acquire_job_lock(job_id, connection)
     try:
         record = load_job(job_id, connection)
         if not record or record.get('status') in TERMINAL_STATUSES:
             release_user_job(record, connection)
+            return None
+        if record.get('status') == 'finalizing':
             return None
         if record.get('cancel_requested'):
             cancelled = update_job(
@@ -157,20 +224,26 @@ def execute_job(job_id):
                 persist_terminal_conversion_billing_release(cancelled, connection)
                 release_user_job(load_job(job_id, connection), connection)
                 return None
-            commit_successful_conversion_billing(latest or record)
             finished = time.time()
-            update_job(
-                job_id,
-                connection,
-                status='done',
-                progress=100,
-                result=result,
-                result_path=result.get('result_path'),
-                finished_at=finished,
-                duration_ms=round((finished - started) * 1000),
-            )
+            if _requires_conversion_billing(latest or record):
+                update_job(
+                    job_id, connection, status='finalizing', progress=95,
+                    result=result, result_path=result.get('result_path'),
+                    duration_ms=round((finished - started) * 1000),
+                )
+            else:
+                update_job(
+                    job_id, connection, status='done', progress=100,
+                    result=result, result_path=result.get('result_path'),
+                    finished_at=finished,
+                    duration_ms=round((finished - started) * 1000),
+                )
         finally:
             lock.release()
+        if _requires_conversion_billing(latest or record):
+            finalized = finalize_ready_conversion_job(job_id, connection)
+            if not finalized or finalized.get('status') != 'done':
+                return None
         release_user_job(load_job(job_id, connection), connection)
         record_metric('completed', connection=connection)
         connection.hincrby('plt-converter:metrics', 'duration_ms_total', round((finished - started) * 1000))
@@ -179,6 +252,8 @@ def execute_job(job_id):
         lock = acquire_job_lock(job_id, connection)
         try:
             latest = load_job(job_id, connection)
+            if latest and latest.get('status') in {'finalizing', 'done'}:
+                return latest.get('result')
             if latest and (latest.get('cancel_requested') or latest.get('status') == 'cancelling'):
                 cancelled = update_job(
                     job_id,
@@ -215,6 +290,8 @@ def execute_job(job_id):
         lock = acquire_job_lock(job_id, connection)
         try:
             latest = load_job(job_id, connection)
+            if latest and latest.get('status') in {'finalizing', 'done'}:
+                return latest.get('result')
             cancelled = latest and (
                 latest.get('cancel_requested') or latest.get('status') == 'cancelling'
             )
@@ -251,6 +328,8 @@ def mark_job_failed(job, connection, type_, value, traceback):
             return
         if record.get('status') in {'done', 'failed', 'cancelled'}:
             release_user_job(record, connection)
+            return
+        if record.get('status') == 'finalizing':
             return
         if record.get('cancel_requested') or record.get('status') == 'cancelling':
             cancelled = update_job(
@@ -339,6 +418,8 @@ def mark_job_stopped(job, connection):
             return
         if record.get('status') in {'done', 'failed', 'cancelled'}:
             release_user_job(record, connection)
+            return
+        if record.get('status') == 'finalizing':
             return
         cancelled = update_job(
             task_id,

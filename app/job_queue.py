@@ -15,7 +15,7 @@ from rq.registry import StartedJobRegistry
 
 
 TERMINAL_STATUSES = {'done', 'failed', 'cancelled', 'expired'}
-ACTIVE_STATUSES = {'billing_pending', 'queued', 'processing', 'cancelling'}
+ACTIVE_STATUSES = {'billing_pending', 'queued', 'processing', 'finalizing', 'cancelling'}
 JOB_OUTPUT_VERSIONS = {
     'plt_to_pdf': '4-single-page-selection',
     'pdf_to_plt': '4-metric-pen-width',
@@ -91,6 +91,8 @@ def save_job(record, connection=None):
 
 def job_record_ttl(record=None):
     retention = max(60, int(os.getenv('PLT_JOB_RETENTION_SECONDS', '1800')))
+    if record and record.get('status') == 'finalizing':
+        return max(retention, 150 * 60)
     if (record and record.get('status') in {'failed', 'cancelled'}
             and record.get('billing_request_id')
             and record.get('billing_released') is False):
@@ -531,6 +533,8 @@ def cancel_job(job_id, user_key=None, connection=None):
         if user_key and record.get('user_key') != user_key:
             raise PermissionError('无权取消该任务')
         if record.get('status') in TERMINAL_STATUSES:
+            return record
+        if record.get('status') == 'finalizing':
             return record
         rq_job_id = record.get('rq_job_id') or job_id
         try:
