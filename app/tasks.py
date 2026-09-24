@@ -31,7 +31,7 @@ from .services.plt_parser import parse_plt
 def release_failed_conversion_billing(record):
     if not record or (
         record.get('job_type') != 'pdf_to_pdf'
-        and record.get('billing_access_method') != 'ad'
+        and record.get('billing_access_method') not in {'ad', 'free'}
     ):
         return False
     user_key = str(record.get('user_key') or '')
@@ -48,10 +48,10 @@ def release_failed_conversion_billing(record):
 
 
 def persist_terminal_conversion_billing_release(record, connection):
-    """Release a failed/cancelled paper or ad-backed job and persist the result."""
+    """Release a failed/cancelled free or ad-backed job and persist the result."""
     if not record or (
         record.get('job_type') != 'pdf_to_pdf'
-        and record.get('billing_access_method') != 'ad'
+        and record.get('billing_access_method') not in {'ad', 'free'}
     ):
         return record
     billing_released = release_failed_conversion_billing(record)
@@ -65,7 +65,7 @@ def persist_terminal_conversion_billing_release(record, connection):
 def commit_successful_conversion_billing(record):
     if not record or (
         record.get('job_type') != 'pdf_to_pdf'
-        and record.get('billing_access_method') != 'ad'
+        and record.get('billing_access_method') not in {'ad', 'free'}
     ):
         return False
     user_key = str(record.get('user_key') or '')

@@ -405,6 +405,74 @@ class PdfToPdfTest(unittest.TestCase):
                 self.assertEqual(release.call_count, 2)
                 self.assertTrue(load_job(record['job_id'], self.redis)['billing_released'])
 
+    def test_failed_free_jobs_release_shared_daily_slot_before_next_attempt(self):
+        app = create_app()
+        for job_type, path in (
+            ('plt_to_pdf', '/api/v1/plt/jobs/'),
+            ('pdf_to_plt', '/api/v1/pdf/jobs/'),
+        ):
+            with self.subTest(job_type=job_type):
+                with patch('app.job_queue.redis_connection', return_value=self.redis):
+                    record = submit_job(
+                        job_type,
+                        b'conversion-source',
+                        f'source.{"plt" if job_type == "plt_to_pdf" else "pdf"}',
+                        {},
+                        'user:7',
+                        billing_request_id=f'{job_type}-failed-free',
+                        billing_access_method='free',
+                    )
+                    confirm_job_billing(record['job_id'], 'user:7')
+                with patch('app.tasks.redis_connection', return_value=self.redis), \
+                        patch('app.tasks._execute', side_effect=ValueError('bad source')), \
+                        patch('app.tasks.release_conversion', return_value=False):
+                    with self.assertRaisesRegex(ValueError, 'bad source'):
+                        execute_job(record['job_id'])
+                failed = load_job(record['job_id'], self.redis)
+                self.assertIs(failed['billing_released'], False)
+
+                url = f"{path}{record['job_id']}"
+                with patch('app.routes.redis_connection', return_value=self.redis), \
+                        patch('app.job_queue.redis_connection', return_value=self.redis), \
+                        patch('app.routes.authenticated_user_key', return_value='user:7'), \
+                        patch('app.routes.release_conversion', return_value=True) as release:
+                    recovered = app.test_client().get(url)
+                self.assertEqual(recovered.status_code, 200)
+                self.assertEqual(recovered.get_json()['status'], 'failed')
+                release.assert_called_once_with(7, f'{job_type}-failed-free', record['job_id'])
+
+    def test_free_job_confirmation_timeout_releases_its_reservation(self):
+        with patch('app.job_queue.redis_connection', return_value=self.redis):
+            record = submit_job(
+                'plt_to_pdf', b'IN;SP1;', 'sample.plt', {}, 'user:7',
+                billing_request_id='free-confirm-timeout', billing_access_method='free',
+            )
+        with patch.dict(os.environ, {'CONVERSION_BILLING_CONFIRM_TIMEOUT_SECONDS': '2'}), \
+                patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks.release_conversion', return_value=True) as release:
+            execute_job(record['job_id'])
+
+        failed = load_job(record['job_id'], self.redis)
+        self.assertEqual(failed['status'], 'failed')
+        self.assertTrue(failed['billing_released'])
+        release.assert_called_once_with(7, 'free-confirm-timeout', record['job_id'])
+
+    def test_successful_free_job_finalizes_daily_usage_after_output_exists(self):
+        with patch('app.job_queue.redis_connection', return_value=self.redis):
+            record = submit_job(
+                'pdf_to_plt', b'%PDF-source', 'sample.pdf', {}, 'user:7',
+                billing_request_id='successful-free', billing_access_method='free',
+            )
+            confirm_job_billing(record['job_id'], 'user:7')
+        with patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks._execute', return_value={
+                    'result_path': '/tmp/sample.plt', 'filename': 'sample.plt',
+                }), patch('app.tasks.commit_conversion', return_value={}) as commit:
+            execute_job(record['job_id'])
+
+        self.assertEqual(load_job(record['job_id'], self.redis)['status'], 'done')
+        commit.assert_called_once_with(7, 'successful-free', record['job_id'], completed=True)
+
     def test_cancelled_ad_jobs_retry_release_before_reporting_cancelled(self):
         app = create_app()
         for job_type, path in (
@@ -437,6 +505,28 @@ class PdfToPdfTest(unittest.TestCase):
                 self.assertEqual(repeated.status_code, 200)
                 self.assertEqual(release.call_count, 2)
                 self.assertTrue(load_job(record['job_id'], self.redis)['billing_released'])
+
+    def test_cancelled_free_job_releases_its_daily_slot(self):
+        with patch('app.job_queue.redis_connection', return_value=self.redis):
+            record = submit_job(
+                'pdf_to_plt', b'%PDF-source', 'sample.pdf', {}, 'user:7',
+                billing_request_id='cancel-free', billing_access_method='free',
+            )
+            confirm_job_billing(record['job_id'], 'user:7')
+
+        app = create_app()
+        url = f"/api/v1/pdf/jobs/{record['job_id']}"
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authenticated_user_key', return_value='user:7'), \
+                patch('app.routes.release_conversion', side_effect=[False, True]) as release:
+            pending = app.test_client().delete(url)
+            recovered = app.test_client().get(url)
+
+        self.assertEqual(pending.status_code, 503)
+        self.assertEqual(recovered.get_json()['status'], 'cancelled')
+        self.assertEqual(recovered.status_code, 200)
+        self.assertEqual(release.call_count, 2)
 
     def test_async_stopped_job_persists_and_exposes_billing_release_result(self):
         with patch('app.job_queue.redis_connection', return_value=self.redis):

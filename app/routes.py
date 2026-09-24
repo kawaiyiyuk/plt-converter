@@ -80,7 +80,7 @@ def settle_terminal_conversion_billing(record):
         return record
     if not record.get('billing_request_id') or not (
         record.get('job_type') == 'pdf_to_pdf'
-        or record.get('billing_access_method') == 'ad'
+        or record.get('billing_access_method') in {'ad', 'free'}
     ):
         return record
     user_key = str(record.get('user_key') or '')
