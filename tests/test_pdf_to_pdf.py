@@ -322,7 +322,7 @@ class PdfToPdfTest(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertIn('A0', response.get_json()['error'])
 
-    def test_cancelled_job_reports_when_billing_release_failed(self):
+    def test_cancelled_job_retries_failed_billing_release_on_next_poll(self):
         with patch('app.job_queue.redis_connection', return_value=self.redis):
             record = submit_job(
                 'pdf_to_pdf',
@@ -338,14 +338,60 @@ class PdfToPdfTest(unittest.TestCase):
         with patch('app.routes.redis_connection', return_value=self.redis), \
                 patch('app.job_queue.redis_connection', return_value=self.redis), \
                 patch('app.routes.authenticated_user_key', return_value='user:7'), \
-                patch('app.routes.release_conversion', return_value=False):
-            response = app.test_client().delete(
+                patch('app.routes.release_conversion', side_effect=[False, True]) as release:
+            cancelled = app.test_client().delete(
+                f"/api/v1/pdf/repage/jobs/{record['job_id']}"
+            )
+            recovered = app.test_client().get(
                 f"/api/v1/pdf/repage/jobs/{record['job_id']}"
             )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()['status'], 'cancelled')
-        self.assertFalse(response.get_json()['billing_released'])
+        self.assertEqual(cancelled.status_code, 503)
+        self.assertEqual(recovered.status_code, 200)
+        self.assertEqual(recovered.get_json()['status'], 'cancelled')
+        self.assertTrue(recovered.get_json()['billing_released'])
+        self.assertEqual(release.call_count, 2)
+        self.assertTrue(load_job(record['job_id'], self.redis)['billing_released'])
+
+    def test_unreleased_cancelled_job_remains_retriable_for_quota_window(self):
+        self.assertGreaterEqual(job_record_ttl({
+            'status': 'cancelled',
+            'billing_request_id': 'pending-release',
+            'billing_released': False,
+        }), 150 * 60)
+
+    def test_cancelled_ad_jobs_retry_release_before_reporting_cancelled(self):
+        app = create_app()
+        for job_type, path in (
+            ('plt_to_pdf', '/api/v1/plt/jobs/'),
+            ('pdf_to_plt', '/api/v1/pdf/jobs/'),
+        ):
+            with self.subTest(job_type=job_type):
+                with patch('app.job_queue.redis_connection', return_value=self.redis):
+                    record = submit_job(
+                        job_type,
+                        b'conversion-source',
+                        f'source.{"plt" if job_type == "plt_to_pdf" else "pdf"}',
+                        {},
+                        'user:7',
+                        billing_request_id=f'{job_type}-cancel-ad',
+                        billing_access_method='ad',
+                    )
+                    confirm_job_billing(record['job_id'], 'user:7')
+                url = f"{path}{record['job_id']}"
+                with patch('app.routes.redis_connection', return_value=self.redis), \
+                        patch('app.job_queue.redis_connection', return_value=self.redis), \
+                        patch('app.routes.authenticated_user_key', return_value='user:7'), \
+                        patch('app.routes.release_conversion', side_effect=[False, True]) as release:
+                    cancelled = app.test_client().delete(url)
+                    recovered = app.test_client().get(url)
+                    repeated = app.test_client().get(url)
+                self.assertEqual(cancelled.status_code, 503)
+                self.assertEqual(recovered.status_code, 200)
+                self.assertEqual(recovered.get_json()['status'], 'cancelled')
+                self.assertEqual(repeated.status_code, 200)
+                self.assertEqual(release.call_count, 2)
+                self.assertTrue(load_job(record['job_id'], self.redis)['billing_released'])
 
     def test_async_stopped_job_persists_and_exposes_billing_release_result(self):
         with patch('app.job_queue.redis_connection', return_value=self.redis):
@@ -372,12 +418,14 @@ class PdfToPdfTest(unittest.TestCase):
         self.assertIs(cancelled['billing_released'], False)
 
         app = create_app()
-        with patch('app.routes.owned_job', return_value=cancelled):
+        with patch('app.routes.owned_job', return_value=cancelled), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.release_conversion', return_value=True):
             response = app.test_client().get(
                 f"/api/v1/pdf/repage/jobs/{record['job_id']}"
             )
         self.assertEqual(response.status_code, 200)
-        self.assertIs(response.get_json()['billing_released'], False)
+        self.assertIs(response.get_json()['billing_released'], True)
 
     def test_cancel_detected_after_conversion_persists_billing_release_result(self):
         with patch('app.job_queue.redis_connection', return_value=self.redis):

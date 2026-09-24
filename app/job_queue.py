@@ -91,6 +91,10 @@ def save_job(record, connection=None):
 
 def job_record_ttl(record=None):
     retention = max(60, int(os.getenv('PLT_JOB_RETENTION_SECONDS', '1800')))
+    if (record and record.get('status') == 'cancelled'
+            and record.get('billing_request_id')
+            and record.get('billing_released') is False):
+        return max(retention, 150 * 60)
     layout_status = ((record or {}).get('result') or {}).get('layout_suggestion_status')
     layout_active = layout_status in {'queued', 'processing'}
     conversion_active = bool(record and record.get('status') in ACTIVE_STATUSES)
