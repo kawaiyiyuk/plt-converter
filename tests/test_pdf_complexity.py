@@ -85,6 +85,21 @@ class PdfComplexityTest(unittest.TestCase):
         self.assertAlmostEqual(visible[0][0].x, 10)
         self.assertAlmostEqual(visible[0][1].x, 90)
 
+    def test_keeps_line_rounded_just_outside_crop_boundary(self):
+        crop_rect = pymupdf.Rect(10, 10, 90, 90)
+        rounded = [pymupdf.Point(9.9996, 20), pymupdf.Point(9.9996, 80)]
+        genuinely_outside = [pymupdf.Point(9.99, 20), pymupdf.Point(9.99, 80)]
+
+        visible = clip_page_polyline(rounded, 100, 100, pymupdf, crop_rect)
+
+        self.assertEqual(len(visible), 1)
+        self.assertAlmostEqual(visible[0][0].x, 10)
+        self.assertAlmostEqual(visible[0][1].x, 10)
+        self.assertEqual(
+            clip_page_polyline(genuinely_outside, 100, 100, pymupdf, crop_rect),
+            [],
+        )
+
     def test_rejects_crop_that_leaves_less_than_one_millimeter(self):
         page = type('CropPage', (), {'rect': pymupdf.Rect(0, 0, 100, 100)})()
         margins = {'left': 20, 'right': 20, 'top': 0, 'bottom': 0}

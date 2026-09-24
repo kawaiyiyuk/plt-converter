@@ -6,6 +6,7 @@ from .pdf_metadata import encode_pdf_layout_metadata
 
 
 MM_TO_PT = 72 / 25.4
+PDF_MAX_PAGE_POINTS = 14400
 PAPER_SIZES_MM = {
     'A0': (841, 1189),
     'A1': (594, 841),
@@ -77,6 +78,10 @@ def render_pdf(document, options=None):
     if single_page:
         single_page_width_pt = drawing_width_pt + margin_pt * 2
         single_page_height_pt = drawing_height_pt + margin_pt * 2
+        if options.get('enforce_single_page_limit') and max(
+            single_page_width_pt, single_page_height_pt,
+        ) > PDF_MAX_PAGE_POINTS + 1e-7:
+            raise ValueError('单页 PDF 单边最多 5080mm（含页边距），请改选 A0–A4 分页输出')
         excluded_clip_rects = None
         if disabled_pages is not None:
             disabled = {int(value) for value in disabled_pages}

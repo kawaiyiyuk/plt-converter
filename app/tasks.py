@@ -574,7 +574,8 @@ def _execute(record, connection):
         _update_job_progress(job_id, connection, progress=25)
         pdf, conversion = convert_pdf_to_pdf(source, options)
         paper_size = str(options.get('paper_size', 'A4')).upper()
-        output_path = job_root / f"{Path(record['filename']).stem}-{paper_size}.pdf"
+        paper_label = '整张' if paper_size == 'SINGLE' else paper_size
+        output_path = job_root / f"{Path(record['filename']).stem}-{paper_label}.pdf"
         output_path.write_bytes(pdf)
         return {
             'result_path': str(output_path),

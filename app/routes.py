@@ -10,7 +10,7 @@ from flask import Blueprint, current_app, jsonify, request, send_file, url_for
 from .billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
 from .tasks import finalize_ready_conversion_job
 from .services.plt_metadata import inspect_plt
-from .services.pdf_to_pdf import pdf_page_count
+from .services.pdf_to_pdf import SINGLE_PAGE_PAPER_SIZE, SUPPORTED_PAPER_SIZES, pdf_page_count
 from .services.pdf_to_plt import DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM
 from .job_queue import (
     QueueRejected,
@@ -935,6 +935,6 @@ def parse_pdf_render_options(form):
 
 def parse_pdf_to_pdf_options(form):
     paper_size = str(form.get('paper_size', '')).upper()
-    if paper_size not in {'A0', 'A1', 'A2', 'A3', 'A4'}:
-        raise ValueError('目标纸张只支持 A0、A1、A2、A3 或 A4')
+    if paper_size not in SUPPORTED_PAPER_SIZES | {SINGLE_PAGE_PAPER_SIZE}:
+        raise ValueError('目标纸张只支持整张单页或 A0、A1、A2、A3、A4')
     return {'paper_size': paper_size}

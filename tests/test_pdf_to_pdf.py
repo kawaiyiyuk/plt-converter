@@ -196,6 +196,32 @@ class PdfToPdfTest(unittest.TestCase):
         authorize.assert_called_once_with('pdf_to_pdf')
         commit.assert_not_called()
 
+    def test_single_page_route_reuses_existing_one_job_billing(self):
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.pdf_page_count', return_value=4), \
+                patch('app.routes.authorize_job', return_value={
+                    'user_id': 7,
+                    'request_id': 'single-page-request',
+                }) as authorize:
+            response = app.test_client().post(
+                '/api/v1/pdf/repage/jobs',
+                data={
+                    'original_filename': '春季纸样.pdf',
+                    'paper_size': 'SINGLE',
+                    'file': (io.BytesIO(b'%PDF'), 'tmp.pdf'),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        record = load_job(body['job_id'], self.redis)
+        self.assertEqual(record['job_type'], 'pdf_to_pdf')
+        self.assertEqual(record['options']['paper_size'], 'SINGLE')
+        self.assertEqual(record['options']['source_page_count'], 4)
+        authorize.assert_called_once_with('pdf_to_pdf')
+
     def test_ad_required_response_includes_source_page_count(self):
         app = create_app()
         rejection = BillingRejected(
@@ -303,7 +329,32 @@ class PdfToPdfTest(unittest.TestCase):
         self.assertEqual(result['filename'], 'sample-A2.pdf')
         self.assertEqual(load_job(record['job_id'], self.redis)['status'], 'done')
 
-    def test_route_only_accepts_a0_through_a4(self):
+    def test_single_page_worker_names_result_and_returns_its_dimensions(self):
+        from app.services.pdf_renderer import render_pdf
+        from app.services.plt_parser import parse_plt
+
+        drawing = parse_plt(b'IN;PU0,0;PD18000,0,18000,24000,0,24000,0,0;')
+        source, _ = render_pdf(drawing, {'paper_size': 'A4', 'margin_mm': 10})
+        with patch('app.job_queue.redis_connection', return_value=self.redis):
+            record = submit_job(
+                'pdf_to_pdf', source, 'sample.pdf', {'paper_size': 'SINGLE'},
+                'user:7', billing_request_id='pdf-to-pdf-single',
+            )
+            confirm_job_billing(record['job_id'], 'user:7')
+
+        with patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks.commit_conversion', return_value={'success': True}):
+            result = execute_job(record['job_id'])
+
+        self.assertEqual(result['filename'], 'sample-整张.pdf')
+        self.assertEqual(result['output_page_count'], 1)
+        self.assertAlmostEqual(result['output_width_mm'], 470, places=1)
+        self.assertAlmostEqual(result['output_height_mm'], 620, places=1)
+        with open(result['result_path'], 'rb') as output_file:
+            with pymupdf.open(stream=output_file.read(), filetype='pdf') as document:
+                self.assertEqual(document.page_count, 1)
+
+    def test_route_rejects_unsupported_paper_size(self):
         app = create_app()
         with patch('app.routes.redis_connection', return_value=self.redis), \
                 patch('app.job_queue.redis_connection', return_value=self.redis), \
@@ -1010,6 +1061,87 @@ class PdfToPdfTest(unittest.TestCase):
                 self.assertEqual(result['layout_source'], 'single_page')
                 self.assertEqual(result['source_page_count'], 1)
                 self.assertEqual(result['output_page_count'], 1)
+
+    def test_real_multi_page_pdf_becomes_one_actual_size_page(self):
+        from app.services.pdf_renderer import render_pdf
+        from app.services.pdf_to_pdf import convert_pdf_to_pdf
+        from app.services.plt_parser import parse_plt
+
+        drawing = parse_plt(b'IN;PU0,0;PD18000,0,18000,24000,0,24000,0,0;')
+        for source_paper in ('A4', 'A3', 'A0'):
+            with self.subTest(source_paper=source_paper):
+                source, source_layout = render_pdf(
+                    drawing, {'paper_size': source_paper, 'margin_mm': 10},
+                )
+                output, result = convert_pdf_to_pdf(source, {'paper_size': 'SINGLE'})
+                with pymupdf.open(stream=output, filetype='pdf') as document:
+                    self.assertEqual(document.page_count, 1)
+                    page = document[0]
+                    self.assertAlmostEqual(page.rect.width * 25.4 / 72, 470, places=1)
+                    self.assertAlmostEqual(page.rect.height * 25.4 / 72, 620, places=1)
+                    pattern_parts = [
+                        item['rect'] for item in page.get_drawings()
+                        if item['color'] == (0.0, 0.0, 0.0)
+                    ]
+                    self.assertTrue(pattern_parts)
+                    pattern_width = max(rect.x1 for rect in pattern_parts) - min(
+                        rect.x0 for rect in pattern_parts
+                    )
+                    pattern_height = max(rect.y1 for rect in pattern_parts) - min(
+                        rect.y0 for rect in pattern_parts
+                    )
+                    self.assertAlmostEqual(pattern_width * 25.4 / 72, 450, places=1)
+                    self.assertAlmostEqual(pattern_height * 25.4 / 72, 600, places=1)
+                self.assertEqual(result['paper_size'], 'SINGLE')
+                self.assertEqual(result['source_page_count'], source_layout['page_count'])
+                self.assertEqual(result['output_page_count'], 1)
+                self.assertAlmostEqual(result['output_width_mm'], 470, places=1)
+                self.assertAlmostEqual(result['output_height_mm'], 620, places=1)
+
+    def test_single_page_options_enforce_pdf_14_limit_without_pagination(self):
+        from app.services.pdf_to_pdf import target_conversion_options
+
+        single = target_conversion_options('SINGLE')
+        self.assertTrue(single['single_page_output'])
+        self.assertTrue(single['enforce_single_page_limit'])
+        self.assertFalse(single['show_page_number'])
+        paginated = target_conversion_options('A4')
+        self.assertFalse(paginated['single_page_output'])
+        self.assertFalse(paginated['enforce_single_page_limit'])
+        self.assertTrue(paginated['show_page_number'])
+
+    def test_multi_page_pattern_over_single_page_limit_fails_without_truncation(self):
+        from app.services.pdf_renderer import render_pdf
+        from app.services.pdf_to_pdf import convert_pdf_to_pdf
+        from app.services.plt_parser import parse_plt
+
+        oversized = parse_plt(b'IN;PU0,0;PD202800,0,202800,1000;')
+        source, source_layout = render_pdf(oversized, {'paper_size': 'A0'})
+        self.assertGreater(source_layout['page_count'], 1)
+        with self.assertRaisesRegex(ValueError, '单页 PDF.*5080mm'):
+            convert_pdf_to_pdf(source, {'paper_size': 'SINGLE'})
+
+    def test_single_page_rejects_dimensions_above_pdf_14_limit(self):
+        from app.services.pdf_renderer import render_pdf
+        from app.services.plt_parser import parse_plt
+
+        at_limit = parse_plt(b'IN;PU0,0;PD202400,0,202400,1000;')
+        output, layout = render_pdf(at_limit, {
+            'paper_size': 'A0', 'single_page_output': True,
+            'enforce_single_page_limit': True, 'margin_mm': 10,
+        })
+        self.assertTrue(output.startswith(b'%PDF-1.4'))
+        self.assertAlmostEqual(layout['page_width_pt'], 14400, places=5)
+        with pymupdf.open(stream=output, filetype='pdf') as document:
+            self.assertEqual(document.page_count, 1)
+            self.assertAlmostEqual(document[0].rect.width, 14400, places=2)
+
+        above_limit = parse_plt(b'IN;PU0,0;PD202440,0,202440,1000;')
+        with self.assertRaisesRegex(ValueError, '单页 PDF.*5080mm'):
+            render_pdf(above_limit, {
+                'paper_size': 'A0', 'single_page_output': True,
+                'enforce_single_page_limit': True, 'margin_mm': 10,
+            })
 
 
 if __name__ == '__main__':

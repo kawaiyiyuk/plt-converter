@@ -7,6 +7,7 @@ from .plt_parser import parse_plt
 
 
 SUPPORTED_PAPER_SIZES = {'A0', 'A1', 'A2', 'A3', 'A4'}
+SINGLE_PAGE_PAPER_SIZE = 'SINGLE'
 
 
 def pdf_page_count(source):
@@ -70,16 +71,20 @@ def source_conversion_options(suggestion):
 
 def target_conversion_options(paper_size):
     normalized_paper_size = str(paper_size or '').upper()
-    if normalized_paper_size not in SUPPORTED_PAPER_SIZES:
-        raise ValueError('目标纸张只支持 A0、A1、A2、A3 或 A4')
+    single_page = normalized_paper_size == SINGLE_PAGE_PAPER_SIZE
+    if not single_page and normalized_paper_size not in SUPPORTED_PAPER_SIZES:
+        raise ValueError('目标纸张只支持整张单页或 A0、A1、A2、A3、A4')
     return {
         'units_per_inch': 1016,
-        'paper_size': normalized_paper_size,
+        # A0 is used only by the shared renderer's tile math. SINGLE always
+        # sizes the actual PDF page from the complete drawing, not from A0.
+        'paper_size': 'A0' if single_page else normalized_paper_size,
         'orientation': 'auto',
         'margin_mm': 10,
         'line_width_mm': 0.265,
-        'single_page_output': False,
-        'show_page_number': True,
+        'single_page_output': single_page,
+        'enforce_single_page_limit': single_page,
+        'show_page_number': not single_page,
     }
 
 
@@ -96,8 +101,8 @@ def convert_pdf_to_pdf(source, options=None):
     )
     drawing = parse_plt(plt, 1016)
     pdf, target_layout = render_pdf(drawing, target_options)
-    return pdf, {
-        'paper_size': target_options['paper_size'],
+    result = {
+        'paper_size': str(options.get('paper_size') or '').upper(),
         'source_page_count': source_page_count,
         'output_page_count': int(target_layout.get('page_count', 0)),
         'source_layout': source_layout,
@@ -105,3 +110,7 @@ def convert_pdf_to_pdf(source, options=None):
         'layout_source': suggestion.get('source'),
         'layout_confidence': suggestion.get('confidence'),
     }
+    if target_layout.get('page_width_pt') and target_layout.get('page_height_pt'):
+        result['output_width_mm'] = round(target_layout['page_width_pt'] * 25.4 / 72, 2)
+        result['output_height_mm'] = round(target_layout['page_height_pt'] * 25.4 / 72, 2)
+    return pdf, result

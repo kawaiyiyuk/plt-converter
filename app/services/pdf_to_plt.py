@@ -542,11 +542,15 @@ def clip_page_segment(start, end, width, height, fitz, clip_rect=None):
     maximum_x = clip_rect.x1 if clip_rect is not None else width
     minimum_y = clip_rect.y0 if clip_rect is not None else 0
     maximum_y = clip_rect.y1 if clip_rect is not None else height
+    # PDF content coordinates are serialized to three decimals while the
+    # requested crop uses full precision. Keep paths rounded by < 0.001pt at
+    # the boundary, then snap their endpoints back inside the true crop.
+    tolerance = 0.001 if clip_rect is not None else 0
     for direction, distance in (
-        (-dx, x1 - minimum_x),
-        (dx, maximum_x - x1),
-        (-dy, y1 - minimum_y),
-        (dy, maximum_y - y1),
+        (-dx, x1 - (minimum_x - tolerance)),
+        (dx, maximum_x + tolerance - x1),
+        (-dy, y1 - (minimum_y - tolerance)),
+        (dy, maximum_y + tolerance - y1),
     ):
         if abs(direction) < 1e-12:
             if distance < 0:
@@ -561,10 +565,13 @@ def clip_page_segment(start, end, width, height, fitz, clip_rect=None):
             if ratio < lower:
                 return None
             upper = min(upper, ratio)
-    return (
-        fitz.Point(x1 + lower * dx, y1 + lower * dy),
-        fitz.Point(x1 + upper * dx, y1 + upper * dy),
-    )
+    def inside_crop(ratio):
+        return fitz.Point(
+            min(max(x1 + ratio * dx, minimum_x), maximum_x),
+            min(max(y1 + ratio * dy, minimum_y), maximum_y),
+        )
+
+    return inside_crop(lower), inside_crop(upper)
 
 
 def fitz_points_equal(first, second):
