@@ -47,8 +47,8 @@ def release_failed_conversion_billing(record):
         return False
 
 
-def persist_cancelled_conversion_billing_release(record, connection):
-    """Release a cancelled paper job or ad-backed job and persist the result."""
+def persist_terminal_conversion_billing_release(record, connection):
+    """Release a failed/cancelled paper or ad-backed job and persist the result."""
     if not record or (
         record.get('job_type') != 'pdf_to_pdf'
         and record.get('billing_access_method') != 'ad'
@@ -114,13 +114,7 @@ def execute_job(job_id):
                         finished_at=time.time(),
                     )
                     release_user_job(load_job(job_id, connection), connection)
-                    user_key = latest.get('user_key', '')
-                    if user_key.startswith('user:') and latest.get('billing_request_id'):
-                        release_conversion(
-                            int(user_key.split(':', 1)[1]),
-                            latest['billing_request_id'],
-                            job_id,
-                        )
+                    persist_terminal_conversion_billing_release(latest, connection)
             finally:
                 lock.release()
             return None
@@ -140,7 +134,7 @@ def execute_job(job_id):
                 finished_at=time.time(),
                 progress=0,
             )
-            persist_cancelled_conversion_billing_release(cancelled, connection)
+            persist_terminal_conversion_billing_release(cancelled, connection)
             release_user_job(load_job(job_id, connection), connection)
             return None
         started = time.time()
@@ -160,7 +154,7 @@ def execute_job(job_id):
                     finished_at=time.time(),
                     progress=0,
                 )
-                persist_cancelled_conversion_billing_release(cancelled, connection)
+                persist_terminal_conversion_billing_release(cancelled, connection)
                 release_user_job(load_job(job_id, connection), connection)
                 return None
             commit_successful_conversion_billing(latest or record)
@@ -193,7 +187,7 @@ def execute_job(job_id):
                     progress=0,
                     finished_at=time.time(),
                 )
-                persist_cancelled_conversion_billing_release(cancelled, connection)
+                persist_terminal_conversion_billing_release(cancelled, connection)
                 release_user_job(load_job(job_id, connection), connection)
                 record_metric('cancelled', connection=connection)
                 return None
@@ -213,7 +207,7 @@ def execute_job(job_id):
             )
             release_user_job(load_job(job_id, connection), connection)
             record_metric('failed', connection=connection)
-            release_failed_conversion_billing(latest or record)
+            persist_terminal_conversion_billing_release(latest or record, connection)
         finally:
             lock.release()
         raise
@@ -237,12 +231,12 @@ def execute_job(job_id):
             release_user_job(load_job(job_id, connection), connection)
             record_metric('cancelled' if cancelled else 'failed', connection=connection)
             if cancelled:
-                persist_cancelled_conversion_billing_release(
+                persist_terminal_conversion_billing_release(
                     load_job(job_id, connection),
                     connection,
                 )
             else:
-                release_failed_conversion_billing(latest or record)
+                persist_terminal_conversion_billing_release(latest or record, connection)
         finally:
             lock.release()
         raise
@@ -266,7 +260,7 @@ def mark_job_failed(job, connection, type_, value, traceback):
                 progress=0,
                 finished_at=time.time(),
             )
-            persist_cancelled_conversion_billing_release(cancelled, connection)
+            persist_terminal_conversion_billing_release(cancelled, connection)
             release_user_job(load_job(task_id, connection), connection)
             record_metric('cancelled', connection=connection)
             return
@@ -285,7 +279,7 @@ def mark_job_failed(job, connection, type_, value, traceback):
         )
         release_user_job(load_job(task_id, connection), connection)
         record_metric('failed', connection=connection)
-        release_failed_conversion_billing(record)
+        persist_terminal_conversion_billing_release(record, connection)
     finally:
         lock.release()
 
@@ -328,7 +322,7 @@ def enqueue_retry(task_id, connection, retries):
             error=f'任务重试入队失败: {error}',
             finished_at=time.time(),
         )
-        release_failed_conversion_billing(record)
+        persist_terminal_conversion_billing_release(record, connection)
         release_user_job(load_job(task_id, connection), connection)
         record_metric('failed', connection=connection)
         return False
@@ -353,7 +347,7 @@ def mark_job_stopped(job, connection):
             progress=0,
             finished_at=time.time(),
         )
-        persist_cancelled_conversion_billing_release(cancelled, connection)
+        persist_terminal_conversion_billing_release(cancelled, connection)
     finally:
         lock.release()
     release_user_job(load_job(task_id, connection), connection)

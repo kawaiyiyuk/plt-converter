@@ -91,7 +91,7 @@ def save_job(record, connection=None):
 
 def job_record_ttl(record=None):
     retention = max(60, int(os.getenv('PLT_JOB_RETENTION_SECONDS', '1800')))
-    if (record and record.get('status') == 'cancelled'
+    if (record and record.get('status') in {'failed', 'cancelled'}
             and record.get('billing_request_id')
             and record.get('billing_released') is False):
         return max(retention, 150 * 60)

@@ -360,6 +360,51 @@ class PdfToPdfTest(unittest.TestCase):
             'billing_released': False,
         }), 150 * 60)
 
+    def test_failed_ad_jobs_retry_billing_release_on_next_poll(self):
+        app = create_app()
+        for job_type, path in (
+            ('plt_to_pdf', '/api/v1/plt/jobs/'),
+            ('pdf_to_plt', '/api/v1/pdf/jobs/'),
+            ('pdf_to_pdf', '/api/v1/pdf/repage/jobs/'),
+        ):
+            with self.subTest(job_type=job_type):
+                with patch('app.job_queue.redis_connection', return_value=self.redis):
+                    record = submit_job(
+                        job_type,
+                        b'conversion-source',
+                        f'source.{"plt" if job_type == "plt_to_pdf" else "pdf"}',
+                        {'paper_size': 'A4'} if job_type == 'pdf_to_pdf' else {},
+                        'user:7',
+                        billing_request_id=f'{job_type}-failed-ad',
+                        billing_access_method='ad',
+                    )
+                    confirm_job_billing(record['job_id'], 'user:7')
+                with patch('app.tasks.redis_connection', return_value=self.redis), \
+                        patch('app.tasks._execute', side_effect=ValueError('bad source')), \
+                        patch('app.tasks.release_conversion', return_value=False):
+                    with self.assertRaisesRegex(ValueError, 'bad source'):
+                        execute_job(record['job_id'])
+
+                failed = load_job(record['job_id'], self.redis)
+                self.assertEqual(failed['status'], 'failed')
+                self.assertIs(failed['billing_released'], False)
+                self.assertGreaterEqual(job_record_ttl(failed), 150 * 60)
+
+                url = f"{path}{record['job_id']}"
+                with patch('app.routes.redis_connection', return_value=self.redis), \
+                        patch('app.job_queue.redis_connection', return_value=self.redis), \
+                        patch('app.routes.authenticated_user_key', return_value='user:7'), \
+                        patch('app.routes.release_conversion', side_effect=[False, True]) as release:
+                    pending = app.test_client().get(url)
+                    recovered = app.test_client().get(url)
+                    repeated = app.test_client().get(url)
+                self.assertEqual(pending.status_code, 503)
+                self.assertEqual(recovered.status_code, 200)
+                self.assertEqual(recovered.get_json()['status'], 'failed')
+                self.assertEqual(repeated.status_code, 200)
+                self.assertEqual(release.call_count, 2)
+                self.assertTrue(load_job(record['job_id'], self.redis)['billing_released'])
+
     def test_cancelled_ad_jobs_retry_release_before_reporting_cancelled(self):
         app = create_app()
         for job_type, path in (
