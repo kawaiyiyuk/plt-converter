@@ -67,7 +67,9 @@ def rollback_conversion_submission(billing, record, billing_confirmed=False):
     job_id = record.get('job_id') if record else None
     if job_id:
         try:
-            cancel_job(job_id, f"user:{billing['user_id']}")
+            cancelled = cancel_job(job_id, f"user:{billing['user_id']}")
+            if cancelled and cancelled.get('status') in {'finalizing', 'done'}:
+                return
         except (RedisError, QueueRejected, PermissionError):
             pass
     release_conversion(billing['user_id'], billing['request_id'], job_id)

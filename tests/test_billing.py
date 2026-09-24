@@ -2,10 +2,31 @@ import unittest
 from unittest.mock import patch
 
 from app.billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
+from app.routes import rollback_conversion_submission
 from app.tasks import commit_successful_conversion_billing, release_failed_conversion_billing
 
 
 class BillingTest(unittest.TestCase):
+    @patch('app.routes.release_conversion')
+    @patch('app.routes.cancel_job')
+    def test_submit_rollback_does_not_release_ready_result(self, cancel, release):
+        for status in ('finalizing', 'done'):
+            with self.subTest(status=status):
+                cancel.return_value = {'status': status}
+                rollback_conversion_submission(
+                    {'user_id': 42, 'request_id': 'ad-request'},
+                    {'job_id': 'job-1'},
+                )
+                release.assert_not_called()
+        self.assertEqual(cancel.call_count, 2)
+
+        cancel.return_value = {'status': 'cancelled'}
+        rollback_conversion_submission(
+            {'user_id': 42, 'request_id': 'ad-request'},
+            {'job_id': 'job-1'},
+        )
+        release.assert_called_once_with(42, 'ad-request', 'job-1')
+
     @patch('app.tasks.release_conversion', return_value=True)
     def test_failed_ad_job_releases_credit_but_old_regular_job_does_not(self, release):
         record = {
