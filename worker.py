@@ -11,6 +11,7 @@ from app.job_queue import (
     pdf_layout_queue,
     redis_connection,
 )
+from app.tasks import reconcile_finalizing_jobs
 
 
 LOGGER = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ def cleanup_loop():
     while True:
         try:
             cleanup_expired_job_files()
+            reconcile_finalizing_jobs()
         except Exception as error:
             LOGGER.warning('Temporary job cleanup failed: %s', error)
         time.sleep(300)

@@ -8,6 +8,7 @@ from pathlib import Path
 from flask import Blueprint, current_app, jsonify, request, send_file, url_for
 
 from .billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
+from .tasks import finalize_ready_conversion_job
 from .services.plt_metadata import inspect_plt
 from .services.pdf_to_pdf import pdf_page_count
 from .services.pdf_to_plt import DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM
@@ -66,10 +67,45 @@ def rollback_conversion_submission(billing, record, billing_confirmed=False):
     job_id = record.get('job_id') if record else None
     if job_id:
         try:
-            cancel_job(job_id, f"user:{billing['user_id']}")
+            cancelled = cancel_job(job_id, f"user:{billing['user_id']}")
+            if cancelled and cancelled.get('status') in {'finalizing', 'done'}:
+                return
         except (RedisError, QueueRejected, PermissionError):
             pass
     release_conversion(billing['user_id'], billing['request_id'], job_id)
+
+
+def settle_terminal_conversion_billing(record):
+    """Recover ready outputs and keep failed releases retryable."""
+    if record and record.get('status') == 'finalizing':
+        try:
+            record = finalize_ready_conversion_job(record['job_id'])
+        except (RedisError, QueueRejected) as error:
+            raise BillingRejected('转换结果确认暂时不可用，请稍后重试', 503) from error
+    if not record or record.get('status') not in {'failed', 'cancelled'}:
+        return record
+    if record.get('billing_released') is True:
+        return record
+    if not record.get('billing_request_id') or not (
+        record.get('job_type') == 'pdf_to_pdf'
+        or record.get('billing_access_method') in {'ad', 'free'}
+    ):
+        return record
+    user_key = str(record.get('user_key') or '')
+    if not user_key.startswith('user:'):
+        raise BillingRejected('转换任务缺少额度信息', 503)
+    release_options = {'rollback_completed': True} if record.get('billing_release_completed') else {}
+    released = release_conversion(
+        int(user_key.split(':', 1)[1]),
+        record['billing_request_id'],
+        record['job_id'],
+        **release_options,
+    )
+    record = update_job(record['job_id'], billing_released=bool(released))
+    if not released:
+        status_label = '取消' if record['status'] == 'cancelled' else '失败'
+        raise BillingRejected(f'任务已{status_label}，额度释放暂未完成，请稍后重试', 503)
+    return record
 
 
 def authenticated_user_key():
@@ -147,7 +183,7 @@ def job_response(record):
     response = {
         'job_id': record['job_id'],
         'job_type': record.get('job_type'),
-        'status': record.get('status'),
+        'status': 'processing' if record.get('status') == 'finalizing' else record.get('status'),
         'progress': record.get('progress', 0),
         'created_at': record.get('created_at'),
         'started_at': record.get('started_at'),
@@ -250,6 +286,7 @@ def create_conversion_job():
             },
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
+            billing_access_method=billing.get('access_method'),
         )
         commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         billing_confirmed = True
@@ -276,6 +313,7 @@ def create_conversion_job():
 def get_conversion_job(job_id):
     try:
         record = owned_job(job_id, 'plt_to_pdf')
+        record = settle_terminal_conversion_billing(record)
     except BillingRejected as error:
         return billing_error(error)
     if record:
@@ -288,6 +326,7 @@ def cancel_conversion_job(job_id):
     try:
         user_key = authenticated_user_key()
         record = cancel_job(job_id, user_key)
+        record = settle_terminal_conversion_billing(record)
     except BillingRejected as error:
         return billing_error(error)
     except PermissionError as error:
@@ -307,7 +346,7 @@ def download_pdf(job_id):
         record = owned_job(job_id, 'plt_to_pdf')
     except BillingRejected as error:
         return billing_error(error)
-    if not record:
+    if not record or record.get('status') != 'done':
         return jsonify({'error': '文件不存在或已过期'}), 404
     output_path = Path(record.get('result_path')) if record and record.get('result_path') else None
     if output_path is None or not output_path.exists():
@@ -388,6 +427,7 @@ def create_pdf_to_plt_job():
             parse_pdf_render_options(request.form),
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
+            billing_access_method=billing.get('access_method'),
         )
         commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         billing_confirmed = True
@@ -414,6 +454,7 @@ def create_pdf_to_plt_job():
 def get_pdf_to_plt_job(job_id):
     try:
         record = owned_job(job_id, 'pdf_to_plt')
+        record = settle_terminal_conversion_billing(record)
     except BillingRejected as error:
         return billing_error(error)
     if record:
@@ -468,7 +509,10 @@ def create_pdf_to_pdf_job():
             options,
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
+            billing_access_method=billing.get('access_method'),
         )
+        if billing.get('access_method') == 'ad':
+            commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
         billing_confirmed = True
     except BillingRejected as error:
@@ -521,6 +565,7 @@ def inspect_pdf_to_pdf_source():
 def get_pdf_to_pdf_job(job_id):
     try:
         record = owned_job(job_id, 'pdf_to_pdf')
+        record = settle_terminal_conversion_billing(record)
     except BillingRejected as error:
         return billing_error(error)
     if record:
@@ -530,23 +575,13 @@ def get_pdf_to_pdf_job(job_id):
 
 @pdf_bp.delete('/repage/jobs/<job_id>')
 def cancel_pdf_to_pdf_job(job_id):
-    billing_released = None
     try:
         user_key = authenticated_user_key()
         owned = owned_job(job_id, 'pdf_to_pdf')
         if not owned:
             return jsonify({'error': '任务不存在或已过期'}), 404
         record = cancel_job(job_id, user_key)
-        if record and record.get('status') == 'cancelled' and record.get('billing_request_id'):
-            billing_released = release_conversion(
-                int(user_key.split(':', 1)[1]),
-                record['billing_request_id'],
-                record['job_id'],
-            )
-            record = update_job(
-                record['job_id'],
-                billing_released=bool(billing_released),
-            )
+        record = settle_terminal_conversion_billing(record)
     except BillingRejected as error:
         return billing_error(error)
     except PermissionError as error:
@@ -557,10 +592,7 @@ def cancel_pdf_to_pdf_job(job_id):
         return redis_unavailable(error)
     if not record:
         return jsonify({'error': '任务不存在或已过期'}), 404
-    response = job_response(record)
-    if billing_released is not None:
-        response['billing_released'] = bool(billing_released)
-    return jsonify(response)
+    return jsonify(job_response(record))
 
 
 @pdf_bp.get('/repage/files/<job_id>.pdf')
@@ -569,7 +601,7 @@ def download_repaged_pdf(job_id):
         record = owned_job(job_id, 'pdf_to_pdf')
     except BillingRejected as error:
         return billing_error(error)
-    if not record:
+    if not record or record.get('status') != 'done':
         return jsonify({'error': 'PDF 文件不存在或已过期'}), 404
     output_path = Path(record.get('result_path')) if record.get('result_path') else None
     if output_path is None or not output_path.exists():
@@ -686,6 +718,7 @@ def cancel_pdf_to_plt_job(job_id):
     try:
         user_key = authenticated_user_key()
         record = cancel_job(job_id, user_key)
+        record = settle_terminal_conversion_billing(record)
     except BillingRejected as error:
         return billing_error(error)
     except PermissionError as error:
@@ -705,7 +738,7 @@ def download_plt(job_id):
         record = owned_job(job_id, 'pdf_to_plt')
     except BillingRejected as error:
         return billing_error(error)
-    if not record:
+    if not record or record.get('status') != 'done':
         return jsonify({'error': 'PLT 文件不存在或已过期'}), 404
     output_path = Path(record.get('result_path')) if record and record.get('result_path') else None
     if output_path is None or not output_path.exists():

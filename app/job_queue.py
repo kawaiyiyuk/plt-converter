@@ -15,7 +15,7 @@ from rq.registry import StartedJobRegistry
 
 
 TERMINAL_STATUSES = {'done', 'failed', 'cancelled', 'expired'}
-ACTIVE_STATUSES = {'billing_pending', 'queued', 'processing', 'cancelling'}
+ACTIVE_STATUSES = {'billing_pending', 'queued', 'processing', 'finalizing', 'cancelling'}
 JOB_OUTPUT_VERSIONS = {
     'plt_to_pdf': '4-single-page-selection',
     'pdf_to_plt': '4-metric-pen-width',
@@ -91,6 +91,12 @@ def save_job(record, connection=None):
 
 def job_record_ttl(record=None):
     retention = max(60, int(os.getenv('PLT_JOB_RETENTION_SECONDS', '1800')))
+    if record and record.get('status') == 'finalizing':
+        return max(retention, 150 * 60)
+    if (record and record.get('status') in {'failed', 'cancelled'}
+            and record.get('billing_request_id')
+            and record.get('billing_released') is False):
+        return max(retention, 150 * 60)
     layout_status = ((record or {}).get('result') or {}).get('layout_suggestion_status')
     layout_active = layout_status in {'queued', 'processing'}
     conversion_active = bool(record and record.get('status') in ACTIVE_STATUSES)
@@ -302,7 +308,10 @@ def store_source_upload(job_type, source, filename, options, user_key, connectio
         slot_lock.release()
 
 
-def submit_job(job_type, source, filename, options, user_key, connection=None, billing_request_id=None):
+def submit_job(
+    job_type, source, filename, options, user_key, connection=None,
+    billing_request_id=None, billing_access_method=None,
+):
     connection = connection or redis_connection()
     cleanup_expired_job_files(connection)
     output_version = JOB_OUTPUT_VERSIONS.get(job_type, '1')
@@ -389,6 +398,7 @@ def submit_job(job_type, source, filename, options, user_key, connection=None, b
             'retry_count': 0,
             'rq_job_id': f'{job_id}:0',
             'billing_request_id': billing_request_id,
+            'billing_access_method': billing_access_method,
             'billing_confirmed': not bool(billing_request_id),
         }
         save_job(record, connection)
@@ -523,6 +533,8 @@ def cancel_job(job_id, user_key=None, connection=None):
         if user_key and record.get('user_key') != user_key:
             raise PermissionError('无权取消该任务')
         if record.get('status') in TERMINAL_STATUSES:
+            return record
+        if record.get('status') == 'finalizing':
             return record
         rq_job_id = record.get('rq_job_id') or job_id
         try:
