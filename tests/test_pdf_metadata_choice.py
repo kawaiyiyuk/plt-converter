@@ -1,10 +1,16 @@
 import io
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+import fakeredis
 import pymupdf
 
 from app import create_app
+from app.job_queue import JOB_OUTPUT_VERSIONS, submit_job, update_job
+from app.tasks import _execute
 from app.services.pdf_metadata import encode_pdf_layout_metadata
 from app.services.pdf_to_plt import convert_pdf_to_plt, read_pdf_layout_metadata
 from app.services.pdf_to_pdf import convert_pdf_to_pdf
@@ -32,6 +38,53 @@ def sample_pdf(with_metadata=True, complete=True):
 
 
 class PdfMetadataChoiceTest(unittest.TestCase):
+    def test_old_incomplete_preview_get_recovers_choice_and_new_post_recomputes(self):
+        source = sample_pdf(complete=False)
+        redis = fakeredis.FakeRedis()
+        class MemoryLock:
+            def acquire(self, blocking=True):
+                return True
+
+            def release(self):
+                pass
+
+        redis.lock = lambda *args, **kwargs: MemoryLock()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {'PLT_TEMP_FOLDER': directory,
+                                        'PLT_RATE_LIMIT_PER_MINUTE': '100',
+                                        'PLT_UPLOAD_RATE_LIMIT_PER_MINUTE': '100',
+                                        'PLT_UPLOAD_IP_RATE_LIMIT_PER_MINUTE': '100'}), \
+                patch('app.job_queue.redis_connection', return_value=redis), \
+                patch('app.routes.request_user_key', return_value='user:42'), \
+                patch('app.routes.enforce_upload_limits'), \
+                patch.dict(JOB_OUTPUT_VERSIONS, {'pdf_preview': '2-editor-preview'}):
+            old = submit_job('pdf_preview', source, 'sample.pdf', {}, 'user:42', redis)
+            old_result = _execute(old, redis)
+            old_result.pop('requires_metadata_choice')
+            old_result.pop('embedded_layout', None)
+            update_job(old['job_id'], redis, status='done', result=old_result)
+            client = create_app().test_client()
+            polled = client.get(f"/api/v1/pdf/preview/jobs/{old['job_id']}")
+            self.assertEqual(polled.status_code, 200, polled.get_json())
+            self.assertTrue(polled.get_json()['requires_metadata_choice'])
+            self.assertNotIn('embedded_layout', polled.get_json())
+            same_version = client.post('/api/v1/pdf/preview', data={
+                'file': (io.BytesIO(source), 'sample.pdf'),
+            })
+            self.assertEqual(same_version.get_json()['job_id'], old['job_id'])
+            self.assertTrue(same_version.get_json()['deduplicated'])
+
+            with patch.dict(JOB_OUTPUT_VERSIONS, {'pdf_preview': '3-metadata-choice'}):
+                fresh = client.post('/api/v1/pdf/preview', data={
+                    'file': (io.BytesIO(source), 'sample.pdf'),
+                })
+            self.assertEqual(fresh.status_code, 200, fresh.get_json())
+            self.assertNotEqual(fresh.get_json()['job_id'], old['job_id'])
+            self.assertFalse(fresh.get_json()['deduplicated'])
+            Path(old['input_path']).unlink()
+            expired = client.get(f"/api/v1/pdf/preview/jobs/{old['job_id']}")
+            self.assertEqual(expired.status_code, 404)
+
     def test_current_keeps_red_line_and_original_filters_it(self):
         source = sample_pdf()
         with self.assertRaisesRegex(ValueError, '先选择'):

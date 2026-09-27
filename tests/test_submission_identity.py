@@ -76,6 +76,46 @@ class SubmissionIdentityTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '请求编号'):
                 self.submit(options={'units_per_inch': 2032})
 
+    def test_old_plain_pdf_request_replays_without_metadata_mode_key(self):
+        for job_type, old_options in (
+            ('pdf_to_plt', {'rows': 1, 'columns': 1, 'line_width_mm': 1.0}),
+            ('pdf_to_pdf', {'paper_size': 'A4', 'source_page_count': 1}),
+        ):
+            with self.subTest(job_type=job_type):
+                source = b'%PDF old ordinary source'
+                request_id = f'legacy-{job_type}'
+                old_job = submit_job(
+                    job_type, source, 'source.pdf', old_options, 'user:42',
+                    self.redis, billing_request_id=request_id,
+                )
+                current_options = {**old_options, 'metadata_mode': None}
+                replay = submit_job(
+                    job_type, source, 'source.pdf', current_options, 'user:42',
+                    self.redis, billing_request_id=request_id,
+                )
+                self.assertEqual(replay['job_id'], old_job['job_id'])
+                for changed_source, changed_name, changed_options in (
+                    (b'%PDF changed', 'source.pdf', current_options),
+                    (source, 'renamed.pdf', current_options),
+                    (source, 'source.pdf', {**current_options, 'rows': 2}),
+                    (source, 'source.pdf', {**old_options, 'metadata_mode': 'current'}),
+                    (source, 'source.pdf', {**old_options, 'metadata_mode': 'original'}),
+                ):
+                    with self.assertRaisesRegex(ValueError, '请求编号'):
+                        submit_job(job_type, changed_source, changed_name, changed_options,
+                                   'user:42', self.redis, billing_request_id=request_id)
+                self.assertEqual(load_job(old_job['job_id'], self.redis)['status'], 'billing_pending')
+
+                # Records without a persisted fingerprint must still verify the source.
+                old_job.pop('fingerprint', None)
+                save_job(old_job, self.redis)
+                for key in self.redis.keys('plt-converter:fingerprint:*'):
+                    self.redis.delete(key)
+                self.assertEqual(submit_job(
+                    job_type, source, 'source.pdf', current_options, 'user:42',
+                    self.redis, billing_request_id=request_id,
+                )['job_id'], old_job['job_id'])
+
     def test_legacy_missing_source_uses_index_or_rejects_without_touching_old_job(self):
         first = self.submit()
         first.pop('fingerprint', None)

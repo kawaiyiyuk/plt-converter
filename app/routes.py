@@ -663,6 +663,22 @@ def get_pdf_preview_job(job_id):
     ):
         record = None
     if record:
+        result = record.get('result') or {}
+        if record.get('status') == 'done' and 'requires_metadata_choice' not in result:
+            # A preview completed before metadata choice support may still be
+            # polled by an open client without another POST.
+            try:
+                source = Path(record['input_path']).read_bytes()
+            except (KeyError, TypeError, OSError):
+                return jsonify({'error': '预览源文件已过期，请重新选择 PDF'}), 404
+            try:
+                embedded_layout = read_pdf_layout_metadata(source)
+            except ValueError as error:
+                return jsonify({'error': str(error)}), 422
+            result = {**result, 'requires_metadata_choice': bool(embedded_layout)}
+            if embedded_layout and embedded_layout.get('complete_layout'):
+                result['embedded_layout'] = embedded_layout
+            record = {**record, 'result': result}
         return jsonify(job_response(record))
     return jsonify({'error': '任务不存在或已过期'}), 404
 

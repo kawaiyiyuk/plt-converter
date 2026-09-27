@@ -20,7 +20,7 @@ JOB_OUTPUT_VERSIONS = {
     'plt_to_pdf': '4-single-page-selection',
     'pdf_to_plt': '4-metric-pen-width',
     'pdf_to_pdf': '1-auto-repage',
-    'pdf_preview': '2-editor-preview',
+    'pdf_preview': '3-metadata-choice',
 }
 
 
@@ -325,7 +325,14 @@ def submission_fingerprint(job_type, source, filename, options, output_version):
 def matches_billing_submission(record, job_type, source, filename, options, connection):
     # A renderer upgrade must not invalidate replay of an already admitted job.
     output_version = record.get('output_version') or '1'
-    candidate = submission_fingerprint(job_type, source, filename, options, output_version)
+    candidate_options = options
+    saved_options = record.get('options') or {}
+    if (job_type in {'pdf_to_plt', 'pdf_to_pdf'}
+            and 'metadata_mode' not in saved_options
+            and options.get('metadata_mode') in (None, '')):
+        # Before metadata selection, ordinary PDFs had no metadata_mode key.
+        candidate_options = {key: value for key, value in options.items() if key != 'metadata_mode'}
+    candidate = submission_fingerprint(job_type, source, filename, candidate_options, output_version)
     expected = record.get('fingerprint')
     if not expected:
         # Existing jobs may predate the persisted fingerprint. Their Redis index
