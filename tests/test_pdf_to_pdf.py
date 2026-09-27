@@ -33,6 +33,26 @@ class AcquiredThreadLock:
 
 class PdfToPdfTest(unittest.TestCase):
     def setUp(self):
+        from app.services.pdf_to_plt import read_pdf_layout_metadata as real_read_metadata
+
+        def read_metadata_or_none(source):
+            # Several route tests deliberately use a fake byte stream while
+            # mocking page counting; treat only those fixtures as plain PDFs.
+            try:
+                return real_read_metadata(source)
+            except ValueError:
+                return None
+
+        self.metadata_reader = patch(
+            'app.services.pdf_to_plt.read_pdf_layout_metadata',
+            side_effect=read_metadata_or_none,
+        )
+        self.route_metadata_reader = patch(
+            'app.routes.read_pdf_layout_metadata',
+            side_effect=read_metadata_or_none,
+        )
+        self.metadata_reader.start()
+        self.route_metadata_reader.start()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.redis = fakeredis.FakeRedis()
         self.redis.lock = lambda *args, **kwargs: MemoryLock()
@@ -46,6 +66,8 @@ class PdfToPdfTest(unittest.TestCase):
         self.environment.start()
 
     def tearDown(self):
+        self.route_metadata_reader.stop()
+        self.metadata_reader.stop()
         self.environment.stop()
         self.temp_dir.cleanup()
 
@@ -337,7 +359,7 @@ class PdfToPdfTest(unittest.TestCase):
         source, _ = render_pdf(drawing, {'paper_size': 'A4', 'margin_mm': 10})
         with patch('app.job_queue.redis_connection', return_value=self.redis):
             record = submit_job(
-                'pdf_to_pdf', source, 'sample.pdf', {'paper_size': 'SINGLE'},
+                'pdf_to_pdf', source, 'sample.pdf', {'paper_size': 'SINGLE', 'metadata_mode': 'original'},
                 'user:7', billing_request_id='pdf-to-pdf-single',
             )
             confirm_job_billing(record['job_id'], 'user:7')
@@ -1073,7 +1095,7 @@ class PdfToPdfTest(unittest.TestCase):
                 source, source_layout = render_pdf(
                     drawing, {'paper_size': source_paper, 'margin_mm': 10},
                 )
-                output, result = convert_pdf_to_pdf(source, {'paper_size': 'SINGLE'})
+                output, result = convert_pdf_to_pdf(source, {'paper_size': 'SINGLE', 'metadata_mode': 'original'})
                 with pymupdf.open(stream=output, filetype='pdf') as document:
                     self.assertEqual(document.page_count, 1)
                     page = document[0]
@@ -1119,7 +1141,7 @@ class PdfToPdfTest(unittest.TestCase):
         source, source_layout = render_pdf(oversized, {'paper_size': 'A0'})
         self.assertGreater(source_layout['page_count'], 1)
         with self.assertRaisesRegex(ValueError, '单页 PDF.*5080mm'):
-            convert_pdf_to_pdf(source, {'paper_size': 'SINGLE'})
+            convert_pdf_to_pdf(source, {'paper_size': 'SINGLE', 'metadata_mode': 'original'})
 
     def test_single_page_rejects_dimensions_above_pdf_14_limit(self):
         from app.services.pdf_renderer import render_pdf

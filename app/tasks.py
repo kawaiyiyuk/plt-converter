@@ -463,7 +463,9 @@ def execute_pdf_layout_suggestion(job_id, attempt=None):
     try:
         if not input_path.exists():
             raise ValueError('PDF 预览已过期，请重新选择文件')
-        suggestion = optimize_pdf_layout(input_path.read_bytes())
+        suggestion = optimize_pdf_layout(
+            input_path.read_bytes(), metadata_mode=result.get('layout_suggestion_mode')
+        )
     except Exception as error:
         _finish_pdf_layout_suggestion(
             job_id,
@@ -608,6 +610,7 @@ def _execute(record, connection):
             'page_count': len(pages),
             'rows': rows,
             'columns': columns,
+            'requires_metadata_choice': bool(embedded_layout),
         }
         if complete_embedded_layout:
             result['embedded_layout'] = complete_embedded_layout

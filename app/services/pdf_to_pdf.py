@@ -26,8 +26,13 @@ def pdf_page_count(source):
         document.close()
 
 
-def automatic_layout_suggestion(source, source_page_count=None):
+def automatic_layout_suggestion(source, source_page_count=None, metadata_mode=None):
     page_count = source_page_count or pdf_page_count(source)
+    if metadata_mode == 'original':
+        from .pdf_to_plt import read_pdf_layout_metadata
+        embedded_layout = read_pdf_layout_metadata(source)
+        if embedded_layout and embedded_layout.get('complete_layout'):
+            return optimize_pdf_layout(source, metadata_mode=metadata_mode)
     if page_count == 1:
         return {
             'confidence': 'high',
@@ -39,7 +44,7 @@ def automatic_layout_suggestion(source, source_page_count=None):
             'output_rotation': 0,
             'source': 'single_page',
         }
-    suggestion = optimize_pdf_layout(source)
+    suggestion = optimize_pdf_layout(source, metadata_mode=metadata_mode)
     if suggestion.get('confidence') not in {'high', 'medium'}:
         reason = suggestion.get('reason') or '接缝证据不足'
         raise ValueError(
@@ -94,10 +99,12 @@ def convert_pdf_to_pdf(source, options=None):
     source_page_count = int(options.get('source_page_count') or pdf_page_count(source))
     if source_page_count < 1 or source_page_count > MAX_PDF_PAGES:
         raise ValueError(f'PDF 页数必须在 1 到 {MAX_PDF_PAGES} 页之间')
-    suggestion = automatic_layout_suggestion(source, source_page_count)
+    from .pdf_to_plt import read_pdf_layout_metadata, validate_metadata_mode
+    metadata_mode = validate_metadata_mode(options.get('metadata_mode'), read_pdf_layout_metadata(source))
+    suggestion = automatic_layout_suggestion(source, source_page_count, metadata_mode)
     plt, source_layout = convert_pdf_to_plt(
         source,
-        source_conversion_options(suggestion),
+        {**source_conversion_options(suggestion), 'metadata_mode': metadata_mode},
     )
     drawing = parse_plt(plt, 1016)
     pdf, target_layout = render_pdf(drawing, target_options)

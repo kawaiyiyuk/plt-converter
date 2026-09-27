@@ -2,6 +2,8 @@ import math
 import os
 import zlib
 
+import pymupdf
+
 from .pdf_metadata import encode_pdf_layout_metadata
 
 
@@ -15,6 +17,61 @@ PAPER_SIZES_MM = {
     'A4': (210, 297),
     'LETTER': (216, 279),
 }
+
+
+def measure_display_bounds(document):
+    """Return PDF ink bounds relative to the original geometry origin."""
+    metrics = document['metrics']
+    unit_to_pt = 72 / float(metrics['units_per_inch'])
+    width = metrics['width_mm'] * MM_TO_PT
+    height = metrics['height_mm'] * MM_TO_PT
+    bounds = [0.0, 0.0, width, height]
+    labels = [shape for shape in document['shapes'] if shape['type'] == 'text' and shape.get('text')]
+    if not labels:
+        return {'min_x_pt': 0.0, 'min_y_pt': 0.0, 'max_x_pt': width,
+                'max_y_pt': height, 'text_bounds_pt': []}
+
+    # A stroke marker precedes every LB. Some controls emit no fill-text box;
+    # markers preserve the label-to-ink mapping without guessing by position.
+    probe_content = '\n'.join(
+        'q 1 w 10 10 m 11 10 l S Q\n'
+        f'BT /F1 8 Tf 100 100 Td <{utf16be_hex(shape["text"])}> Tj ET'
+        for shape in labels
+    )
+    probe = build_pdf_document([probe_content], 1000, 1000)
+    with pymupdf.open(stream=probe, filetype='pdf') as measured:
+        logs = measured[0].get_bboxlog()
+    ink_by_label = []
+    for kind, rect in logs:
+        if kind == 'stroke-path':
+            ink_by_label.append([])
+        elif kind == 'fill-text' and ink_by_label:
+            ink_by_label[-1].append(rect)
+    if len(ink_by_label) != len(labels):
+        raise ValueError('PLT 文字范围无法测量')
+
+    text_bounds = []
+    for shape, ink_boxes in zip(labels, ink_by_label):
+        if not ink_boxes:
+            text_bounds.append(None)
+            continue
+        ink = (
+            min(rect[0] for rect in ink_boxes),
+            min(rect[1] for rect in ink_boxes),
+            max(rect[2] for rect in ink_boxes),
+            max(rect[3] for rect in ink_boxes),
+        )
+        anchor_x = (shape['point']['x'] - metrics['min_x']) * unit_to_pt
+        anchor_y = (shape['point']['y'] - metrics['min_y']) * unit_to_pt
+        actual = [anchor_x + ink[0] - 100, anchor_y + 900 - ink[3],
+                  anchor_x + ink[2] - 100, anchor_y + 900 - ink[1]]
+        text_bounds.append(actual)
+        bounds[0] = min(bounds[0], actual[0])
+        bounds[1] = min(bounds[1], actual[1])
+        bounds[2] = max(bounds[2], actual[2])
+        bounds[3] = max(bounds[3], actual[3])
+    return dict(zip(('min_x_pt', 'min_y_pt', 'max_x_pt', 'max_y_pt'), bounds),
+                text_bounds_pt=text_bounds)
 
 
 def render_pdf(document, options=None):
@@ -31,15 +88,21 @@ def render_pdf(document, options=None):
     disabled_pages = options.get('disabled_pages')
     maximum_pages = max(1, int(os.getenv('PLT_MAX_OUTPUT_PAGES', '80')))
     units_per_inch = float(metrics['units_per_inch'])
-    scale = MM_TO_PT / 25.4 * 25.4 / units_per_inch
+    unit_to_pt = 72 / units_per_inch
+    display = measure_display_bounds(document)
+    display_metrics = dict(metrics)
+    if display['min_x_pt'] < 0:
+        display_metrics['min_x'] += display['min_x_pt'] / unit_to_pt
+    if display['max_y_pt'] > metrics['height_mm'] * MM_TO_PT:
+        display_metrics['max_y'] = metrics['min_y'] + display['max_y_pt'] / unit_to_pt
 
     if paper_size not in PAPER_SIZES_MM:
         raise ValueError(f'不支持的纸张类型: {paper_size}')
     if orientation not in {'portrait', 'landscape', 'auto'}:
         orientation = 'portrait'
 
-    drawing_width_pt = metrics['width_mm'] * MM_TO_PT
-    drawing_height_pt = metrics['height_mm'] * MM_TO_PT
+    drawing_width_pt = display['max_x_pt'] - display['min_x_pt']
+    drawing_height_pt = display['max_y_pt'] - display['min_y_pt']
     if disabled_pages is None and enabled_pages is not None and not enabled_pages:
         raise ValueError('至少保留一个输出页面')
 
@@ -115,7 +178,7 @@ def render_pdf(document, options=None):
         }
         content = build_page_content(
             shapes,
-            metrics,
+            display_metrics,
             {'row': 0, 'column': 0, 'source_index': 0},
             single_page_width_pt,
             single_page_height_pt,
@@ -183,7 +246,7 @@ def render_pdf(document, options=None):
     for page_number, page in enumerate(pages, start=1):
         page_contents.append(build_page_content(
             shapes,
-            metrics,
+            display_metrics,
             page,
             page_width_pt,
             page_height_pt,
@@ -365,8 +428,6 @@ def build_page_content(
 
     for shape in text_shapes:
         point = transform_point(shape['point'], metrics, page, drawing_width_pt, drawing_height_pt, tile_width_pt, tile_height_pt, margin_pt)
-        if not point_in_rect(point, clip_min_x, clip_min_y, clip_max_x, clip_max_y):
-            continue
         text = utf16be_hex(shape.get('text', ''))
         if not text:
             continue
@@ -553,9 +614,18 @@ def build_pdf_document(page_contents, page_width_pt, page_height_pt, layout_meta
     objects = [None]
     text_shape_font = None
     if any('/F1 ' in content for content in page_contents):
+        # STSong-Light CID descriptor values from ReportLab pdfbase/_cidfontdata.py.
+        descriptor = add_object(
+            objects,
+            '<< /Type /FontDescriptor /Ascent 752 /CapHeight 737 /Descent -271 '
+            '/Flags 6 /FontBBox [-25 -254 1000 880] /FontName /STSongStd-Light '
+            '/ItalicAngle 0 /Leading 148 /MaxWidth 1000 /MissingWidth 500 '
+            '/StemH 91 /StemV 58 /XHeight 553 >>',
+        )
         cid_font = add_object(
             objects,
             '<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light '
+            f'/FontDescriptor {descriptor} 0 R '
             '/CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> /DW 1000 >>',
         )
         text_shape_font = add_object(

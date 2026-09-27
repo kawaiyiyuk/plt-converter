@@ -26,7 +26,7 @@ DEFAULT_MAX_CROP_MM = 15.0
 DEFAULT_CROP_STEP_MM = 0.1
 
 
-def optimize_pdf_layout(source):
+def optimize_pdf_layout(source, metadata_mode=None):
     """Analyze a vector PDF and return the strongest page-layout suggestion."""
     fitz = load_fitz()
     document = open_pdf_document(source, fitz)
@@ -37,6 +37,10 @@ def optimize_pdf_layout(source):
             raise ValueError('PDF 页数过多，最多支持 200 页')
         validate_pdf_complexity(document)
         embedded_layout = read_pdf_layout_metadata_from_document(document)
+        from .pdf_to_plt import validate_metadata_mode
+        metadata_mode = validate_metadata_mode(metadata_mode, embedded_layout)
+        if metadata_mode == 'current':
+            embedded_layout = None
         if embedded_layout and embedded_layout.get('complete_layout'):
             return _embedded_layout_suggestion(embedded_layout)
 
@@ -44,6 +48,7 @@ def optimize_pdf_layout(source):
             document,
             fitz,
             ignore_internal_guides=bool(embedded_layout),
+            ignore_crop_guides=metadata_mode != 'current',
         )
     finally:
         document.close()
@@ -422,7 +427,7 @@ def _dedupe(values):
     return result
 
 
-def _extract_vector_segments(document, fitz, ignore_internal_guides=False):
+def _extract_vector_segments(document, fitz, ignore_internal_guides=False, ignore_crop_guides=True):
     sizes = []
     pages = []
     for page_index in range(document.page_count):
@@ -445,7 +450,7 @@ def _extract_vector_segments(document, fitz, ignore_internal_guides=False):
                         (float(start.x), float(start.y)),
                         (float(end.x), float(end.y)),
                     )
-                    if _is_red_crop_guide_segment(
+                    if ignore_crop_guides and _is_red_crop_guide_segment(
                         segment[0],
                         segment[1],
                         color,

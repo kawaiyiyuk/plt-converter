@@ -10,10 +10,15 @@ from flask import Blueprint, current_app, jsonify, request, send_file, url_for
 from .billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
 from .tasks import finalize_ready_conversion_job
 from .services.plt_metadata import inspect_plt
+from .services.plt_parser import parse_plt
+from .services.pdf_renderer import measure_display_bounds
 from .services.pdf_to_pdf import SINGLE_PAGE_PAPER_SIZE, SUPPORTED_PAPER_SIZES, pdf_page_count
-from .services.pdf_to_plt import DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM
+from .services.pdf_to_plt import (
+    DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM, read_pdf_layout_metadata, validate_metadata_mode,
+)
 from .job_queue import (
     QueueRejected,
+    SubmissionConflict,
     cancel_job,
     confirm_job_billing,
     enforce_rate_limit,
@@ -194,6 +199,8 @@ def job_response(record):
     if record.get('status') == 'queued':
         response['queue_position'] = queue_position(record['job_id'])
     result = record.get('result') or {}
+    if record.get('job_type') in {'pdf_to_plt', 'pdf_to_pdf'}:
+        response['metadata_mode'] = (record.get('options') or {}).get('metadata_mode')
     if record.get('job_type') == 'pdf_to_pdf':
         source_page_count = (record.get('options') or {}).get('source_page_count')
         if source_page_count:
@@ -253,6 +260,15 @@ def preview_plt():
             source,
             units_per_inch=int(request.form.get('units_per_inch', 1016)),
         )
+        document = parse_plt(source, units_per_inch=metadata['units_per_inch'])
+        display_bounds = measure_display_bounds(document)
+        labels = [
+            {'text': shape['text'], 'point': shape['point'], 'bounds_pt': bounds}
+            for shape, bounds in zip(
+                (shape for shape in document['shapes'] if shape['type'] == 'text' and shape.get('text')),
+                display_bounds['text_bounds_pt'],
+            )
+        ]
     except ValueError as error:
         return jsonify({'error': str(error)}), 422
 
@@ -260,6 +276,8 @@ def preview_plt():
         'status': 'preview_ready',
         'filename': filename,
         'metadata': metadata,
+        'display_bounds_pt': display_bounds,
+        'labels': labels,
         'temporary': True,
     })
 
@@ -291,6 +309,8 @@ def create_conversion_job():
         commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         billing_confirmed = True
         record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
+    except SubmissionConflict as error:
+        return jsonify({'error': str(error), 'status': 'conflict'}), 409
     except BillingRejected as error:
         rollback_conversion_submission(billing, record, billing_confirmed)
         return billing_error(error)
@@ -325,7 +345,7 @@ def get_conversion_job(job_id):
 def cancel_conversion_job(job_id):
     try:
         user_key = authenticated_user_key()
-        record = cancel_job(job_id, user_key)
+        record = cancel_job(job_id, user_key, expected_type='plt_to_pdf')
         record = settle_terminal_conversion_billing(record)
     except BillingRejected as error:
         return billing_error(error)
@@ -415,6 +435,14 @@ def create_pdf_to_plt_job():
     validation_error = validate_pdf_upload(uploaded)
     if validation_error:
         return validation_error
+    try:
+        source = uploaded.read()
+        options = parse_pdf_render_options(request.form)
+        options['metadata_mode'] = validate_metadata_mode(
+            request.form.get('metadata_mode'), read_pdf_layout_metadata(source)
+        )
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 422
     billing = None
     record = None
     billing_confirmed = False
@@ -422,9 +450,9 @@ def create_pdf_to_plt_job():
         billing = authorize_job('pdf_to_plt')
         record = submit_job(
             'pdf_to_plt',
-            uploaded.read(),
+            source,
             safe_uploaded_filename(request.form.get('original_filename') or uploaded.filename),
-            parse_pdf_render_options(request.form),
+            options,
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
             billing_access_method=billing.get('access_method'),
@@ -432,6 +460,8 @@ def create_pdf_to_plt_job():
         commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         billing_confirmed = True
         record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
+    except SubmissionConflict as error:
+        return jsonify({'error': str(error), 'status': 'conflict'}), 409
     except BillingRejected as error:
         rollback_conversion_submission(billing, record, billing_confirmed)
         return billing_error(error)
@@ -501,6 +531,9 @@ def create_pdf_to_pdf_job():
             source_page_count = pdf_page_count(source)
             source_filename = uploaded.filename
         options['source_page_count'] = source_page_count
+        options['metadata_mode'] = validate_metadata_mode(
+            request.form.get('metadata_mode'), read_pdf_layout_metadata(source)
+        )
         billing = authorize_job('pdf_to_pdf')
         record = submit_job(
             'pdf_to_pdf',
@@ -515,6 +548,8 @@ def create_pdf_to_pdf_job():
             commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
         billing_confirmed = True
+    except SubmissionConflict as error:
+        return jsonify({'error': str(error), 'status': 'conflict'}), 409
     except BillingRejected as error:
         rollback_conversion_submission(billing, record, billing_confirmed)
         return billing_error(error, {'source_page_count': source_page_count})
@@ -542,11 +577,12 @@ def inspect_pdf_to_pdf_source():
     try:
         source = uploaded.read()
         source_page_count = pdf_page_count(source)
+        has_embedded_layout = bool(read_pdf_layout_metadata(source))
         record = store_source_upload(
             'pdf_to_pdf_source',
             source,
             safe_uploaded_filename(uploaded.filename),
-            {'source_page_count': source_page_count},
+            {'source_page_count': source_page_count, 'has_embedded_layout': has_embedded_layout},
             request_user_key(),
         )
     except RedisError as error:
@@ -558,6 +594,7 @@ def inspect_pdf_to_pdf_source():
     return jsonify({
         'source_id': record['job_id'],
         'source_page_count': source_page_count,
+        'requires_metadata_choice': has_embedded_layout,
     }), 200
 
 
@@ -580,7 +617,7 @@ def cancel_pdf_to_pdf_job(job_id):
         owned = owned_job(job_id, 'pdf_to_pdf')
         if not owned:
             return jsonify({'error': '任务不存在或已过期'}), 404
-        record = cancel_job(job_id, user_key)
+        record = cancel_job(job_id, user_key, expected_type='pdf_to_pdf')
         record = settle_terminal_conversion_billing(record)
     except BillingRejected as error:
         return billing_error(error)
@@ -626,6 +663,22 @@ def get_pdf_preview_job(job_id):
     ):
         record = None
     if record:
+        result = record.get('result') or {}
+        if record.get('status') == 'done' and 'requires_metadata_choice' not in result:
+            # A preview completed before metadata choice support may still be
+            # polled by an open client without another POST.
+            try:
+                source = Path(record['input_path']).read_bytes()
+            except (KeyError, TypeError, OSError):
+                return jsonify({'error': '预览源文件已过期，请重新选择 PDF'}), 404
+            try:
+                embedded_layout = read_pdf_layout_metadata(source)
+            except ValueError as error:
+                return jsonify({'error': str(error)}), 422
+            result = {**result, 'requires_metadata_choice': bool(embedded_layout)}
+            if embedded_layout and embedded_layout.get('complete_layout'):
+                result['embedded_layout'] = embedded_layout
+            record = {**record, 'result': result}
         return jsonify(job_response(record))
     return jsonify({'error': '任务不存在或已过期'}), 404
 
@@ -645,13 +698,23 @@ def get_pdf_layout_suggestion(job_id):
     if not input_path.exists():
         return jsonify({'error': 'PDF 预览已过期，请重新选择文件'}), 404
     result = dict(record.get('result') or {})
-    cached_suggestion = result.get('layout_suggestion')
+    try:
+        metadata_mode = validate_metadata_mode(
+            request.args.get('metadata_mode'), result.get('requires_metadata_choice')
+        )
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 422
+    cached_suggestion = (
+        result.get('layout_suggestion')
+        if result.get('layout_suggestion_mode') == metadata_mode else None
+    )
     try:
         if not cached_suggestion:
             record = enqueue_pdf_layout_suggestion(
                 job_id,
                 request_user_key(),
                 retry_failed=request.args.get('retry') == '1',
+                metadata_mode=metadata_mode,
             )
             result = dict(record.get('result') or {})
             cached_suggestion = result.get('layout_suggestion')
@@ -717,7 +780,7 @@ def cancel_pdf_preview_job(job_id):
 def cancel_pdf_to_plt_job(job_id):
     try:
         user_key = authenticated_user_key()
-        record = cancel_job(job_id, user_key)
+        record = cancel_job(job_id, user_key, expected_type='pdf_to_plt')
         record = settle_terminal_conversion_billing(record)
     except BillingRejected as error:
         return billing_error(error)
@@ -828,7 +891,27 @@ def parse_units_per_inch(form):
         value = 1016
     if value <= 0:
         raise ValueError('units_per_inch 必须大于 0')
+    try:
+        finite_value = float(value)
+    except OverflowError as error:
+        raise ValueError('units_per_inch 参数无效') from error
+    if not math.isfinite(finite_value):
+        raise ValueError('units_per_inch 参数无效')
     return value
+
+
+def _parse_page_index(value):
+    if isinstance(value, bool):
+        raise ValueError('页码必须是整数')
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError('页码必须是整数')
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r'[+-]?\d+', value.strip()):
+        return int(value.strip())
+    raise ValueError('页码必须是整数')
 
 
 def parse_render_options(form):
@@ -855,8 +938,8 @@ def parse_render_options(form):
             decoded = json.loads(raw_value)
             if not isinstance(decoded, list):
                 raise ValueError
-            return [int(value) for value in decoded]
-        except (TypeError, ValueError, json.JSONDecodeError):
+            return [_parse_page_index(value) for value in decoded]
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
             raise ValueError(f'{name} 参数无效')
 
     return {
@@ -896,18 +979,24 @@ def parse_pdf_render_options(form):
     enabled_pages = None
     if raw_enabled_pages:
         try:
-            enabled_pages = [int(value) for value in json.loads(raw_enabled_pages)]
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            parsed_pages = json.loads(raw_enabled_pages)
+            if not isinstance(parsed_pages, list):
+                raise ValueError('enabled_pages 参数无效')
+            enabled_pages = [_parse_page_index(value) for value in parsed_pages]
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError) as error:
             raise ValueError('enabled_pages 参数无效') from error
     raw_page_slots = form.get('page_slots', '')
     page_slots = None
     if raw_page_slots:
         try:
+            parsed_slots = json.loads(raw_page_slots)
+            if not isinstance(parsed_slots, list):
+                raise ValueError('page_slots 参数无效')
             page_slots = [
-                None if value is None else int(value)
-                for value in json.loads(raw_page_slots)
+                None if value is None else _parse_page_index(value)
+                for value in parsed_slots
             ]
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError) as error:
             raise ValueError('page_slots 参数无效') from error
     raw_output_rotation = form.get('output_rotation', 0)
     try:
@@ -930,6 +1019,7 @@ def parse_pdf_render_options(form):
         'enabled_pages': enabled_pages,
         'page_slots': page_slots,
         'output_rotation': output_rotation,
+        'metadata_mode': form.get('metadata_mode'),
     }
 
 
