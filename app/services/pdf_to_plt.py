@@ -80,6 +80,14 @@ def read_pdf_layout_metadata_from_document(document):
     return metadata
 
 
+def validate_metadata_mode(mode, embedded_layout):
+    if mode not in (None, '', 'original', 'current'):
+        raise ValueError('元数据处理方式只支持 original 或 current')
+    if embedded_layout and not mode:
+        raise ValueError('检测到排版信息，无法确认 PDF 是否被修改；请先选择“使用原排版”或“按当前 PDF 内容”')
+    return mode or None
+
+
 def convert_pdf_to_plt(source, options=None):
     """Convert vector PDF paths, or raster page lines as a best-effort fallback, to HPGL."""
     options = options or {}
@@ -102,6 +110,9 @@ def convert_pdf_to_plt(source, options=None):
             raise ValueError(f'PDF 页数过多，最多支持 {MAX_PDF_PAGES} 页')
         page_count = document.page_count
         embedded_layout = read_pdf_layout_metadata_from_document(document)
+        metadata_mode = validate_metadata_mode(options.get('metadata_mode'), embedded_layout)
+        if metadata_mode == 'current':
+            embedded_layout = None
         validate_pdf_complexity(document)
         placements, enabled_pages = resolve_page_placements(
             page_count,
@@ -124,6 +135,7 @@ def convert_pdf_to_plt(source, options=None):
                 maximum_segments - total_segments,
                 crop_rect,
                 ignore_internal_guides=bool(embedded_layout),
+                ignore_crop_guides=metadata_mode != 'current',
             )
             total_segments += sum(max(len(shape) - 1, 0) for shape in extracted_page['shapes'])
             if total_segments > maximum_segments:
@@ -373,6 +385,7 @@ def _extract_page(
     remaining_segments,
     crop_rect=None,
     ignore_internal_guides=False,
+    ignore_crop_guides=True,
 ):
     crop_rect = crop_rect or fitz.Rect(0, 0, page.rect.width, page.rect.height)
     page_width = crop_rect.width * units_per_inch / 72
@@ -383,7 +396,7 @@ def _extract_page(
     for drawing in drawings:
         if ignore_internal_guides and is_internal_guide_drawing(drawing):
             continue
-        if is_crop_guide_drawing(drawing, crop_rect, rotation_matrix, fitz):
+        if ignore_crop_guides and is_crop_guide_drawing(drawing, crop_rect, rotation_matrix, fitz):
             continue
         drawing_shapes = []
         for item in drawing.get('items', []):

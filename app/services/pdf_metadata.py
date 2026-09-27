@@ -30,12 +30,12 @@ def decode_pdf_layout_metadata(subject):
         payload = base64.urlsafe_b64decode((encoded + padding).encode('ascii'))
         decoded = json.loads(payload.decode('ascii'))
         return normalize_pdf_layout_metadata(decoded)
-    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+    except (ValueError, TypeError, OverflowError, UnicodeError, json.JSONDecodeError):
         return None
 
 
 def normalize_pdf_layout_metadata(metadata):
-    if not isinstance(metadata, dict) or int(metadata.get('version', 0)) != 1:
+    if not isinstance(metadata, dict) or _metadata_int(metadata.get('version', 0), 'version') != 1:
         raise ValueError('PDF 排版元数据版本无效')
     rows = _positive_grid_int(metadata.get('rows'), 'rows')
     columns = _positive_grid_int(metadata.get('columns'), 'columns')
@@ -52,7 +52,7 @@ def normalize_pdf_layout_metadata(metadata):
         if value is None:
             page_slots.append(None)
             continue
-        index = int(value)
+        index = _metadata_int(value, '页码')
         if index < 0:
             raise ValueError('PDF 排版元数据页码无效')
         page_slots.append(index)
@@ -87,28 +87,45 @@ def normalize_pdf_layout_metadata(metadata):
     }
 
 
+def _metadata_int(value, name):
+    if isinstance(value, bool) or (
+        isinstance(value, float) and (not math.isfinite(value) or not value.is_integer())
+    ):
+        raise ValueError(f'PDF 排版元数据{name}无效')
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f'PDF 排版元数据{name}无效') from error
+
+
 def _positive_grid_int(value, name):
-    result = int(value)
+    result = _metadata_int(value, name)
     if result <= 0 or result > MAX_GRID_SIZE:
         raise ValueError(f'{name} 超出范围')
     return result
 
 
 def _finite_non_negative(value, name):
-    result = float(value)
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f'{name} 超出范围') from error
     if not math.isfinite(result) or result < 0 or result > 100:
         raise ValueError(f'{name} 超出范围')
     return result
 
 
 def _finite_drawing_dimension(value, name):
-    result = float(value)
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f'{name} 超出范围') from error
     try:
         maximum = float(os.getenv('PLT_MAX_DIMENSION_MM', '10000'))
     except (TypeError, ValueError):
         maximum = 10000.0
     if not math.isfinite(maximum) or maximum < 100:
         maximum = 10000.0
-    if not math.isfinite(result) or result <= 0 or result > maximum:
+    if not math.isfinite(result) or result < 0 or result > maximum:
         raise ValueError(f'{name} 超出范围')
     return result

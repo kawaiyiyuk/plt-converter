@@ -12,7 +12,7 @@ from redis.exceptions import RedisError
 
 from app import create_app
 from app.billing import BillingRejected
-from app.routes import parse_pdf_render_options, parse_render_options, safe_uploaded_filename
+from app.routes import parse_pdf_render_options, parse_render_options, parse_units_per_inch, safe_uploaded_filename
 from app.job_queue import (
     JOB_OUTPUT_VERSIONS,
     QueueRejected,
@@ -601,7 +601,40 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(self.redis.llen('rq:queue:pdf-layout-analysis'), 1)
         self.assertEqual(cached.get_json(), expected)
         self.assertEqual(denied.status_code, 404)
-        optimize.assert_called_once_with(b'%PDF preview source')
+        optimize.assert_called_once_with(b'%PDF preview source', metadata_mode=None)
+
+    def test_pdf_layout_suggestion_cache_is_isolated_by_metadata_mode(self):
+        from app.job_queue import save_job
+
+        record = submit_job(
+            'pdf_preview', b'%PDF preview source', 'sample.pdf', {},
+            'user-a', connection=self.redis,
+        )
+        completed = load_job(record['job_id'], self.redis)
+        completed['status'] = 'done'
+        completed['result'] = {
+            'pages': [{'index': 0}], 'requires_metadata_choice': True,
+        }
+        save_job(completed, self.redis)
+        app = create_app()
+        route = f"/api/v1/pdf/preview/jobs/{record['job_id']}/layout-suggestion"
+        headers = {'X-Client-Key': 'user-a'}
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks.optimize_pdf_layout', side_effect=lambda _source, metadata_mode: {
+                    'confidence': 'high', 'source': metadata_mode,
+                }):
+            client = app.test_client()
+            self.assertEqual(client.get(route, headers=headers).status_code, 422)
+            self.assertEqual(client.get(route + '?metadata_mode=original', headers=headers).status_code, 202)
+            execute_pdf_layout_suggestion(record['job_id'])
+            original = client.get(route + '?metadata_mode=original', headers=headers)
+            self.assertEqual(original.get_json()['suggestion']['source'], 'original')
+            current_pending = client.get(route + '?metadata_mode=current', headers=headers)
+            self.assertEqual(current_pending.status_code, 202)
+            execute_pdf_layout_suggestion(record['job_id'])
+            current = client.get(route + '?metadata_mode=current', headers=headers)
+            self.assertEqual(current.get_json()['suggestion']['source'], 'current')
 
     def test_pdf_layout_suggestion_rejects_when_analysis_queue_is_full(self):
         from app.job_queue import enqueue_pdf_layout_suggestion, save_job
@@ -763,6 +796,7 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(result['rows'], 4)
         self.assertEqual(result['columns'], 3)
         self.assertEqual(result['embedded_layout'], embedded_layout)
+        self.assertTrue(result['requires_metadata_choice'])
 
     def test_pdf_preview_does_not_expose_incomplete_roundtrip_layout(self):
         source = Path(self.temp_dir.name) / 'incomplete-layout.pdf'
@@ -798,6 +832,7 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(result['rows'], 1)
         self.assertEqual(result['columns'], 2)
         self.assertNotIn('embedded_layout', result)
+        self.assertTrue(result['requires_metadata_choice'])
 
     def test_large_pdf_preview_default_grid_stays_within_conversion_limits(self):
         source = Path(self.temp_dir.name) / 'large-preview.pdf'
@@ -898,13 +933,16 @@ class JobQueueTest(unittest.TestCase):
                     'request_id': 'pdf-original-name-request',
                 }), \
                 patch('app.routes.commit_conversion', return_value={'success': True}):
-            response = app.test_client().post(
-                '/api/v1/pdf/jobs',
-                data={
-                    'original_filename': '春季 纸样.v1.pdf',
-                    'file': (io.BytesIO(b'%PDF'), 'tmp_upload.pdf'),
-                },
-            )
+            # This filename test deliberately sends fake PDF bytes.
+            # Metadata detection is covered with a real PDF separately.
+            with patch('app.routes.read_pdf_layout_metadata', return_value=None):
+                response = app.test_client().post(
+                    '/api/v1/pdf/jobs',
+                    data={
+                        'original_filename': '春季 纸样.v1.pdf',
+                        'file': (io.BytesIO(b'%PDF'), 'tmp_upload.pdf'),
+                    },
+                )
 
         self.assertEqual(response.status_code, 200)
         record = load_job(response.get_json()['job_id'], self.redis)
@@ -967,6 +1005,33 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(options['enabled_pages'], [0, 1])
         self.assertEqual(options['disabled_pages'], [])
 
+    def test_plt_render_options_rejects_infinite_and_fractional_page_indexes(self):
+        for key in ('enabled_pages', 'disabled_pages'):
+            for raw in ('[1e309]', '[1.9]', '[false]'):
+                with self.subTest(key=key, raw=raw):
+                    with self.assertRaisesRegex(ValueError, key):
+                        parse_render_options({key: raw})
+
+    def test_plt_job_rejects_infinite_page_index_with_422(self):
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authorize_job', return_value={
+                    'user_id': 1,
+                    'request_id': 'invalid-page-request',
+                }), \
+                patch('app.routes.release_conversion'):
+            response = app.test_client().post(
+                '/api/v1/plt/jobs',
+                headers={'X-Client-Key': 'invalid-page'},
+                data={
+                    'file': (io.BytesIO(b'IN;PU0,0;PD1016,1016;'), 'sample.plt'),
+                    'enabled_pages': '[1e309]',
+                },
+            )
+        self.assertEqual(response.status_code, 422)
+        self.assertIn('enabled_pages', response.get_json()['error'])
+
     def test_pdf_route_strictly_rejects_invalid_crop_options(self):
         app = create_app()
         with patch('app.routes.redis_connection', return_value=self.redis), \
@@ -995,6 +1060,42 @@ class JobQueueTest(unittest.TestCase):
         for value in ('45', '-90', 'abc'):
             with self.assertRaisesRegex(ValueError, 'output_rotation'):
                 parse_pdf_render_options({'output_rotation': value})
+
+    def test_pdf_render_options_rejects_json_strings_as_page_lists(self):
+        for key in ('enabled_pages', 'page_slots'):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, key):
+                    parse_pdf_render_options({key: '"12"'})
+
+    def test_pdf_render_options_rejects_infinite_page_indexes(self):
+        for key in ('enabled_pages', 'page_slots'):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, key):
+                    parse_pdf_render_options({key: '[1e309]'})
+
+    def test_pdf_render_options_rejects_fractional_and_boolean_page_indexes(self):
+        for key in ('enabled_pages', 'page_slots'):
+            for raw in ('[1.9]', '[false]'):
+                with self.subTest(key=key, raw=raw):
+                    with self.assertRaisesRegex(ValueError, key):
+                        parse_pdf_render_options({key: raw})
+
+    def test_rejects_unit_scale_too_large_for_float_conversion(self):
+        with self.assertRaisesRegex(ValueError, 'units_per_inch'):
+            parse_units_per_inch({'units_per_inch': '1' + '0' * 309})
+
+        app = create_app()
+        with patch('app.routes.enforce_rate_limit'):
+            response = app.test_client().post(
+                '/api/v1/plt/preview',
+                data={
+                    'file': (io.BytesIO(b'IN;PU0,0;PD1016,1016;'), 'sample.plt'),
+                    'units_per_inch': '1' + '0' * 309,
+                },
+                content_type='multipart/form-data',
+            )
+        self.assertEqual(response.status_code, 422)
+        self.assertIn('units_per_inch', response.get_json()['error'])
 
     def test_pdf_render_options_default_to_one_mm_export_line_width(self):
         self.assertEqual(parse_pdf_render_options({})['line_width_mm'], 1.0)

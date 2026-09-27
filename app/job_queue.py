@@ -308,14 +308,8 @@ def store_source_upload(job_type, source, filename, options, user_key, connectio
         slot_lock.release()
 
 
-def submit_job(
-    job_type, source, filename, options, user_key, connection=None,
-    billing_request_id=None, billing_access_method=None,
-):
-    connection = connection or redis_connection()
-    cleanup_expired_job_files(connection)
-    output_version = JOB_OUTPUT_VERSIONS.get(job_type, '1')
-    fingerprint = hashlib.sha256(
+def submission_fingerprint(job_type, source, filename, options, output_version):
+    return hashlib.sha256(
         job_type.encode('utf-8')
         + b'\0'
         + output_version.encode('utf-8')
@@ -326,6 +320,39 @@ def submit_job(
         + b'\0'
         + json.dumps(options, sort_keys=True, ensure_ascii=False).encode('utf-8')
     ).hexdigest()
+
+
+def matches_billing_submission(record, job_type, source, filename, options, connection):
+    # A renderer upgrade must not invalidate replay of an already admitted job.
+    output_version = record.get('output_version') or '1'
+    candidate = submission_fingerprint(job_type, source, filename, options, output_version)
+    expected = record.get('fingerprint')
+    if not expected:
+        # Existing jobs may predate the persisted fingerprint. Their Redis index
+        # proves a match while it exists; otherwise verify against the saved input.
+        legacy_id = connection.get(f"plt-converter:fingerprint:{record['user_key']}:{candidate}")
+        if isinstance(legacy_id, bytes):
+            legacy_id = legacy_id.decode('utf-8')
+        if legacy_id == record['job_id']:
+            return True
+        try:
+            saved_source = Path(record['input_path']).read_bytes()
+        except (KeyError, TypeError, OSError) as error:
+            raise SubmissionConflict('无法核对原任务，请使用新的转换请求编号') from error
+        expected = submission_fingerprint(
+            record['job_type'], saved_source, record['filename'], record['options'], output_version,
+        )
+    return candidate == expected
+
+
+def submit_job(
+    job_type, source, filename, options, user_key, connection=None,
+    billing_request_id=None, billing_access_method=None,
+):
+    connection = connection or redis_connection()
+    cleanup_expired_job_files(connection)
+    output_version = JOB_OUTPUT_VERSIONS.get(job_type, '1')
+    fingerprint = submission_fingerprint(job_type, source, filename, options, output_version)
     fingerprint_key = f'plt-converter:fingerprint:{user_key}:{fingerprint}'
     lock = connection.lock('plt-converter:submit-lock', timeout=15, blocking_timeout=5)
     if not lock.acquire(blocking=True):
@@ -342,6 +369,8 @@ def submit_job(
                 billing_job.get('status') in ACTIVE_STATUSES
                 or completed_result_available(billing_job)
             ):
+                if not matches_billing_submission(billing_job, job_type, source, filename, options, connection):
+                    raise SubmissionConflict('转换请求编号已用于不同文件或参数，请重新提交')
                 billing_job['deduplicated'] = True
                 return billing_job
             if billing_job_id:
@@ -381,6 +410,7 @@ def submit_job(
             'job_id': job_id,
             'job_type': job_type,
             'output_version': output_version,
+            'fingerprint': fingerprint,
             'user_key': user_key,
             'status': 'billing_pending' if billing_request_id else 'queued',
             'progress': 0,
@@ -441,7 +471,7 @@ def submit_job(
         lock.release()
 
 
-def enqueue_pdf_layout_suggestion(job_id, user_key, connection=None, retry_failed=False):
+def enqueue_pdf_layout_suggestion(job_id, user_key, connection=None, retry_failed=False, metadata_mode=None):
     """Queue one layout analysis for an already completed, owned PDF preview."""
     connection = connection or redis_connection()
     lock = acquire_job_lock(job_id, connection)
@@ -455,6 +485,15 @@ def enqueue_pdf_layout_suggestion(job_id, user_key, connection=None, retry_faile
             raise ValueError('PDF 预览尚未完成，请稍后再试')
 
         result = dict(record.get('result') or {})
+        from .services.pdf_to_plt import validate_metadata_mode
+        validate_metadata_mode(metadata_mode, result.get('requires_metadata_choice'))
+        if result.get('layout_suggestion_mode') != metadata_mode:
+            result.pop('layout_suggestion', None)
+            result.pop('layout_suggestion_status', None)
+            result.pop('layout_suggestion_error', None)
+            result['layout_suggestion_mode'] = metadata_mode
+            result['layout_suggestion_attempt'] = int(result.get('layout_suggestion_attempt', 0)) + 1
+            record = update_job(job_id, connection, result=result)
         analysis_status = result.get('layout_suggestion_status')
         if result.get('layout_suggestion') or analysis_status in {'queued', 'processing'}:
             return record
@@ -523,7 +562,7 @@ def enqueue_pdf_layout_suggestion(job_id, user_key, connection=None, retry_faile
         lock.release()
 
 
-def cancel_job(job_id, user_key=None, connection=None):
+def cancel_job(job_id, user_key=None, connection=None, expected_type=None):
     connection = connection or redis_connection()
     lock = acquire_job_lock(job_id, connection)
     try:
@@ -532,6 +571,8 @@ def cancel_job(job_id, user_key=None, connection=None):
             return None
         if user_key and record.get('user_key') != user_key:
             raise PermissionError('无权取消该任务')
+        if expected_type and record.get('job_type') != expected_type:
+            return None
         if record.get('status') in TERMINAL_STATUSES:
             return record
         if record.get('status') == 'finalizing':
@@ -654,6 +695,10 @@ def cleanup_expired_job_files(connection=None):
                 shutil.rmtree(job_folder, ignore_errors=True)
         except OSError:
             continue
+
+
+class SubmissionConflict(ValueError):
+    """A repeated billing request identifies different input; preserve the old job."""
 
 
 class QueueRejected(Exception):

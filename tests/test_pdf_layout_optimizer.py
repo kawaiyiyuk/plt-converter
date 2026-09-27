@@ -278,12 +278,13 @@ class PdfLayoutOptimizerTest(unittest.TestCase):
             'app.services.pdf_layout_optimizer.choose_best_layout',
             side_effect=lambda *args, **kwargs: dict(low_result),
         ):
-            optimize_pdf_layout(b'%PDF fake')
+            optimize_pdf_layout(b'%PDF fake', metadata_mode='original')
 
         extract.assert_called_once_with(
             unittest.mock.ANY,
             fitz.return_value,
             ignore_internal_guides=True,
+            ignore_crop_guides=True,
         )
 
 
