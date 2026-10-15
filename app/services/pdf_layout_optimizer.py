@@ -7,8 +7,11 @@ from functools import lru_cache
 
 from .pdf_to_plt import (
     MM_TO_PT,
+    clip_page_polyline,
     drawing_item_points,
     is_internal_guide_drawing,
+    iter_native_clipped_drawings,
+    native_clip_drawings,
     load_fitz,
     open_pdf_document,
     read_pdf_layout_metadata_from_document,
@@ -23,7 +26,7 @@ DEDUP_TOLERANCE_PT = 0.8
 MATCH_TOLERANCE_PT = 2.0
 MAX_GRID_SIZE = 24
 DEFAULT_MAX_BLANK_CELLS = 8
-PDF_LAYOUT_ALGORITHM_VERSION = '3-asymmetric-selection-blank8-outer-edges'
+PDF_LAYOUT_ALGORITHM_VERSION = '4-asymmetric-selection-blank8-visible-clips'
 DEFAULT_MAX_CROP_MM = 15.0
 DEFAULT_CROP_STEP_MM = 0.1
 
@@ -536,7 +539,8 @@ def _extract_vector_segments(document, fitz, ignore_internal_guides=False, ignor
         sizes.append((float(page.rect.width), float(page.rect.height)))
         rotation_matrix = getattr(page, 'rotation_matrix', None)
         segments = []
-        for drawing in page.get_drawings():
+        drawings = native_clip_drawings(page)
+        for drawing, visible_crop in iter_native_clipped_drawings(page, drawings, fitz, page.rect):
             if ignore_internal_guides and is_internal_guide_drawing(drawing):
                 continue
             color = drawing.get('color')
@@ -547,19 +551,20 @@ def _extract_vector_segments(document, fitz, ignore_internal_guides=False, ignor
                 if rotation_matrix is not None:
                     points = [point * rotation_matrix for point in points]
                 for start, end in itertools.pairwise(points):
-                    segment = (
-                        (float(start.x), float(start.y)),
-                        (float(end.x), float(end.y)),
-                    )
+                    # Preserve guide classification on the original segment:
+                    # clipping a diagonal to a tiny span must not turn it into a guide.
                     if ignore_crop_guides and _is_red_crop_guide_segment(
-                        segment[0],
-                        segment[1],
-                        color,
-                        float(page.rect.width),
-                        float(page.rect.height),
+                        (start.x, start.y), (end.x, end.y), color,
+                        float(page.rect.width), float(page.rect.height),
                     ):
                         continue
-                    segments.append(segment)
+                    for visible_points in clip_page_polyline(
+                        [start, end], page.rect.width, page.rect.height, fitz, visible_crop,
+                    ):
+                        segments.extend(
+                            ((float(first.x), float(first.y)), (float(second.x), float(second.y)))
+                            for first, second in itertools.pairwise(visible_points)
+                        )
         pages.append(segments)
     return sizes, pages
 

@@ -465,6 +465,39 @@ def build_crop_rect(page, crop_margins, fitz, page_number=None):
     return fitz.Rect(left, top, page.rect.width - right, page.rect.height - bottom)
 
 
+def native_clip_drawings(page):
+    """Read clip hierarchy when supported, retaining older Page compatibility."""
+    try:
+        return page.get_drawings(extended=True)
+    except TypeError:
+        return page.get_drawings()
+
+
+def iter_native_clipped_drawings(page, drawings, fitz, crop_rect):
+    """Yield drawings with their visible rectangular bounds in display coordinates.
+
+    Keep the raw drawings separate so filtered geometry cannot change the
+    vector/raster fallback decision. Scissors are exact for rectangular clips;
+    nonrectangular clip contours retain the existing bounding-box limitation.
+    """
+    native_clips = []
+    rotation_matrix = getattr(page, 'rotation_matrix', None)
+    for drawing in drawings:
+        level = drawing.get('level', 0)
+        native_clips = [(depth, rect) for depth, rect in native_clips if depth < level]
+        if drawing.get('type') == 'clip':
+            native_clips.append((level, fitz.Rect(drawing['scissor'])))
+            continue
+        if drawing.get('type') == 'group':
+            continue
+        visible_crop = crop_rect
+        for _depth, native_rect in native_clips:
+            displayed_rect = native_rect * rotation_matrix if rotation_matrix is not None else native_rect
+            visible_crop = visible_crop & displayed_rect
+        if not visible_crop.is_empty:
+            yield drawing, visible_crop
+
+
 def _extract_page(
     page,
     units_per_inch,
@@ -480,32 +513,12 @@ def _extract_page(
     page_width = crop_rect.width * units_per_inch / 72
     page_height = crop_rect.height * units_per_inch / 72
     shapes = []
-    if respect_native_clips:
-        try:
-            drawings = page.get_drawings(extended=True)
-        except TypeError:
-            drawings = page.get_drawings()
-    else:
-        drawings = page.get_drawings()
-    native_clips = []
+    drawings = native_clip_drawings(page) if respect_native_clips else page.get_drawings()
     rotation_matrix = getattr(page, 'rotation_matrix', None)
-    for drawing in drawings:
-        visible_crop = crop_rect
+    visible_drawings = (iter_native_clipped_drawings(page, drawings, fitz, crop_rect)
+                        if respect_native_clips else ((drawing, crop_rect) for drawing in drawings))
+    for drawing, visible_crop in visible_drawings:
         if respect_native_clips:
-            level = drawing.get('level', 0)
-            native_clips = [(depth, rect) for depth, rect in native_clips if depth < level]
-            if drawing.get('type') == 'clip':
-                # Scissor intersections are exact for rectangular native clips.
-                # Complex nonrectangular clip contours remain outside this path's fidelity coverage.
-                native_clips.append((level, fitz.Rect(drawing['scissor'])))
-                continue
-            if drawing.get('type') == 'group':
-                continue
-            for _depth, native_rect in native_clips:
-                displayed_rect = native_rect * rotation_matrix if rotation_matrix is not None else native_rect
-                visible_crop = visible_crop & displayed_rect
-            if visible_crop.is_empty:
-                continue
             # White fill without a stroke is a background, not a visible
             # black outline. Preserve the legacy extraction path unchanged.
             if (drawing.get('type') == 'f' and drawing.get('color') is None

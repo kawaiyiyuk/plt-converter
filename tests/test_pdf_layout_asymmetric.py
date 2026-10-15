@@ -142,7 +142,7 @@ class AsymmetricOptimizerTest(unittest.TestCase):
         result = opt.optimize_pdf_layout(tiled_pdf())
         self.assertEqual(result['confidence'], 'high')
         self.assertIs(result['preserve_outer_edges'], True)
-        self.assertEqual(opt.PDF_LAYOUT_ALGORITHM_VERSION, '3-asymmetric-selection-blank8-outer-edges')
+        self.assertEqual(opt.PDF_LAYOUT_ALGORITHM_VERSION, '4-asymmetric-selection-blank8-visible-clips')
 
     def test_original_metadata_suggestion_keeps_original_crop_semantics(self):
         metadata = {'rows': 2, 'columns': 2, 'order': 'row',

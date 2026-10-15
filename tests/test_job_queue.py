@@ -708,7 +708,7 @@ class JobQueueTest(unittest.TestCase):
                     'PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS': '8',
                 }):
             client = create_app().test_client()
-            for version in (None, 'old-layout-version'):
+            for version in (None, 'old-layout-version', '3-asymmetric-selection-blank8-outer-edges'):
                 for confidence in ('high', 'low'):
                     with self.subTest(version=version, confidence=confidence):
                         record['result'].update({
