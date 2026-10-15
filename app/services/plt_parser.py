@@ -1,5 +1,6 @@
 import math
 import os
+import re
 
 from .number_tokens import iter_number_tokens
 
@@ -19,8 +20,16 @@ def decode_plt(source):
     return raw.decode('latin1', errors='replace')
 
 
-def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
+def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
+              max_chord_error_mm=None):
+    # Opt-in projection rules must not change the formal converter's parser.
+    if not math.isfinite(float(units_per_inch)) or float(units_per_inch) <= 0:
+        raise ValueError('PLT 单位必须为正有限数值')
+    if max_chord_error_mm is not None and (not math.isfinite(max_chord_error_mm) or max_chord_error_mm <= 0):
+        raise ValueError('PLT 圆弧精度必须为正有限数值')
     text = decode_plt(source) if isinstance(source, (bytes, bytearray)) else str(source or '')
+    if strict and '\x00' in text:
+        raise ValueError('PLT 含无效空字符，无法保证投影图形完整')
     text = text.replace('\x00', '')
     index = 0
     mode = 'absolute'
@@ -38,7 +47,13 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
     maximum_points = max(1000, int(os.getenv('PLT_MAX_POINTS', '500000')))
     maximum_shapes = max(100, int(os.getenv('PLT_MAX_PATHS', '100000')))
     maximum_text_chars = max(1000, int(os.getenv('PLT_MAX_TEXT_CHARS', '100000')))
+    if strict:
+        maximum_commands = min(maximum_commands, 250000)
+        maximum_points = min(maximum_points, 500000)
+        maximum_shapes = min(maximum_shapes, 100000)
+        maximum_text_chars = min(maximum_text_chars, 100000)
     text_char_count = 0
+    warnings = []
 
     def create_shape(shape):
         nonlocal next_shape_id
@@ -73,8 +88,10 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
             }
         else:
             point = {'x': x, 'y': y}
+        if strict and not all(math.isfinite(value) for value in point.values()):
+            raise ValueError('PLT 累计坐标超出有限数值范围')
         current_position = point
-        if pen_down:
+        if pen_down and (not strict or current_pen != 0):
             if not stroke:
                 stroke.append(start)
             stroke.append(point)
@@ -86,8 +103,10 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
         if point_count > maximum_points:
             raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
         start = dict(current_position)
+        if strict and not all(math.isfinite(value) for value in point.values()):
+            raise ValueError('PLT 累计坐标超出有限数值范围')
         current_position = point
-        if pen_down:
+        if pen_down and (not strict or current_pen != 0):
             if not stroke:
                 stroke.append(start)
             stroke.append(point)
@@ -99,12 +118,19 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
             current_position['y'] - center['y'],
         )
         if radius <= 0 or not math.isfinite(radius) or not math.isfinite(angle_degrees):
+            if strict:
+                raise ValueError('HPGL 圆弧半径或角度无效')
             return
         start_angle = math.atan2(
             current_position['y'] - center['y'],
             current_position['x'] - center['x'],
         )
         chord_angle = max(abs(float(chord_angle_degrees or 5)), 0.1)
+        if max_chord_error_mm is not None:
+            chord_angle = min(chord_angle, math.degrees(chord_step_angle(radius, units_per_inch, max_chord_error_mm)))
+        if strict and (abs(angle_degrees) / 360 > maximum_points or
+                       chord_angle < abs(angle_degrees) / maximum_points):
+            raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
         steps = max(1, math.ceil(abs(angle_degrees) / chord_angle))
         if point_count + steps > maximum_points:
             raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
@@ -117,13 +143,15 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
             })
 
     while index < len(text):
-        if text[index] in '\n\r\t ,':
+        if text[index] in '\n\r\t ,' or (strict and text[index] == ';'):
             index += 1
             continue
 
         command = text[index:index + 2].upper()
         index += 2
         if len(command) != 2 or not command.isalpha():
+            if strict:
+                raise ValueError('PLT 命令格式无效，无法保证投影图形完整')
             index += 1
             continue
         command_count += 1
@@ -139,15 +167,21 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
                 text_char_count += len(label)
                 if text_char_count > maximum_text_chars:
                     raise ValueError(f'PLT 文本内容过多，最多支持 {maximum_text_chars} 个字符')
-                shapes.append(create_shape({
-                    'type': 'text',
-                    'pen': current_pen,
-                    'point': dict(current_position),
-                    'text': label,
-                }))
+                if not strict or current_pen != 0:
+                    shapes.append(create_shape({
+                        'type': 'text',
+                        'pen': current_pen,
+                        'point': dict(current_position),
+                        'text': label,
+                    }))
+                    if strict and 'LB 文字按固定 8pt 兼容显示' not in warnings:
+                        warnings.append('LB 文字按固定 8pt 兼容显示')
             if index < len(text):
                 index += 1
             continue
+
+        if strict and command not in {'IN', 'SP', 'PA', 'PR', 'PU', 'PD', 'CI', 'AA', 'AR', 'PW', 'VS'}:
+            raise ValueError(f'投影暂不支持 HPGL 命令 {command}，无法保证图形完整')
 
         argument_start = index
         while index < len(text) and text[index] != ';':
@@ -155,9 +189,26 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
         argument_text = text[argument_start:index]
         if index < len(text):
             index += 1
+        if strict:
+            # Use exactly the legacy tokenizer's comma/whitespace boundaries.
+            # Validate whole tokens before parse_numbers can skip an invalid one;
+            # e.g. 100-200 is one malformed token, never two coordinates.
+            for token in iter_number_tokens(argument_text):
+                if not re.fullmatch(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?', token):
+                    raise ValueError(f'HPGL 命令 {command} 参数格式无效')
+                if not math.isfinite(float(token)):
+                    raise ValueError(f'HPGL 命令 {command} 坐标必须有限')
         remaining_values = max((maximum_points - point_count) * 2, 0)
         value_limit = remaining_values if command in {'PA', 'PR', 'PU', 'PD'} else 10000
         numbers = parse_numbers(argument_text, maximum_values=value_limit)
+
+        if strict:
+            lengths = {'IN': {0}, 'SP': {0, 1}, 'CI': {1, 2}, 'AA': {3, 4}, 'AR': {3, 4}, 'PW': {1, 2}, 'VS': {1, 2}}
+            if ((command in lengths and len(numbers) not in lengths[command])
+                    or (command in {'PA', 'PR', 'PU', 'PD'} and len(numbers) % 2)):
+                raise ValueError(f'HPGL 命令 {command} 参数数量无效')
+            if command == 'SP' and numbers and (not numbers[0].is_integer() or numbers[0] < 0):
+                raise ValueError('HPGL 命令 SP 画笔编号必须为非负整数')
 
         if command == 'IN':
             flush_stroke()
@@ -186,8 +237,25 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
             add_coordinate_pairs(numbers, add_point)
         elif command == 'CI':
             flush_stroke()
+            if strict and current_pen == 0:
+                continue
             radius = numbers[0] if numbers else 0
-            if radius > 0:
+            if strict and radius <= 0:
+                raise ValueError('HPGL 命令 CI 半径必须大于0')
+            if radius > 0 and max_chord_error_mm is not None:
+                step_angle = chord_step_angle(radius, units_per_inch, max_chord_error_mm)
+                if step_angle < 2 * math.pi / maximum_points:
+                    raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
+                steps = max(4, 4 * math.ceil((2 * math.pi / step_angle) / 4))
+                if point_count + steps + 1 > maximum_points:
+                    raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
+                point_count += steps + 1
+                points = [{'x': current_position['x'] + radius * math.cos(2 * math.pi * i / steps),
+                           'y': current_position['y'] + radius * math.sin(2 * math.pi * i / steps)}
+                          for i in range(steps + 1)]
+                shapes.append(create_shape({'type': 'path', 'pen': current_pen, 'points': points,
+                                            'line_width_units': current_line_width}))
+            elif radius > 0:
                 shapes.append(create_shape({
                     'type': 'circle',
                     'pen': current_pen,
@@ -202,6 +270,9 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
                 'x': current_position['x'] + numbers[0],
                 'y': current_position['y'] + numbers[1],
             }, numbers[2], numbers[3] if len(numbers) > 3 else 5)
+        elif command == 'VS':
+            if strict and '已忽略绘图速度 VS，投影使用统一黑线' not in warnings:
+                warnings.append('已忽略绘图速度 VS，投影使用统一黑线')
         elif command == 'PW':
             if numbers and numbers[0] >= 0:
                 target_pen = int(numbers[1]) if len(numbers) > 1 else current_pen
@@ -212,9 +283,15 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH):
     flush_stroke()
     if not shapes:
         raise ValueError('没有解析到有效的 PLT 矢量内容')
+    metrics = measure_document(shapes, units_per_inch)
+    # A path split (SP/PU/IN) repeats its start in the rendered shape. Include
+    # those starts in the strict output cap as well as incoming coordinates.
+    if strict and metrics['point_count'] > maximum_points:
+        raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
     return {
         'shapes': shapes,
-        'metrics': measure_document(shapes, units_per_inch),
+        'metrics': metrics,
+        **({'warnings': warnings} if strict else {}),
     }
 
 
@@ -272,3 +349,10 @@ def parse_numbers(text, maximum_values=None):
 def add_coordinate_pairs(numbers, callback):
     for index in range(0, len(numbers) - 1, 2):
         callback(numbers[index], numbers[index + 1])
+
+
+def chord_step_angle(radius_units, units_per_inch, error_mm):
+    """Maximum central angle with <= error_mm physical sagitta; stable for huge r."""
+    error_units = error_mm * float(units_per_inch) / 25.4
+    ratio = min(1.0, error_units / abs(radius_units) / 2)
+    return min(math.pi, 4 * math.asin(math.sqrt(ratio)))
