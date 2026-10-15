@@ -1,0 +1,9 @@
+# Use only a clean allowlist context prepared by deploy-projector.sh.
+services:
+  projector-api:
+    build:
+      context: ${PROJECTOR_BUILD_CONTEXT:?clean projection-only context required}
+      dockerfile: Dockerfile.projection
+      pull: false
+      args:
+        PROJECTOR_BASE_IMAGE: ${PROJECTOR_BASE_IMAGE:?approved immutable base required}

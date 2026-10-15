@@ -1,0 +1,86 @@
+# Separate stack: do not merge this into legacy compose or legacy deploy script.
+name: fengrenjiyi-projector
+x-projector: &projector
+  # Private namespace shared only by these new services for SQLite lease identity.
+  pid: service:projector-redis
+  image: ${PROJECTOR_IMAGE:?explicit shared candidate image required}
+  pull_policy: never
+  init: true
+  restart: unless-stopped
+  read_only: true
+  # Non-root fixed uid:gid; the projector-data volume is seeded with this
+  # ownership by Dockerfile.projection's COPY --chown placeholder.
+  user: "10001:10001"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  env_file:
+    - ${PROJECTOR_POLICY_FILE:?explicit reviewed policy file required}
+  environment:
+    PROJECTOR_ENABLED: ${PROJECTOR_ENABLED:-0}
+    PROJECTOR_ROOT: /var/lib/projector
+    PROJECTOR_REDIS_URL: redis://projector-redis:6379/0
+    WX_BACKEND_URL: ${PROJECTOR_WX_BACKEND_URL:?explicit non-production identity backend required}
+    CONVERSION_SERVICE_TOKEN: ${PROJECTOR_SERVICE_TOKEN:?identity service token required}
+  volumes:
+    - projector-data:/var/lib/projector
+  tmpfs:
+    - /run/projector:size=8m,mode=1777,noexec,nosuid
+  depends_on:
+    projector-redis:
+      condition: service_healthy
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "2"}
+services:
+  projector-api:
+    <<: *projector
+    command: ["gunicorn", "--bind", "0.0.0.0:80", "--workers", "1", "--threads", "${PROJECTOR_HTTP_THREADS:?engineering thread budget required}", "--timeout", "${PROJECTOR_HTTP_TIMEOUT:?engineering HTTP timeout required}", "--worker-tmp-dir", "/run/projector", "--access-logfile", "-", "--error-logfile", "-", "run_projection:app"]
+    ports:
+      - "${PROJECTOR_BIND_ADDRESS:-127.0.0.1}:${PROJECTOR_BIND_PORT:-8092}:80"
+    mem_limit: ${PROJECTOR_API_MEMORY:?engineering memory budget required}
+    cpus: ${PROJECTOR_API_CPUS:?engineering CPU budget required}
+    pids_limit: ${PROJECTOR_API_PIDS:?engineering PID budget required}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/health/readiness', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+  projector-layout-worker:
+    <<: *projector
+    command: ["python", "-c", "from app.projection_layout import worker_main; worker_main()"]
+    mem_limit: ${PROJECTOR_WORKER_MEMORY:?engineering memory budget required}
+    cpus: ${PROJECTOR_WORKER_CPUS:?engineering CPU budget required}
+    pids_limit: ${PROJECTOR_WORKER_PIDS:?engineering PID budget required}
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.projection_layout import has_live_projection_worker; raise SystemExit(0 if has_live_projection_worker() else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+  projector-redis:
+    # Namespace anchor: its init/PID1 owns only this new stack.
+    init: true
+    image: ${PROJECTOR_REDIS_IMAGE:?locally available reviewed Redis image required}
+    # Non-root entrypoint skips /data chown; retain cap_drop ALL.
+    user: redis
+    pull_policy: never
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "${PROJECTOR_REDIS_MAXMEMORY:?Redis budget required}", "--maxmemory-policy", "noeviction"]
+    mem_limit: ${PROJECTOR_REDIS_MEMORY:?Redis container memory required}
+    cpus: ${PROJECTOR_REDIS_CPUS:?Redis CPU budget required}
+    pids_limit: ${PROJECTOR_REDIS_PIDS:?Redis PID budget required}
+    tmpfs:
+      - /data:size=1m,mode=1777,noexec,nosuid
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+volumes:
+  # Disk-backed Docker volume. Application accounting is not a filesystem hard quota.
+  projector-data:
