@@ -1,4 +1,5 @@
 import json
+from io import BytesIO
 import math
 import os
 import re
@@ -15,9 +16,10 @@ from .services.pdf_renderer import measure_display_bounds
 from .services.pdf_to_pdf import SINGLE_PAGE_PAPER_SIZE, SUPPORTED_PAPER_SIZES, pdf_page_count
 from .services.pdf_to_plt import (
     DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM, parse_preserve_outer_edges,
-    read_pdf_layout_metadata, validate_metadata_mode,
+    read_pdf_layout_metadata, validate_metadata_mode, load_fitz, transparent_preview,
 )
 from .job_queue import (
+    JOB_OUTPUT_VERSIONS,
     QueueRejected,
     SubmissionConflict,
     cancel_job,
@@ -227,6 +229,7 @@ def job_response(record):
                         'pdf.preview_image',
                         preview_id=preview_id,
                         page_index=page['index'],
+                        v=JOB_OUTPUT_VERSIONS['pdf_preview'],
                     ),
                     **({
                         'editor_preview_path': url_for(
@@ -410,6 +413,15 @@ def preview_image(preview_id, page_index):
     image_path = Path(record.get('input_path', '')).parent / 'previews' / f'{preview_id}-{page_index}.png'
     if not image_path.exists():
         return jsonify({'error': '预览图不存在'}), 404
+    if record.get('output_version') != JOB_OUTPUT_VERSIONS['pdf_preview']:
+        # Open clients can still poll jobs generated before transparent thumbnails.
+        # Convert only this cached thumbnail, without rewriting files or rendering
+        # the PDF again. The response URL version also bypasses opaque HTTP caches.
+        fitz = load_fitz()
+        pixmap = fitz.Pixmap(str(image_path))
+        if not pixmap.alpha:
+            image = transparent_preview(pixmap, fitz).tobytes('png')
+            return send_file(BytesIO(image), mimetype='image/png', max_age=300)
     return send_file(image_path, mimetype='image/png', max_age=300)
 
 

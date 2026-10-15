@@ -34,7 +34,7 @@ def inspect_pdf(source, preview_folder, preview_id):
             scale = min(1, PREVIEW_WIDTH_PX / max(rect.width, 1))
             pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
             preview_path = Path(preview_folder) / f'{preview_id}-{index}.png'
-            pixmap.save(str(preview_path))
+            transparent_preview(pixmap, fitz).save(str(preview_path))
             page_result = {
                 'index': index,
                 'label': f'{index + 1}',
@@ -55,6 +55,28 @@ def inspect_pdf(source, preview_folder, preview_id):
         return pages
     finally:
         document.close()
+
+
+def transparent_preview(pixmap, fitz):
+    """Remove white paper while preserving the RGB appearance on white.
+
+    Start from the flattened RGB render, so explicit PDF white fills are also
+    removed. MuPDF stores premultiplied RGBA: subtract each pixel's white
+    component directly and pass the already premultiplied samples to Pixmap.
+    Calling set_alpha() with its default would multiply the colors twice.
+    """
+    rgb = pixmap.samples
+    rgba = bytearray(pixmap.width * pixmap.height * 4)
+    target = 0
+    for red, green, blue in zip(rgb[0::3], rgb[1::3], rgb[2::3]):
+        white = min(red, green, blue)
+        if white != 255:
+            rgba[target] = red - white
+            rgba[target + 1] = green - white
+            rgba[target + 2] = blue - white
+            rgba[target + 3] = 255 - white
+        target += 4
+    return fitz.Pixmap(fitz.csRGB, pixmap.width, pixmap.height, rgba, True)
 
 
 def read_pdf_layout_metadata(source):

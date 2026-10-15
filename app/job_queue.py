@@ -20,7 +20,7 @@ JOB_OUTPUT_VERSIONS = {
     'plt_to_pdf': '4-single-page-selection',
     'pdf_to_plt': '4-metric-pen-width',
     'pdf_to_pdf': '1-auto-repage',
-    'pdf_preview': '3-metadata-choice',
+    'pdf_preview': '4-transparent-thumbnails',
 }
 
 

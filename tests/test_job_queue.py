@@ -133,6 +133,24 @@ class JobQueueTest(unittest.TestCase):
         self.assertNotEqual(replacement['job_id'], first['job_id'])
         self.assertEqual(replacement['output_version'], 'next-version')
 
+    def test_transparent_pdf_preview_does_not_reuse_opaque_completed_job(self):
+        from app.job_queue import update_job
+        with patch.dict(JOB_OUTPUT_VERSIONS, {'pdf_preview': '3-metadata-choice'}):
+            first = submit_job('pdf_preview', b'%PDF-source', 'sample.pdf', {},
+                               'user-a', connection=self.redis)
+            preview_root = Path(first['input_path']).parent / 'previews'
+            preview_root.mkdir()
+            (preview_root / f"{first['job_id']}-0.png").write_bytes(b'opaque PNG')
+            update_job(first['job_id'], self.redis, status='done', result={'pages': [{'index': 0}]})
+            same = submit_job('pdf_preview', b'%PDF-source', 'sample.pdf', {},
+                              'user-a', connection=self.redis)
+            self.assertEqual(same['job_id'], first['job_id'])
+        replacement = submit_job('pdf_preview', b'%PDF-source', 'sample.pdf', {},
+                                 'user-a', connection=self.redis)
+        self.assertNotEqual(replacement['job_id'], first['job_id'])
+        self.assertFalse(replacement['deduplicated'])
+        self.assertEqual(replacement['output_version'], '4-transparent-thumbnails')
+
     def test_pdf_to_plt_metric_pen_width_version_invalidates_old_completed_result(self):
         options = {'units_per_inch': 1016, 'line_width_mm': 1.0}
         with patch.dict(JOB_OUTPUT_VERSIONS, {'pdf_to_plt': '3-page-cropped'}):
@@ -488,7 +506,9 @@ class JobQueueTest(unittest.TestCase):
         completed['result'] = {'pages': [{'index': 0}]}
         preview = Path(completed['input_path']).parent / 'previews' / f"{record['job_id']}-0.png"
         preview.parent.mkdir(exist_ok=True)
-        preview.write_bytes(b'png')
+        from app.services.pdf_to_plt import load_fitz
+        fitz = load_fitz()
+        fitz.Pixmap(fitz.csRGB, 1, 1, bytes((255, 255, 255)), False).save(str(preview))
         from app.job_queue import save_job
         save_job(completed, self.redis)
 
