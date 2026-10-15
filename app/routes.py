@@ -14,7 +14,8 @@ from .services.plt_parser import parse_plt
 from .services.pdf_renderer import measure_display_bounds
 from .services.pdf_to_pdf import SINGLE_PAGE_PAPER_SIZE, SUPPORTED_PAPER_SIZES, pdf_page_count
 from .services.pdf_to_plt import (
-    DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM, read_pdf_layout_metadata, validate_metadata_mode,
+    DEFAULT_PDF_TO_PLT_LINE_WIDTH_MM, parse_preserve_outer_edges,
+    read_pdf_layout_metadata, validate_metadata_mode,
 )
 from .job_queue import (
     QueueRejected,
@@ -704,20 +705,24 @@ def get_pdf_layout_suggestion(job_id):
         )
     except ValueError as error:
         return jsonify({'error': str(error)}), 422
-    cached_suggestion = (
-        result.get('layout_suggestion')
-        if result.get('layout_suggestion_mode') == metadata_mode else None
-    )
     try:
-        if not cached_suggestion:
-            record = enqueue_pdf_layout_suggestion(
-                job_id,
-                request_user_key(),
-                retry_failed=request.args.get('retry') == '1',
-                metadata_mode=metadata_mode,
-            )
-            result = dict(record.get('result') or {})
-            cached_suggestion = result.get('layout_suggestion')
+        page_indexes = None
+        if 'page_indexes' in request.args:
+            try:
+                page_indexes = json.loads(request.args['page_indexes'])
+            except (TypeError, ValueError):
+                raise ValueError('page_indexes 必须是非空页码索引数组') from None
+            if not isinstance(page_indexes, list):
+                raise ValueError('page_indexes 必须是非空页码索引数组')
+        record = enqueue_pdf_layout_suggestion(
+            job_id,
+            request_user_key(),
+            retry_failed=request.args.get('retry') == '1',
+            metadata_mode=metadata_mode,
+            page_indexes=page_indexes,
+        )
+        result = dict(record.get('result') or {})
+        cached_suggestion = result.get('layout_suggestion')
     except RedisError as error:
         return redis_unavailable(error)
     except QueueRejected as error:
@@ -730,13 +735,18 @@ def get_pdf_layout_suggestion(job_id):
         if result.get('layout_suggestion_status') == 'failed':
             return jsonify({
                 'status': 'analysis_failed',
+                'page_indexes': result.get('layout_suggestion_page_indexes'),
                 'error': result.get('layout_suggestion_error') or '智能排版分析失败，请重试',
             }), 422
-        return jsonify({'status': 'analyzing'}), 202
+        return jsonify({
+            'status': 'analyzing',
+            'page_indexes': result.get('layout_suggestion_page_indexes'),
+        }), 202
     suggestion = cached_suggestion
     if suggestion.get('confidence') == 'low':
         return jsonify({
             'status': 'insufficient_evidence',
+            'page_indexes': result.get('layout_suggestion_page_indexes'),
             'reason': suggestion.get('reason') or '没有找到足够可靠的跨页接缝',
             'analysis': {
                 key: suggestion.get(key)
@@ -751,7 +761,10 @@ def get_pdf_layout_suggestion(job_id):
                 )
             },
         })
-    return jsonify({'status': 'suggestion_ready', 'suggestion': suggestion})
+    return jsonify({
+        'status': 'suggestion_ready', 'suggestion': suggestion,
+        'page_indexes': result.get('layout_suggestion_page_indexes'),
+    })
 
 
 @pdf_bp.delete('/preview/jobs/<job_id>')
@@ -1020,6 +1033,7 @@ def parse_pdf_render_options(form):
         'page_slots': page_slots,
         'output_rotation': output_rotation,
         'metadata_mode': form.get('metadata_mode'),
+        'preserve_outer_edges': parse_preserve_outer_edges(form.get('preserve_outer_edges', False)),
     }
 
 

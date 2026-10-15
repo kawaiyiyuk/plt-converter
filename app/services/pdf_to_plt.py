@@ -38,8 +38,8 @@ def inspect_pdf(source, preview_folder, preview_id):
             page_result = {
                 'index': index,
                 'label': f'{index + 1}',
-                'width_mm': round(rect.width * 25.4 / 72, 2),
-                'height_mm': round(rect.height * 25.4 / 72, 2),
+                'width_mm': rect.width * 25.4 / 72,
+                'height_mm': rect.height * 25.4 / 72,
                 'preview_name': preview_path.name,
             }
             if index == 0:
@@ -88,6 +88,15 @@ def validate_metadata_mode(mode, embedded_layout):
     return mode or None
 
 
+def parse_preserve_outer_edges(value=False):
+    """Accept only booleans or their HTTP true/false spellings."""
+    if type(value) is bool:
+        return value
+    if isinstance(value, str) and value.lower() in {'true', 'false'}:
+        return value.lower() == 'true'
+    raise ValueError('preserve_outer_edges 只支持 true 或 false')
+
+
 def convert_pdf_to_plt(source, options=None):
     """Convert vector PDF paths, or raster page lines as a best-effort fallback, to HPGL."""
     options = options or {}
@@ -99,6 +108,7 @@ def convert_pdf_to_plt(source, options=None):
     )
     margin_mm = clamp(float(options.get('margin_mm', 0)), 0, 100)
     crop_margins = parse_crop_margins(options)
+    preserve_outer_edges = parse_preserve_outer_edges(options.get('preserve_outer_edges', False))
     rows = positive_int(options.get('rows', 1), 'rows')
     columns = positive_int(options.get('columns', 1), 'columns')
     order = options.get('order', 'row') if options.get('order', 'row') in {'row', 'column'} else 'row'
@@ -122,12 +132,39 @@ def convert_pdf_to_plt(source, options=None):
             options.get('page_slots'),
             options.get('enabled_pages'),
         )
+        cells = {
+            page_index_to_cell(slot, rows, columns, order): page_index
+            for slot, page_index in placements
+        }
+        page_cells = {page_index: cell for cell, page_index in cells.items()}
         pages = {}
+        base_sizes = {}
+        extensions = {}
         total_segments = 0
         maximum_segments = max(1000, int(os.getenv('PDF_MAX_OUTPUT_SEGMENTS', '300000')))
         for index in enabled_pages:
             page = document.load_page(index)
-            crop_rect = build_crop_rect(page, crop_margins, fitz, index + 1)
+            base_crop_rect = build_crop_rect(page, crop_margins, fitz, index + 1)
+            crop_rect = base_crop_rect
+            if preserve_outer_edges:
+                row, column = page_cells[index]
+                neighbors = {
+                    'left': (row, column - 1), 'right': (row, column + 1),
+                    'top': (row - 1, column), 'bottom': (row + 1, column),
+                }
+                effective_crop = {
+                    side: crop_margins[side] if cell in cells else 0
+                    for side, cell in neighbors.items()
+                }
+                crop_rect = build_crop_rect(page, effective_crop, fitz, index + 1)
+                base_sizes[index] = (
+                    base_crop_rect.width * units_per_inch / 72,
+                    base_crop_rect.height * units_per_inch / 72,
+                )
+                extensions[index] = (
+                    (base_crop_rect.x0 - crop_rect.x0) * units_per_inch / 72,
+                    (crop_rect.y1 - base_crop_rect.y1) * units_per_inch / 72,
+                )
             extracted_page = _extract_page(
                 page,
                 units_per_inch,
@@ -136,6 +173,8 @@ def convert_pdf_to_plt(source, options=None):
                 crop_rect,
                 ignore_internal_guides=bool(embedded_layout),
                 ignore_crop_guides=metadata_mode != 'current',
+                **({'guide_crop_rect': base_crop_rect, 'respect_native_clips': True}
+                   if preserve_outer_edges else {}),
             )
             total_segments += sum(max(len(shape) - 1, 0) for shape in extracted_page['shapes'])
             if total_segments > maximum_segments:
@@ -147,12 +186,29 @@ def convert_pdf_to_plt(source, options=None):
     if not pages:
         raise ValueError('PDF 没有可转换的页面')
 
-    tile_width = max(page['width_units'] for page in pages.values())
-    tile_height = max(page['height_units'] for page in pages.values())
+    tile_width = (max(size[0] for size in base_sizes.values()) if preserve_outer_edges
+                  else max(page['width_units'] for page in pages.values()))
+    tile_height = (max(size[1] for size in base_sizes.values()) if preserve_outer_edges
+                   else max(page['height_units'] for page in pages.values()))
     gap_units = round(margin_mm * units_per_inch / 25.4)
     output_paths = []
     output_width = columns * tile_width + max(columns - 1, 0) * gap_units
     output_height = rows * tile_height + max(rows - 1, 0) * gap_units
+    window_offsets = {}
+    if preserve_outer_edges:
+        min_x, min_y, max_x, max_y = 0, 0, output_width, output_height
+        for slot_index, page_index in placements:
+            row, column = page_index_to_cell(slot_index, rows, columns, order)
+            expand_left, expand_bottom = extensions[page_index]
+            x = column * (tile_width + gap_units) - expand_left
+            y = (rows - row - 1) * (tile_height + gap_units) - expand_bottom
+            window_offsets[page_index] = (x, y)
+            min_x, min_y = min(min_x, x), min(min_y, y)
+            max_x = max(max_x, x + pages[page_index]['width_units'])
+            max_y = max(max_y, y + pages[page_index]['height_units'])
+        output_width, output_height = max_x - min_x, max_y - min_y
+        window_offsets = {index: (x - min_x, y - min_y)
+                          for index, (x, y) in window_offsets.items()}
     for slot_index, page_index in placements:
         cell = page_index_to_cell(slot_index, rows, columns, order)
         if cell is None:
@@ -160,6 +216,8 @@ def convert_pdf_to_plt(source, options=None):
         row, column = cell
         offset_x = column * (tile_width + gap_units)
         offset_y = (rows - row - 1) * (tile_height + gap_units)
+        if preserve_outer_edges:
+            offset_x, offset_y = window_offsets[page_index]
         for shape in pages[page_index]['shapes']:
             output_paths.append(offset_shape(shape, offset_x, offset_y))
 
@@ -173,6 +231,7 @@ def convert_pdf_to_plt(source, options=None):
         options.get('page_slots'),
         crop_margins,
     )
+    embedded_layout_applied = embedded_layout_applied and not preserve_outer_edges
     if embedded_layout_applied:
         output_paths, output_width, output_height = normalize_generated_pdf_paths(
             output_paths,
@@ -196,6 +255,7 @@ def convert_pdf_to_plt(source, options=None):
         'order': order,
         'output_rotation': output_rotation,
         'margin_mm': margin_mm,
+        'preserve_outer_edges': preserve_outer_edges,
         'crop_left_mm': crop_margins['left'],
         'crop_right_mm': crop_margins['right'],
         'crop_top_mm': crop_margins['top'],
@@ -371,11 +431,16 @@ def build_crop_rect(page, crop_margins, fitz, page_number=None):
     right = crop_margins['right'] * MM_TO_PT
     top = crop_margins['top'] * MM_TO_PT
     bottom = crop_margins['bottom'] * MM_TO_PT
-    rect = fitz.Rect(left, top, page.rect.width - right, page.rect.height - bottom)
-    if rect.width < MM_TO_PT or rect.height < MM_TO_PT:
+    # Validate doubles before fitz.Rect quantizes coordinates; allow only
+    # round-off at the 1mm boundary, not a smaller physical crop.
+    remaining_width = page.rect.width - left - right
+    remaining_height = page.rect.height - top - bottom
+    tolerance_pt = 1e-9
+    if (remaining_width < MM_TO_PT - tolerance_pt
+            or remaining_height < MM_TO_PT - tolerance_pt):
         prefix = f'第 {page_number} 页' if page_number else 'PDF 页面'
         raise ValueError(f'{prefix}裁边后必须至少保留 1mm × 1mm')
-    return rect
+    return fitz.Rect(left, top, page.rect.width - right, page.rect.height - bottom)
 
 
 def _extract_page(
@@ -386,17 +451,47 @@ def _extract_page(
     crop_rect=None,
     ignore_internal_guides=False,
     ignore_crop_guides=True,
+    guide_crop_rect=None,
+    respect_native_clips=False,
 ):
     crop_rect = crop_rect or fitz.Rect(0, 0, page.rect.width, page.rect.height)
     page_width = crop_rect.width * units_per_inch / 72
     page_height = crop_rect.height * units_per_inch / 72
     shapes = []
-    drawings = page.get_drawings()
+    if respect_native_clips:
+        try:
+            drawings = page.get_drawings(extended=True)
+        except TypeError:
+            drawings = page.get_drawings()
+    else:
+        drawings = page.get_drawings()
+    native_clips = []
     rotation_matrix = getattr(page, 'rotation_matrix', None)
     for drawing in drawings:
+        visible_crop = crop_rect
+        if respect_native_clips:
+            level = drawing.get('level', 0)
+            native_clips = [(depth, rect) for depth, rect in native_clips if depth < level]
+            if drawing.get('type') == 'clip':
+                # Scissor intersections are exact for rectangular native clips.
+                # Complex nonrectangular clip contours remain outside this path's fidelity coverage.
+                native_clips.append((level, fitz.Rect(drawing['scissor'])))
+                continue
+            if drawing.get('type') == 'group':
+                continue
+            for _depth, native_rect in native_clips:
+                displayed_rect = native_rect * rotation_matrix if rotation_matrix is not None else native_rect
+                visible_crop = visible_crop & displayed_rect
+            if visible_crop.is_empty:
+                continue
+            # White fill without a stroke is a background, not a visible
+            # black outline. Preserve the legacy extraction path unchanged.
+            if (drawing.get('type') == 'f' and drawing.get('color') is None
+                    and tuple(drawing.get('fill') or ()) == (1.0, 1.0, 1.0)):
+                continue
         if ignore_internal_guides and is_internal_guide_drawing(drawing):
             continue
-        if ignore_crop_guides and is_crop_guide_drawing(drawing, crop_rect, rotation_matrix, fitz):
+        if ignore_crop_guides and is_crop_guide_drawing(drawing, guide_crop_rect or crop_rect, rotation_matrix, fitz):
             continue
         drawing_shapes = []
         for item in drawing.get('items', []):
@@ -409,7 +504,7 @@ def _extract_page(
                 page.rect.width,
                 page.rect.height,
                 fitz,
-                crop_rect,
+                visible_crop,
             ):
                 if len(visible_points) - 1 > remaining_segments:
                     raise ValueError('PDF 线条数量超过服务器限制')
@@ -423,7 +518,9 @@ def _extract_page(
                 append_contiguous_shape(drawing_shapes, converted)
                 remaining_segments -= len(visible_points) - 1
         shapes.extend(drawing_shapes)
-    if drawings:
+    has_vector_drawings = (any(item.get('type') not in {'clip', 'group'} for item in drawings)
+                           if respect_native_clips else bool(drawings))
+    if has_vector_drawings:
         return {
             'width_units': page_width,
             'height_units': page_height,

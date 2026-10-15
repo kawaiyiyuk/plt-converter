@@ -464,7 +464,8 @@ def execute_pdf_layout_suggestion(job_id, attempt=None):
         if not input_path.exists():
             raise ValueError('PDF 预览已过期，请重新选择文件')
         suggestion = optimize_pdf_layout(
-            input_path.read_bytes(), metadata_mode=result.get('layout_suggestion_mode')
+            input_path.read_bytes(), metadata_mode=result.get('layout_suggestion_mode'),
+            page_indexes=result.get('layout_suggestion_page_indexes'),
         )
     except Exception as error:
         _finish_pdf_layout_suggestion(

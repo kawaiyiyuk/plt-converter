@@ -478,7 +478,10 @@ def submit_job(
         lock.release()
 
 
-def enqueue_pdf_layout_suggestion(job_id, user_key, connection=None, retry_failed=False, metadata_mode=None):
+def enqueue_pdf_layout_suggestion(
+    job_id, user_key, connection=None, retry_failed=False, metadata_mode=None,
+    page_indexes=None,
+):
     """Queue one layout analysis for an already completed, owned PDF preview."""
     connection = connection or redis_connection()
     lock = acquire_job_lock(job_id, connection)
@@ -494,11 +497,32 @@ def enqueue_pdf_layout_suggestion(job_id, user_key, connection=None, retry_faile
         result = dict(record.get('result') or {})
         from .services.pdf_to_plt import validate_metadata_mode
         validate_metadata_mode(metadata_mode, result.get('requires_metadata_choice'))
-        if result.get('layout_suggestion_mode') != metadata_mode:
+        from .services.pdf_layout_optimizer import (
+            PDF_LAYOUT_ALGORITHM_VERSION,
+            effective_pdf_layout_max_blank_cells,
+            normalize_pdf_page_indexes,
+        )
+        pages = result.get('pages')
+        page_count = result.get('page_count')
+        if type(page_count) is not int or page_count < 1:
+            page_count = len(pages) if isinstance(pages, list) else 0
+        if page_count < 1:
+            raise ValueError('PDF 没有可用页面')
+        normalized_pages = normalize_pdf_page_indexes(page_indexes, page_count)
+        max_blank_cells = effective_pdf_layout_max_blank_cells()
+        if (
+            result.get('layout_suggestion_algorithm_version') != PDF_LAYOUT_ALGORITHM_VERSION
+            or result.get('layout_suggestion_max_blank_cells') != max_blank_cells
+            or result.get('layout_suggestion_mode') != metadata_mode
+            or result.get('layout_suggestion_page_indexes') != normalized_pages
+        ):
             result.pop('layout_suggestion', None)
             result.pop('layout_suggestion_status', None)
             result.pop('layout_suggestion_error', None)
+            result['layout_suggestion_algorithm_version'] = PDF_LAYOUT_ALGORITHM_VERSION
+            result['layout_suggestion_max_blank_cells'] = max_blank_cells
             result['layout_suggestion_mode'] = metadata_mode
+            result['layout_suggestion_page_indexes'] = normalized_pages
             result['layout_suggestion_attempt'] = int(result.get('layout_suggestion_attempt', 0)) + 1
             record = update_job(job_id, connection, result=result)
         analysis_status = result.get('layout_suggestion_status')

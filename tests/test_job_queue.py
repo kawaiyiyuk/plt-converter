@@ -520,7 +520,9 @@ class JobQueueTest(unittest.TestCase):
         )
         completed = load_job(record['job_id'], self.redis)
         completed['status'] = 'done'
-        completed['result'] = {'pages': [{'index': 0, 'label': '1'}]}
+        completed['result'] = {
+            'pages': [{'index': 0, 'label': '1'}], 'requires_metadata_choice': False,
+        }
         from app.job_queue import save_job
         save_job(completed, self.redis)
 
@@ -557,6 +559,7 @@ class JobQueueTest(unittest.TestCase):
         save_job(completed, self.redis)
         expected = {
             'status': 'suggestion_ready',
+            'page_indexes': list(range(24)),
             'suggestion': {
                 'rows': 8,
                 'columns': 3,
@@ -601,7 +604,9 @@ class JobQueueTest(unittest.TestCase):
         self.assertEqual(self.redis.llen('rq:queue:pdf-layout-analysis'), 1)
         self.assertEqual(cached.get_json(), expected)
         self.assertEqual(denied.status_code, 404)
-        optimize.assert_called_once_with(b'%PDF preview source', metadata_mode=None)
+        optimize.assert_called_once_with(
+            b'%PDF preview source', metadata_mode=None, page_indexes=list(range(24)),
+        )
 
     def test_pdf_layout_suggestion_cache_is_isolated_by_metadata_mode(self):
         from app.job_queue import save_job
@@ -621,7 +626,7 @@ class JobQueueTest(unittest.TestCase):
         headers = {'X-Client-Key': 'user-a'}
         with patch('app.routes.redis_connection', return_value=self.redis), \
                 patch('app.tasks.redis_connection', return_value=self.redis), \
-                patch('app.tasks.optimize_pdf_layout', side_effect=lambda _source, metadata_mode: {
+                patch('app.tasks.optimize_pdf_layout', side_effect=lambda _source, metadata_mode, page_indexes: {
                     'confidence': 'high', 'source': metadata_mode,
                 }):
             client = app.test_client()
@@ -635,6 +640,189 @@ class JobQueueTest(unittest.TestCase):
             execute_pdf_layout_suggestion(record['job_id'])
             current = client.get(route + '?metadata_mode=current', headers=headers)
             self.assertEqual(current.get_json()['suggestion']['source'], 'current')
+
+    def test_pdf_layout_suggestion_subset_invalidates_cached_analysis(self):
+        from app.job_queue import save_job
+
+        record = submit_job('pdf_preview', b'%PDF preview', 'subset.pdf', {},
+                            'user-a', connection=self.redis)
+        record['status'] = 'done'
+        record['result'] = {
+            'pages': [{'index': i} for i in range(3)],
+            'layout_suggestion': {'confidence': 'high', 'page_slots': [0, 1, 2]},
+            'layout_suggestion_mode': None,
+            'layout_suggestion_page_indexes': [0, 1, 2],
+            'layout_suggestion_status': 'done',
+            'layout_suggestion_attempt': 1,
+        }
+        save_job(record, self.redis)
+        with patch('app.routes.redis_connection', return_value=self.redis):
+            response = create_app().test_client().get(
+                f"/api/v1/pdf/preview/jobs/{record['job_id']}/layout-suggestion",
+                query_string={'page_indexes': '[2,0]'},
+                headers={'X-Client-Key': 'user-a'},
+            )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()['page_indexes'], [0, 2])
+        result = load_job(record['job_id'], self.redis)['result']
+        self.assertNotIn('layout_suggestion', result)
+        self.assertGreater(result['layout_suggestion_attempt'], 1)
+        self.assertEqual(result['layout_suggestion_page_indexes'], [0, 2])
+
+    def _completed_layout_preview(self, page_count=3):
+        from app.job_queue import save_job
+        record = submit_job('pdf_preview', b'%PDF preview', 'subset.pdf', {},
+                            'user-a', connection=self.redis)
+        record['status'] = 'done'
+        record['result'] = {'pages': [{'index': i} for i in range(page_count)],
+                            'page_count': page_count}
+        save_job(record, self.redis)
+        return record, f"/api/v1/pdf/preview/jobs/{record['job_id']}/layout-suggestion"
+
+    def test_layout_cache_upgrade_invalidates_old_high_and_low_suggestions(self):
+        from app.job_queue import save_job
+        record, route = self._completed_layout_preview(page_count=29)
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch.dict(os.environ, {
+                    'PDF_LAYOUT_OPTIMIZE_RATE_LIMIT_PER_MINUTE': '20',
+                    'PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS': '8',
+                }):
+            client = create_app().test_client()
+            for version in (None, 'old-layout-version'):
+                for confidence in ('high', 'low'):
+                    with self.subTest(version=version, confidence=confidence):
+                        record['result'].update({
+                            'layout_suggestion': {'confidence': confidence, 'rows': 4, 'columns': 8},
+                            'layout_suggestion_mode': None,
+                            'layout_suggestion_page_indexes': list(range(29)),
+                            'layout_suggestion_status': 'done',
+                            'layout_suggestion_attempt': 1,
+                            'layout_suggestion_max_blank_cells': 8,
+                        })
+                        if version is None:
+                            record['result'].pop('layout_suggestion_algorithm_version', None)
+                        else:
+                            record['result']['layout_suggestion_algorithm_version'] = version
+                        save_job(record, self.redis)
+                        response = client.get(route, headers={'X-Client-Key': 'user-a'})
+                        self.assertEqual(response.status_code, 202)
+                        updated = load_job(record['job_id'], self.redis)['result']
+                        self.assertNotIn('layout_suggestion', updated)
+                        self.assertGreater(updated['layout_suggestion_attempt'], 1)
+
+    def test_layout_cache_reuses_same_version_and_limit_but_invalidates_limit_changes(self):
+        from app.services.pdf_layout_optimizer import PDF_LAYOUT_ALGORITHM_VERSION
+        record, route = self._completed_layout_preview(page_count=29)
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks.optimize_pdf_layout', return_value={'confidence': 'high'}) as optimize:
+            client = create_app().test_client()
+            last_attempt = 0
+            for limit in ('4', '8', '4'):
+                with patch.dict(os.environ, {'PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS': limit}):
+                    self.assertEqual(client.get(route, headers={'X-Client-Key': 'user-a'}).status_code, 202)
+                    result = load_job(record['job_id'], self.redis)['result']
+                    self.assertEqual(result['layout_suggestion_algorithm_version'], PDF_LAYOUT_ALGORITHM_VERSION)
+                    self.assertEqual(result['layout_suggestion_max_blank_cells'], int(limit))
+                    self.assertGreater(result['layout_suggestion_attempt'], last_attempt)
+                    last_attempt = result['layout_suggestion_attempt']
+                    execute_pdf_layout_suggestion(record['job_id'], last_attempt)
+                    cached = client.get(route, headers={'X-Client-Key': 'user-a'})
+                    self.assertEqual(cached.status_code, 200)
+                    self.assertEqual(cached.get_json()['status'], 'suggestion_ready')
+                    self.assertEqual(load_job(record['job_id'], self.redis)['result']['layout_suggestion_attempt'], last_attempt)
+            self.assertEqual(optimize.call_count, 3)
+
+    def test_layout_version_switch_during_worker_discards_stale_result_and_callback(self):
+        from app.job_queue import enqueue_pdf_layout_suggestion
+        from app.services.pdf_layout_optimizer import PDF_LAYOUT_ALGORITHM_VERSION
+        from app.tasks import mark_pdf_layout_suggestion_failed
+        record, _route = self._completed_layout_preview(page_count=29)
+        job_id = record['job_id']
+        with patch('app.services.pdf_layout_optimizer.PDF_LAYOUT_ALGORITHM_VERSION', 'old-version'):
+            old = enqueue_pdf_layout_suggestion(job_id, 'user-a', self.redis)
+        old_attempt = old['result']['layout_suggestion_attempt']
+        def upgrade_during_analysis(_source, metadata_mode, page_indexes):
+            enqueue_pdf_layout_suggestion(job_id, 'user-a', self.redis)
+            return {'confidence': 'high', 'rows': 4, 'columns': 8}
+        with patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks.optimize_pdf_layout', side_effect=upgrade_during_analysis):
+            execute_pdf_layout_suggestion(job_id, old_attempt)
+        stale = SimpleNamespace(args=(job_id, old_attempt), id=f'{job_id}:layout-suggestion:{old_attempt}')
+        mark_pdf_layout_suggestion_failed(stale, self.redis, RuntimeError, RuntimeError('old'), None)
+        result = load_job(job_id, self.redis)['result']
+        self.assertEqual(result['layout_suggestion_algorithm_version'], PDF_LAYOUT_ALGORITHM_VERSION)
+        self.assertEqual(result['layout_suggestion_status'], 'queued')
+        self.assertNotIn('layout_suggestion', result)
+        self.assertGreater(result['layout_suggestion_attempt'], old_attempt)
+
+    def test_layout_subset_rejects_invalid_input_without_enqueue(self):
+        record, route = self._completed_layout_preview()
+        with patch('app.routes.redis_connection', return_value=self.redis):
+            client = create_app().test_client()
+            for value in ('[]', '[0,0]', '[true]', '[1.0]', '[-1]', '[3]',
+                          'null', '{}', '"0"', '[', '[0,"1"]'):
+                with self.subTest(value=value):
+                    response = client.get(route, query_string={'page_indexes': value},
+                                          headers={'X-Client-Key': 'user-a'})
+                    self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.redis.llen('rq:queue:pdf-layout-analysis'), 0)
+        self.assertNotIn('layout_suggestion_attempt', load_job(record['job_id'], self.redis)['result'])
+
+    def test_layout_subset_is_idempotent_and_low_evidence_cache_is_isolated(self):
+        record, route = self._completed_layout_preview()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks.optimize_pdf_layout', return_value={
+                    'confidence': 'low', 'reason': 'no seam',
+                }) as optimize:
+            client = create_app().test_client()
+            def get(pages):
+                return client.get(route, query_string={'page_indexes': pages},
+                                  headers={'X-Client-Key': 'user-a'})
+            self.assertEqual(get('[2,0]').status_code, 202)
+            attempt = load_job(record['job_id'], self.redis)['result']['layout_suggestion_attempt']
+            self.assertEqual(get('[0,2]').status_code, 202)
+            self.assertEqual(load_job(record['job_id'], self.redis)['result']['layout_suggestion_attempt'], attempt)
+            self.assertEqual(self.redis.llen('rq:queue:pdf-layout-analysis'), 1)
+            execute_pdf_layout_suggestion(record['job_id'], attempt)
+            cached = get('[0,2]')
+            self.assertEqual(cached.get_json()['status'], 'insufficient_evidence')
+            self.assertEqual(cached.get_json()['page_indexes'], [0, 2])
+            self.assertEqual(get('[1,2]').status_code, 202)
+            self.assertGreater(load_job(record['job_id'], self.redis)['result']['layout_suggestion_attempt'], attempt)
+            optimize.assert_called_once_with(b'%PDF preview', metadata_mode=None, page_indexes=[0, 2])
+
+    def test_layout_subset_switch_during_worker_discards_stale_success_and_failure(self):
+        from app.job_queue import enqueue_pdf_layout_suggestion
+        from app.tasks import mark_pdf_layout_suggestion_failed
+        record, _route = self._completed_layout_preview()
+        job_id = record['job_id']
+        first = enqueue_pdf_layout_suggestion(job_id, 'user-a', self.redis, page_indexes=[0, 2])
+        old_attempt = first['result']['layout_suggestion_attempt']
+        def finish_old(_source, metadata_mode, page_indexes):
+            self.assertEqual(page_indexes, [0, 2])
+            enqueue_pdf_layout_suggestion(job_id, 'user-a', self.redis, page_indexes=[1, 2])
+            return {'confidence': 'high', 'page_slots': [0, 2]}
+        with patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks.optimize_pdf_layout', side_effect=finish_old) as optimize:
+            execute_pdf_layout_suggestion(job_id, old_attempt)
+            self.assertIsNone(execute_pdf_layout_suggestion(job_id, old_attempt))
+            self.assertEqual(optimize.call_count, 1)
+        stale = SimpleNamespace(args=(job_id, old_attempt), id=f'{job_id}:layout-suggestion:{old_attempt}')
+        mark_pdf_layout_suggestion_failed(stale, self.redis, RuntimeError, RuntimeError('old'), None)
+        result = load_job(job_id, self.redis)['result']
+        self.assertEqual(result['layout_suggestion_page_indexes'], [1, 2])
+        self.assertEqual(result['layout_suggestion_status'], 'queued')
+        self.assertNotIn('layout_suggestion', result)
+        self.assertGreater(result['layout_suggestion_attempt'], old_attempt)
+
+    def test_layout_subset_cannot_analyze_empty_preview(self):
+        _record, route = self._completed_layout_preview(page_count=0)
+        with patch('app.routes.redis_connection', return_value=self.redis):
+            response = create_app().test_client().get(route, headers={'X-Client-Key': 'user-a'})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.redis.llen('rq:queue:pdf-layout-analysis'), 0)
 
     def test_pdf_layout_suggestion_rejects_when_analysis_queue_is_full(self):
         from app.job_queue import enqueue_pdf_layout_suggestion, save_job
@@ -870,6 +1058,7 @@ class JobQueueTest(unittest.TestCase):
                 'label': '1',
                 'editor_preview_name': f"{record['job_id']}-0-editor.png",
             }],
+            'requires_metadata_choice': False,
         }
         preview_root = Path(completed['input_path']).parent / 'previews'
         preview_root.mkdir(exist_ok=True)

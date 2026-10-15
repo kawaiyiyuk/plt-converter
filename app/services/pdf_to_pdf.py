@@ -70,6 +70,7 @@ def source_conversion_options(suggestion):
         'crop_top_mm': float(crop.get('top', 0)),
         'crop_bottom_mm': float(crop.get('bottom', 0)),
         'output_rotation': int(suggestion.get('output_rotation', 0)),
+        'preserve_outer_edges': suggestion.get('preserve_outer_edges', False),
         'line_width_mm': 0.265,
     }
 
