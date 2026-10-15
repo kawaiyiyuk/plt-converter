@@ -636,13 +636,32 @@ class Store:
         return self.update(document,owner,None,generation,invalidate,
                            analysis_guard=(analysis_id,change))
 
-    def update(self, document, owner, meta, generation, invalidate=False, analysis_guard=None):
+    def replace_analysis(self,document,owner,analysis,generation,expected_analysis_id):
+        # Retiring the old child must commit with the metadata replacement. A
+        # supervisor crash after this transaction cannot leave its lease valid.
+        return self.update(document,owner,None,generation,
+                           analysis_replacement=(expected_analysis_id,analysis))
+
+    def update(self, document, owner, meta, generation, invalidate=False, analysis_guard=None,
+               analysis_replacement=None):
         new=self.metadata_path(document,secrets.token_hex(8));old=None
         try:
             with self.transaction() as db:
                 row = self._load(db, document, owner)
                 if row is None or row['generation'] != generation:
                     return False
+                if analysis_replacement is not None:
+                    expected_analysis_id,analysis=analysis_replacement
+                    latest=self.read_metadata(row)
+                    current=latest.get('analysis') or {}
+                    if current.get('analysis_id')!=expected_analysis_id:
+                        return False
+                    prior_lease=current.get('lease')
+                    latest['analysis']=analysis
+                    meta=latest
+                    if prior_lease and prior_lease!=analysis.get('lease'):
+                        db.execute("UPDATE leases SET generation=-1 WHERE id=? AND owner=? AND document=? AND kind='analysis'",
+                                   (prior_lease,owner,document))
                 if analysis_guard is not None:
                     analysis_id,change=analysis_guard
                     latest=self.read_metadata(row)

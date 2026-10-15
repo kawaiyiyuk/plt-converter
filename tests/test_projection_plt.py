@@ -265,3 +265,168 @@ class ProjectionPltTests(unittest.TestCase):
             {'x': 0, 'y': 0}, {'x': 100, 'y': -200},
             {'x': 300, 'y': -400}, {'x': 0.5, 'y': 6},
         ])
+
+    def test_projection_rectangles_keep_all_edges_at_original_scale(self):
+        from app.services.plt_parser import parse_plt
+        from app.services.pdf_renderer import render_projection_pdf
+        for width, height, x, y in ((100, 100, 0, 0), (10000, 10000, 0, 0),
+                                    (10000, 10000, 1234, -5678), (4000, 2000, 0, 0),
+                                    (4001, 2001, -2500, 500)):
+            with self.subTest(width=width, height=height, origin=(x, y)):
+                source = (f'IN;SP1;PU{x},{y};PD{x+width},{y},{x+width},{y+height},'
+                          f'{x},{y+height},{x},{y};')
+                parsed = parse_plt(source, strict=True, max_chord_error_mm=0.049)
+                with fitz.open(stream=render_projection_pdf(parsed), filetype='pdf') as pdf:
+                    page = pdf[0]
+                    self.assertAlmostEqual(page.rect.width * 25.4 / 72, width * 0.025, places=3)
+                    self.assertAlmostEqual(page.rect.height * 25.4 / 72, height * 0.025, places=3)
+                    pixels = page.get_pixmap(matrix=fitz.Matrix(4, 4), colorspace=fitz.csGRAY)
+                    edge_centers = ((0, pixels.height // 2), (pixels.width - 1, pixels.height // 2),
+                                    (pixels.width // 2, 0), (pixels.width // 2, pixels.height - 1))
+                    for position in edge_centers:
+                        self.assertLess(pixels.pixel(*position)[0], 128, f'missing edge at {position}')
+
+    def test_strict_parameterless_sp_matches_sp0_for_every_shape_type(self):
+        from app.services.plt_parser import parse_plt
+        prefix = 'IN;SP1;PU0,0;PD100,0;'
+        suffix = 'PD10000,10000;CI400;LBhidden\x03;SP2;PU200,200;PD300,300;'
+        empty = parse_plt(prefix + 'SP;' + suffix, strict=True, max_chord_error_mm=0.049)
+        zero = parse_plt(prefix + 'SP0;' + suffix, strict=True, max_chord_error_mm=0.049)
+        self.assertEqual(empty, zero)
+        self.assertEqual([shape['type'] for shape in empty['shapes']], ['path', 'path'])
+        self.assertAlmostEqual(empty['metrics']['width_mm'], 7.5)
+
+    def test_legacy_parameterless_sp_keeps_existing_pen_one(self):
+        from app.services.plt_parser import parse_plt
+        parsed = parse_plt('IN;SP2;PU0,0;PD100,0;SP;PD200,200;')
+        self.assertEqual([shape['pen'] for shape in parsed['shapes']], [2, 1])
+
+    def test_strict_consecutive_labels_advance_in_rendered_pdf(self):
+        from app.services.plt_parser import parse_plt
+        from app.services.pdf_renderer import render_projection_pdf
+        parsed = parse_plt('IN;SP1;PU0,0;LBAAA\x03;LBBBB\x03;', strict=True)
+        labels = [shape for shape in parsed['shapes'] if shape['type'] == 'text']
+        self.assertAlmostEqual(labels[1]['point']['x'], 24 * 1016 / 72)
+        with fitz.open(stream=render_projection_pdf(parsed), filetype='pdf') as pdf:
+            chars = [char for block in pdf[0].get_text('rawdict')['blocks'] if block['type'] == 0
+                     for line in block['lines'] for span in line['spans'] for char in span['chars']]
+            self.assertEqual(''.join(char['c'] for char in chars), 'AAABBB')
+            self.assertAlmostEqual(chars[3]['origin'][0] - chars[0]['origin'][0], 24, places=3)
+
+    def test_strict_pd_and_pr_start_after_label(self):
+        from app.services.plt_parser import parse_plt
+        advance = 16 * 1016 / 72
+        absolute = parse_plt('IN;SP1;PU0,0;LBAB\x03;PD2000,0;', strict=True)
+        self.assertAlmostEqual(absolute['shapes'][-1]['points'][0]['x'], advance)
+        relative = parse_plt('IN;SP1;PU0,0;LBAB\x03;PR400,200;PD400,200;', strict=True)
+        points = relative['shapes'][-1]['points']
+        self.assertAlmostEqual(points[0]['x'], advance + 400)
+        self.assertAlmostEqual(points[1]['x'], advance + 800)
+        self.assertEqual([point['y'] for point in points], [200, 400])
+
+    def test_strict_label_breaks_existing_stroke_without_connector(self):
+        from app.services.plt_parser import parse_plt
+        from app.services.pdf_renderer import render_projection_pdf
+        parsed = parse_plt('IN;SP1;PU0,0;PD400,0;LBAB\x03;PD2000,0;', strict=True)
+        paths = [shape for shape in parsed['shapes'] if shape['type'] == 'path']
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(paths[0]['points'], [{'x': 0, 'y': 0}, {'x': 400, 'y': 0}])
+        self.assertAlmostEqual(paths[1]['points'][0]['x'], 400 + 16 * 1016 / 72)
+        with fitz.open(stream=render_projection_pdf(parsed), filetype='pdf') as pdf:
+            lines = [item for drawing in pdf[0].get_drawings() for item in drawing['items']]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual([item[0] for item in lines], ['l', 'l'])
+            self.assertAlmostEqual(lines[1][1].x - lines[0][2].x, 16, places=3)
+
+    def test_strict_sp0_label_moves_position_without_rendering(self):
+        from app.services.plt_parser import parse_plt
+        parsed = parse_plt('IN;SP0;PU0,0;LBAB\x03;SP1;PR400,200;PD400,200;', strict=True)
+        self.assertEqual([shape['type'] for shape in parsed['shapes']], ['path'])
+        self.assertAlmostEqual(parsed['shapes'][0]['points'][0]['x'], 16 * 1016 / 72 + 400)
+
+    def test_legacy_labels_keep_existing_position_and_stroke_behavior(self):
+        from app.services.plt_parser import parse_plt
+        parsed = parse_plt('IN;SP1;PU0,0;PD400,0;LBAB\x03LBCD\x03PD2000,0;')
+        self.assertEqual([shape['point']['x'] for shape in parsed['shapes'] if shape['type'] == 'text'], [400, 400])
+        paths = [shape for shape in parsed['shapes'] if shape['type'] == 'path']
+        self.assertEqual(len(paths), 1)
+        self.assertEqual([point['x'] for point in paths[0]['points']], [0, 400, 2000])
+
+    def test_strict_label_controls_keep_positions_and_following_pen_move(self):
+        from app.services.plt_parser import parse_plt
+        from app.services.pdf_renderer import render_projection_pdf
+        cell = 8 * 1016 / 72
+        source = 'IN;SP1;PU100,100;LBA\rB\nC\tD\bE\x03;PD2000,100;'
+        parsed = parse_plt(source, strict=True)
+        labels = [shape for shape in parsed['shapes'] if shape['type'] == 'text']
+        self.assertEqual([shape['text'] for shape in labels], list('ABCDE'))
+        expected = [(100, 100), (100, 100), (100 + cell, 100 - cell),
+                    (100 + 8 * cell, 100 - cell), (100 + 8 * cell, 100 - cell)]
+        for shape, (x, y) in zip(labels, expected):
+            self.assertAlmostEqual(shape['point']['x'], x)
+            self.assertAlmostEqual(shape['point']['y'], y)
+        self.assertAlmostEqual(parsed['shapes'][-1]['points'][0]['x'], 100 + 9 * cell)
+        self.assertAlmostEqual(parsed['shapes'][-1]['points'][0]['y'], 100 - cell)
+        with fitz.open(stream=render_projection_pdf(parsed), filetype='pdf') as pdf:
+            chars = [char for block in pdf[0].get_text('rawdict')['blocks'] if block['type'] == 0
+                     for line in block['lines'] for span in line['spans'] for char in span['chars']]
+            self.assertEqual(''.join(char['c'] for char in chars), 'ABCDE')
+            self.assertAlmostEqual(chars[2]['origin'][0] - chars[1]['origin'][0], 8, places=3)
+            self.assertAlmostEqual(chars[2]['origin'][1] - chars[1]['origin'][1], 8, places=3)
+            self.assertAlmostEqual(chars[3]['origin'][0] - chars[2]['origin'][0], 56, places=3)
+
+    def test_strict_label_carriage_origin_survives_labels_and_resets_on_moves(self):
+        from app.services.plt_parser import parse_plt
+        cell = 8 * 1016 / 72
+        parsed = parse_plt('IN;SP1;PU100,100;LBA\n\x03;LB\rB\x03;PU1000,2000;LB\rC\x03;', strict=True)
+        labels = [shape for shape in parsed['shapes'] if shape['type'] == 'text']
+        self.assertEqual([shape['text'] for shape in labels], list('ABC'))
+        self.assertAlmostEqual(labels[1]['point']['x'], 100)
+        self.assertAlmostEqual(labels[1]['point']['y'], 100 - cell)
+        self.assertEqual(labels[2]['point'], {'x': 1000, 'y': 2000})
+
+    def test_strict_label_backspace_tab_and_other_controls(self):
+        from app.services.plt_parser import parse_plt
+        cell = 8 * 1016 / 72
+        parsed = parse_plt('IN;SP1;PU0,0;LB\bA\x01\x04\tB\x03;', strict=True)
+        labels = [shape for shape in parsed['shapes'] if shape['type'] == 'text']
+        self.assertEqual([shape['text'] for shape in labels], ['A', 'B'])
+        self.assertEqual(labels[0]['point'], {'x': 0, 'y': 0})
+        self.assertAlmostEqual(labels[1]['point']['x'], 8 * cell)
+        parsed = parse_plt('IN;SP1;LB12345678\tZ\x03;', strict=True)
+        self.assertAlmostEqual(parsed['shapes'][-1]['point']['x'], 16 * cell)
+
+    def test_strict_astral_label_uses_warned_replacement_without_losing_suffix(self):
+        from app.services.plt_parser import parse_plt
+        from app.services.pdf_renderer import render_projection_pdf
+        parsed = parse_plt('IN;SP1;PU0,0;LBA😀B\x03;PD2000,0;', strict=True)
+        self.assertEqual(parsed['shapes'][0]['text'], 'A□B')
+        self.assertIn('不支持的增补字符以□兼容显示', parsed['warnings'])
+        self.assertAlmostEqual(parsed['shapes'][-1]['points'][0]['x'], 24 * 1016 / 72)
+        with fitz.open(stream=render_projection_pdf(parsed), filetype='pdf') as pdf:
+            page = pdf[0]
+            self.assertIn('A□B', page.get_text())
+            chars = [char for block in page.get_text('rawdict')['blocks'] if block['type'] == 0
+                     for line in block['lines'] for span in line['spans'] for char in span['chars']]
+            self.assertAlmostEqual(chars[2]['origin'][0] - chars[0]['origin'][0], 16, places=3)
+            pixels = page.get_pixmap(matrix=fitz.Matrix(8, 8), colorspace=fitz.csGRAY)
+            # The middle cell must contain real visible placeholder ink.
+            x_start = int((chars[1]['origin'][0] + 1) * 8)
+            x_end = int((chars[2]['origin'][0] - 1) * 8)
+            self.assertTrue(any(pixels.pixel(x, y)[0] < 128
+                                for y in range(pixels.height) for x in range(x_start, x_end)))
+
+    def test_strict_pa_pr_without_coordinates_reset_label_carriage_origin(self):
+        from app.services.plt_parser import parse_plt
+        for command in ('PA', 'PR'):
+            with self.subTest(command=command):
+                parsed = parse_plt('IN;SP1;PU100,100;LBA\x03;' + command + ';LB\rB\x03;', strict=True)
+                labels = [shape for shape in parsed['shapes'] if shape['type'] == 'text']
+                self.assertAlmostEqual(labels[1]['point']['x'], 100 + 8 * 1016 / 72)
+                self.assertEqual(labels[1]['point']['y'], 100)
+
+    def test_strict_ci_preserves_label_carriage_origin(self):
+        from app.services.plt_parser import parse_plt
+        parsed = parse_plt('IN;SP1;PU100,100;LBA\x03;CI10;LB\rB\x03;', strict=True)
+        labels = [shape for shape in parsed['shapes'] if shape['type'] == 'text']
+        self.assertEqual(labels[1]['point'], {'x': 100, 'y': 100})

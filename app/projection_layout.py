@@ -246,38 +246,10 @@ def submit_analysis(ledger, document_id, owner, meta, mode):
         if meta is None:
             # A concurrent DELETE removed the session between the two reads.
             raise ProjectionRejected('projection_not_found','投影文件不存在或已过期',404,0)
-        previous = meta.get('analysis') or {}
-    if previous.get('mode') == mode and previous.get('status') in ('analyzing','ready'):
-        return analysis_response(previous)
-    if previous.get('status') == 'analyzing' and previous.get('mode') != mode:
-        prior_lease = previous.get('lease')
-        prior_job = previous.get('analysis_id')
-        meta.pop('analysis',None)
-        # Analysis state is independent of tile rendering: dropping the prior
-        # analysis must not bump the generation and abort an in-flight tile.
-        if not ledger.update(document_id,owner,meta,meta['_generation']):
-            raise ProjectionRejected('projection_result_stale','投影会话或排版已变化',409,0)
-        # The superseded job must leave the queue; releasing only its lease
-        # would still count it against the global queue capacity.
-        discard_analysis_job(prior_job)
-        if prior_lease:
-            # A live analysis child keeps its own reservation (release is a
-            # no-op while the process is alive), so revoke first: the
-            # supervisor's next valid_lease poll then aborts it and its finally
-            # reclaims the lease and operations directory.
-            ledger.revoke(prior_lease)
-            ledger.release(prior_lease)
-        meta = ledger.load(document_id,owner)
-        if meta is None:
-            raise ProjectionRejected('projection_not_found','投影文件不存在或已过期',404,0)
     try:
         connection = projection_connection()
-        if not has_live_projection_worker(connection):
-            raise ProjectionWorkerUnavailable('投影排版Worker暂时不可用，原分页保留，请稍后重试')
         queue = projection_queue(connection)
         with connection.lock(f'{QUEUE_NAME}:submission-lock',timeout=15,blocking_timeout=2):
-            if queue.count >= QUEUE_CAPACITY:
-                raise ProjectionRejected('projection_analysis_queue_full','投影排版队列已满，请稍后重试',429,10)
             # Recheck after the bounded Redis mutex; never hold a SQLite lock
             # over network I/O. Concurrent layout/delete invalidates publication.
             current = ledger.load(document_id,owner)
@@ -286,27 +258,46 @@ def submit_analysis(ledger, document_id, owner, meta, mode):
             active = current.get('analysis') or {}
             if active.get('mode') == mode and active.get('status') in ('analyzing','ready'):
                 return analysis_response(active)
+            if not has_live_projection_worker(connection):
+                raise ProjectionWorkerUnavailable('投影排版Worker暂时不可用，原分页保留，请稍后重试')
+            prior_job = active.get('analysis_id') if active.get('status') == 'analyzing' else None
+            # A mode replacement takes the queued job's existing slot; only
+            # remove it after the SQLite identity CAS actually succeeds.
+            replacing_queued = bool(prior_job and prior_job in queue.job_ids)
+            if queue.count - int(replacing_queued) >= QUEUE_CAPACITY:
+                raise ProjectionRejected('projection_analysis_queue_full','投影排版队列已满，请稍后重试',429,10)
             # At most one in-flight analysis per owner across all documents.
             if ledger.analyzing_documents(owner,exclude=document_id):
                 raise ProjectionRejected('projection_analysis_owner_busy',
                     '该账户已有正在进行的排版分析，请稍后重试',429,5)
-            lease = ledger.reserve(owner,'analysis',document_id,meta['_generation'])
+            lease = ledger.reserve(owner,'analysis',document_id,current['_generation'])
             analysis_id = f'projection-layout-{document_id}-{secrets.token_hex(8)}'
-            meta['analysis'] = {'analysis_id':analysis_id,'status':'analyzing','mode':mode,'phase':'queued','lease':lease}
+            analysis = {'analysis_id':analysis_id,'status':'analyzing','mode':mode,'phase':'queued','lease':lease}
             configuration = {'PROJECTOR_'+field:str(getattr(ledger.policy,field.lower())) for field in FIELDS}
-            if not ledger.update(document_id,owner,meta,meta['_generation']):
+            try:
+                replaced = ledger.replace_analysis(document_id,owner,analysis,current['_generation'],active.get('analysis_id'))
+            except BaseException:
+                ledger.release(lease)
+                raise
+            if not replaced:
                 ledger.release(lease)
                 raise ProjectionRejected('projection_result_stale','投影会话或排版已变化',409,0)
             try:
+                # The old lease was already invalidated in the metadata CAS.
+                # A live child keeps its budget until its supervisor reaps it;
+                # a stale submitter cannot cancel a different winning analysis.
+                discard_analysis_job(prior_job,connection)
+                if active.get('lease'):
+                    ledger.release(active['lease'])
                 queue.enqueue_call(execute_layout_analysis,
                     args=(document_id,owner,str(ledger.root),analysis_id,mode,configuration,lease),
                     job_id=analysis_id,timeout=ANALYSIS_TIMEOUT,ttl=3600,result_ttl=3600,failure_ttl=3600)
             except Exception:
                 ledger.release(lease)
-                ledger.update_analysis(document_id,owner,analysis_id,meta['_generation'],
+                ledger.update_analysis(document_id,owner,analysis_id,current['_generation'],
                     {'status':'failed','error':'投影排版任务入队失败，请重试'})
                 raise
-        return analysis_response(meta['analysis'])
+        return analysis_response(analysis)
     except RedisError as error:
         raise ProjectionWorkerUnavailable('投影排版服务暂时不可用，原分页保留') from error
 

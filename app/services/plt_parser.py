@@ -6,6 +6,8 @@ from .number_tokens import iter_number_tokens
 
 
 DEFAULT_UNITS_PER_INCH = 1016
+# The PDF compatibility font uses a 1000-unit default width (one em).
+PLT_LABEL_FONT_SIZE_PT = 8
 
 
 def decode_plt(source):
@@ -36,6 +38,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
     pen_down = False
     current_pen = 1
     current_position = {'x': 0.0, 'y': 0.0}
+    label_carriage_return = dict(current_position)
     current_line_width = None
     stroke = []
     shapes = []
@@ -76,7 +79,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         stroke = []
 
     def add_point(x, y):
-        nonlocal current_position, point_count
+        nonlocal current_position, point_count, label_carriage_return
         point_count += 1
         if point_count > maximum_points:
             raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
@@ -91,6 +94,8 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         if strict and not all(math.isfinite(value) for value in point.values()):
             raise ValueError('PLT 累计坐标超出有限数值范围')
         current_position = point
+        if strict:
+            label_carriage_return = dict(point)
         if pen_down and (not strict or current_pen != 0):
             if not stroke:
                 stroke.append(start)
@@ -98,7 +103,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         return point
 
     def add_absolute_point(point):
-        nonlocal current_position, point_count
+        nonlocal current_position, point_count, label_carriage_return
         point_count += 1
         if point_count > maximum_points:
             raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
@@ -106,6 +111,8 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         if strict and not all(math.isfinite(value) for value in point.values()):
             raise ValueError('PLT 累计坐标超出有限数值范围')
         current_position = point
+        if strict:
+            label_carriage_return = dict(point)
         if pen_down and (not strict or current_pen != 0):
             if not stroke:
                 stroke.append(start)
@@ -142,6 +149,66 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                 'y': center['y'] + math.sin(theta) * radius,
             })
 
+    def add_projection_label(label):
+        nonlocal current_position, label_carriage_return
+        # Numeric paths retain their endpoint dictionaries after flush_stroke.
+        # The label cursor must not mutate an already rendered endpoint.
+        current_position = dict(current_position)
+        cell_units = PLT_LABEL_FONT_SIZE_PT * float(units_per_inch) / 72
+        start = dict(current_position)
+        run = []
+        run_start = dict(current_position)
+        emitted = False
+
+        def flush_run():
+            nonlocal run, emitted
+            if run and current_pen != 0:
+                shapes.append(create_shape({'type': 'text', 'pen': current_pen,
+                                            'point': dict(run_start), 'text': ''.join(run)}))
+                emitted = True
+            run = []
+
+        for offset, character in enumerate(label):
+            if ord(character) < 32:
+                if character not in '\r\n\t\b' or (character == '\b' and offset == 0):
+                    continue
+                # C0 controls move the label cursor, never appear as PDF glyphs.
+                flush_run()
+                if character == '\r':
+                    current_position = dict(label_carriage_return)
+                elif character == '\n':
+                    current_position['y'] -= cell_units
+                    label_carriage_return['y'] -= cell_units
+                elif character == '\t':
+                    column = (current_position['x'] - label_carriage_return['x']) / cell_units
+                    # Stabilize exact cell boundaries after repeated 8pt advances.
+                    if abs(column - round(column)) < 1e-9:
+                        column = round(column)
+                    current_position['x'] = label_carriage_return['x'] + (math.floor(column / 8) + 1) * 8 * cell_units
+                elif character == '\b' and offset > 0:
+                    current_position['x'] -= cell_units
+                continue
+            if ord(character) > 0xffff:
+                character = '□'
+                warning = '不支持的增补字符以□兼容显示'
+                if warning not in warnings:
+                    warnings.append(warning)
+            if not run:
+                run_start = dict(current_position)
+            run.append(character)
+            current_position['x'] += cell_units
+        flush_run()
+        if not all(math.isfinite(value) for value in current_position.values()):
+            raise ValueError('PLT 累计坐标超出有限数值范围')
+        if current_pen != 0:
+            # Preserve accepted control-only labels without inventing visible ink.
+            if not emitted:
+                shapes.append(create_shape({'type': 'text', 'pen': current_pen,
+                                            'point': start, 'text': ''}))
+            warning = 'LB 文字按固定 8pt 兼容显示'
+            if warning not in warnings:
+                warnings.append(warning)
+
     while index < len(text):
         if text[index] in '\n\r\t ,' or (strict and text[index] == ';'):
             index += 1
@@ -159,6 +226,8 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             raise ValueError(f'PLT 命令数量过多，最多支持 {maximum_commands} 条')
 
         if command == 'LB':
+            if strict:
+                flush_stroke()
             text_start = index
             while index < len(text) and text[index] not in '\x03;':
                 index += 1
@@ -167,15 +236,15 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                 text_char_count += len(label)
                 if text_char_count > maximum_text_chars:
                     raise ValueError(f'PLT 文本内容过多，最多支持 {maximum_text_chars} 个字符')
-                if not strict or current_pen != 0:
+                if strict:
+                    add_projection_label(label)
+                else:
                     shapes.append(create_shape({
                         'type': 'text',
                         'pen': current_pen,
                         'point': dict(current_position),
                         'text': label,
                     }))
-                    if strict and 'LB 文字按固定 8pt 兼容显示' not in warnings:
-                        warnings.append('LB 文字按固定 8pt 兼容显示')
             if index < len(text):
                 index += 1
             continue
@@ -216,18 +285,25 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             pen_down = False
             current_pen = 1
             current_position = {'x': 0.0, 'y': 0.0}
+            label_carriage_return = dict(current_position)
             current_line_width = None
             pen_widths = {}
         elif command == 'SP':
             flush_stroke()
-            current_pen = int(numbers[0]) if numbers else 1
+            # HPGL SP without a parameter stores the pen, just like SP0.
+            # Preserve the formal converter's historical default outside strict.
+            current_pen = int(numbers[0]) if numbers else (0 if strict else 1)
             current_line_width = pen_widths.get(current_pen)
         elif command == 'PA':
             mode = 'absolute'
             add_coordinate_pairs(numbers, add_point)
+            if strict:
+                label_carriage_return = dict(current_position)
         elif command == 'PR':
             mode = 'relative'
             add_coordinate_pairs(numbers, add_point)
+            if strict:
+                label_carriage_return = dict(current_position)
         elif command == 'PU':
             flush_stroke()
             pen_down = False
