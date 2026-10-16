@@ -158,7 +158,7 @@ if sys.argv[4] == '--apply-local' and env.get('PROJECTOR_ENABLED', '0') != '1':
     raise SystemExit(2)
 if sys.argv[4] == '--prepare-base-local' and not re.fullmatch(r'localhost:1/fengrenjiyi-projector-base:review-[a-f0-9]{12}-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', env['PROJECTOR_BASE_IMAGE']):
     raise SystemExit('Preparing base requires a fresh UUID task alias')
-files = ['Dockerfile.projection', 'app/__init__.py', 'app/projection.py', 'app/projection_layout.py', 'app/projection_app.py', 'app/projection_store.py', 'app/projection_runtime.py', 'app/projection_child.py', 'app/projection_stream.py', 'run_projection.py', 'projection_bootstrap.py', 'docker/projector-data/.keep', 'app/services/plt_parser.py', 'app/services/pdf_renderer.py', 'app/services/number_tokens.py', 'app/services/pdf_metadata.py']
+files = ['Dockerfile.projection', 'app/__init__.py', 'app/projection.py', 'app/projection_layout.py', 'app/projection_app.py', 'app/projection_store.py', 'app/projection_runtime.py', 'app/projection_child.py', 'app/projection_stream.py', 'app/projection_proxy.py', 'run_projection.py', 'projection_bootstrap.py', 'docker/projector-data/.keep', 'app/services/plt_parser.py', 'app/services/pdf_renderer.py', 'app/services/number_tokens.py', 'app/services/pdf_metadata.py']
 if context:
     raw = Path(context)
     if '..' in raw.parts:

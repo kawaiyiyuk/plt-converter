@@ -3,7 +3,7 @@
 ARG PROJECTOR_BASE_IMAGE
 FROM ${PROJECTOR_BASE_IMAGE}
 WORKDIR /app
-COPY app/__init__.py app/projection.py app/projection_layout.py app/projection_app.py app/projection_store.py app/projection_runtime.py app/projection_child.py app/projection_stream.py ./app/
+COPY app/__init__.py app/projection.py app/projection_layout.py app/projection_app.py app/projection_store.py app/projection_runtime.py app/projection_child.py app/projection_stream.py app/projection_proxy.py ./app/
 COPY app/services/plt_parser.py app/services/pdf_renderer.py app/services/number_tokens.py app/services/pdf_metadata.py ./app/services/
 COPY run_projection.py projection_bootstrap.py ./
 # Seed the named volume's initial ownership for the non-root uid:gid.
