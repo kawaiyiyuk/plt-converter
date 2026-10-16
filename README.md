@@ -267,3 +267,11 @@ API 与 Worker 容器以固定非 root uid:gid `10001:10001` 运行（`read_only
 本轮 B3／B4 部署变化：B3 子进程环境白名单与容器固定非 root uid:gid `10001:10001`（环境白名单见上一段）。B4 `scripts/deploy-projector.sh` 部署前校验：凡会被 compose 插值或 env 文件定义、且已在 shell 中导出的 `PROJECTOR_*` 变量一律拒绝（compose 插值优先于 `--env-file`，否则可绕过校验，含 env 文件省略而由 compose 取默认的项）；`PROJECTOR_WX_BACKEND_URL` 必须是纯 ASCII 且不含 `%`，host 只允许 `localhost`、`host.docker.internal`、不含点的单段主机名（compose 服务名）或回环/RFC1918 私网 IPv4，其余（含 `fengrenjiyi.com` 及其子域、公网主机与 IP、非 ASCII 或百分号别名）一律拒绝；`PROJECTOR_BIND_ADDRESS` 仅允许 `127.0.0.1` 或 RFC1918 私网 IPv4（拒绝 `0.0.0.0` 与公网地址）；`PROJECTOR_POLICY_FILE` 必须存在且用同一逐行规则解析，只允许 `PROJECTOR_` 加 `app/projection_store.py` 中 `FIELDS` 的键，`http_proxy`、`HTTPS_PROXY`、`NO_PROXY`、`WX_BACKEND_URL` 等代理或其他变量一律拒绝；`--prepare-context` 只把批准的源码名单规范化复制到全新的 `/private/tmp/projector-build.*`；除 `--apply-local` 外所有模式要求 `PROJECTOR_ENABLED=0`，`--apply-local` 要求 `PROJECTOR_ENABLED=1` 并拒绝关闭 gate 时启动。
 
 同机生产准备材料见 [投影离线准备](docs/deployment/projector-shared-host.md)：仅校验与脱敏计划，不执行部署、不开放 gate；原 local-review 部署脚本保持不变。
+
+### 投影上传限流的可信代理 IP
+
+仅上传限流使用 `PROJECTOR_TRUSTED_PROXY_CIDRS`：逗号分隔的明确 IPv4/IPv6 IP 或规范 CIDR，推荐精确 `/32`、`/128`。默认空表示完全忽略转发头，使用真实连接 IP；不自动信任私网、Docker 网关或 CDN。只有真实连接 peer 命中允许表，才接受 `X-Forwarded-For` 中单个合法 IP；未配置、不可信 peer、缺失／非法／多地址头均回退连接 IP，不因此拒绝普通请求。IPv4-mapped IPv6 与 IPv4 归一化为同一限流 IP。不读取 `Forwarded` 或 `X-Real-IP`；鉴权仍由后台 identity 确认，不使用这些 IP 识别账户，也不修改 host/proto。
+
+Nginx 模板用 `$remote_addr` 覆盖 XFF，丢弃客户端自带头。必须在未来获授权部署时核对容器实际看到的连接 peer 后显式填写配置；当前未连接生产核对。CDN／多层网关须另行核验前置 Nginx realip 的可信来源和真实客户端地址，本轮不推断可信链。部署前不要直接复制任意示例私网地址。
+
+**AI 自行添加规则（工程输入保护）**：配置中非法 IP/CIDR、空列表项、带主机位的非规范 CIDR、IPv6 scope ID、全网 `/0`（含映射的全 IPv4 范围，以及多个 CIDR 联合覆盖全网）导致启动／生产离线检查失败，错误不输出原配置值，避免误配为任意来源可伪造限流 IP。生产离线准备要求该字段显式非空；本地可留空。每账户每 UTC 分钟 5 次、每 IP 每 UTC 分钟 30 次、瓦片每秒 3 次及 burst 5 均保持；上传失败请求仍按现有规则计入限流。生产预算仍待明确填写，`PROJECTOR_ENABLED=0` 与前端发布门禁继续关闭。

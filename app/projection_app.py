@@ -4,6 +4,7 @@ from pathlib import Path
 from flask import Flask, Request, g, jsonify
 from redis.exceptions import RedisError
 from werkzeug.exceptions import RequestEntityTooLarge
+from .projection_proxy import parse_trusted_proxy_cidrs
 from .projection_store import MAX_BODY, MAX_SOURCE, Policy, ProjectionRejected, Store
 
 
@@ -50,6 +51,8 @@ def create_projection_app(configuration=None):
         raise ValueError('PROJECTOR_ENABLED must be 0 or 1')
     app.config.update(MAX_CONTENT_LENGTH=MAX_BODY, PLT_MAX_UPLOAD_BYTES=MAX_SOURCE,
                       PLT_MAX_UPLOAD_MB=20, PROJECTOR_ENABLED=(enabled == '1'))
+    app.config['PROJECTOR_TRUSTED_PROXY_CIDRS'] = parse_trusted_proxy_cidrs(
+        configuration.get('PROJECTOR_TRUSTED_PROXY_CIDRS', ''))
     if enabled == '1':
         root = configuration.get('PROJECTOR_ROOT')
         if not root or not Path(root).is_absolute():

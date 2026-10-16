@@ -25,7 +25,7 @@ class ProductionPreparationTests(unittest.TestCase):
         self.envpath = self.folder / 'production.env'
         self.values = dict(line.split('=', 1) for line in (ROOT / '.env.projector.example').read_text().splitlines() if line and not line.startswith('#'))
         self.values = {key: value for key, value in self.values.items() if key in prep.ENV_FIELDS}
-        self.values.update(PROJECTOR_IMAGE='registry.invalid/projector@sha256:' + 'a'*64,
+        self.values.update(PROJECTOR_TRUSTED_PROXY_CIDRS='10.20.0.2/32', PROJECTOR_IMAGE='registry.invalid/projector@sha256:' + 'a'*64,
                            PROJECTOR_REDIS_IMAGE='registry.invalid/redis@sha256:' + 'b'*64,
                            PROJECTOR_POLICY_FILE=str(self.policy), PROJECTOR_PUBLIC_BASE_URL='https://files.invalid',
                            PROJECTOR_WX_BACKEND_URL='https://identity.invalid', PROJECTOR_SERVICE_TOKEN='secret-fixture-NEVER-PRINT')
@@ -48,7 +48,7 @@ class ProductionPreparationTests(unittest.TestCase):
         self.assertFalse(plan['production_preflight'])
         self.assertEqual(plan['release_gate'], 'closed')
         rendered = json.dumps(plan)
-        for value in ('secret-fixture-NEVER-PRINT', 'identity.invalid', str(self.policy)):
+        for value in ('secret-fixture-NEVER-PRINT', 'identity.invalid', str(self.policy), '10.20.0.2'):
             self.assertNotIn(value, rendered)
         self.assertEqual(plan['services'], ['projector-api','projector-layout-worker','projector-redis'])
 
@@ -57,6 +57,15 @@ class ProductionPreparationTests(unittest.TestCase):
         plan = prep.prepare(self.envpath)
         self.assertEqual(set(plan), {'status', 'missing_fields'})
         self.assertIn('PROJECTOR_SERVICE_TOKEN', plan['missing_fields'])
+
+    def test_proxy_peers_are_explicit_required_and_redacted(self):
+        for value in ('', None):
+            if value is None:
+                self.values.pop('PROJECTOR_TRUSTED_PROXY_CIDRS', None)
+            else:
+                self.values['PROJECTOR_TRUSTED_PROXY_CIDRS'] = value
+            self.save()
+            self.assertIn('PROJECTOR_TRUSTED_PROXY_CIDRS', prep.prepare(self.envpath)['missing_fields'])
 
     def test_duplicate_env_and_policy(self):
         for path, line in ((self.envpath, 'PROJECTOR_ENABLED=0'), (self.policy,'PROJECTOR_TILE_RATE=3')):
@@ -79,7 +88,7 @@ class ProductionPreparationTests(unittest.TestCase):
                 prep.prepare(self.envpath)
 
     def test_invalid_values(self):
-        cases = {'PROJECTOR_ENABLED':['1'], 'PROJECTOR_BIND_ADDRESS':['0.0.0.0'],
+        cases = {'PROJECTOR_TRUSTED_PROXY_CIDRS':['bad-peer', '0.0.0.0/0', '::/0', '::ffff:0:0/96', '10.20.0.2,,10.20.0.3', '0.0.0.0/1,128.0.0.0/1', '::/1,8000::/1', '::ffff:0:0/97,::ffff:8000:0/97'], 'PROJECTOR_ENABLED':['1'], 'PROJECTOR_BIND_ADDRESS':['0.0.0.0'],
                  'PROJECTOR_BIND_PORT':['8091'], 'PROJECTOR_IMAGE':['registry.invalid/app:latest'],
                  'PROJECTOR_WX_BACKEND_URL':['http://identity.invalid','https://user:secret@identity.invalid','https://identity.invalid/a'],
                  'PROJECTOR_API_CPUS':['NaN','Infinity','-1','0'],

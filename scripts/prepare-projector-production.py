@@ -4,6 +4,7 @@ import argparse
 import ast
 from decimal import Decimal, InvalidOperation
 import json
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -19,7 +20,7 @@ FIXED_POLICY = {
 BUDGETS = ('API_MEMORY API_CPUS API_PIDS WORKER_MEMORY WORKER_CPUS WORKER_PIDS '
            'REDIS_MAXMEMORY REDIS_MEMORY REDIS_CPUS REDIS_PIDS HTTP_THREADS HTTP_TIMEOUT').split()
 ENV_FIELDS = {'PROJECTOR_' + name for name in BUDGETS} | {
-    'PROJECTOR_ENABLED', 'PROJECTOR_IMAGE', 'PROJECTOR_REDIS_IMAGE',
+    'PROJECTOR_TRUSTED_PROXY_CIDRS', 'PROJECTOR_ENABLED', 'PROJECTOR_IMAGE', 'PROJECTOR_REDIS_IMAGE',
     'PROJECTOR_POLICY_FILE', 'PROJECTOR_BIND_ADDRESS', 'PROJECTOR_BIND_PORT',
     'PROJECTOR_WX_BACKEND_URL', 'PROJECTOR_PUBLIC_BASE_URL', 'PROJECTOR_SERVICE_TOKEN',
 }
@@ -105,6 +106,14 @@ def prepare(envpath):
     missing = sorted(key for key in ENV_FIELDS if pending(env.get(key)))
     if missing:
         return {'status': 'incomplete', 'missing_fields': missing}
+    # Load only the stdlib helper, never the app package or its service setup.
+    spec = importlib.util.spec_from_file_location('projector_proxy_offline', ROOT / 'app/projection_proxy.py')
+    proxy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(proxy)
+    try:
+        proxy.parse_trusted_proxy_cidrs(env['PROJECTOR_TRUSTED_PROXY_CIDRS'])
+    except ValueError:
+        raise Invalid('Invalid or unrestricted PROJECTOR_TRUSTED_PROXY_CIDRS (values redacted)') from None
     policy_path = Path(env['PROJECTOR_POLICY_FILE'])
     if not policy_path.is_absolute() or not policy_path.is_file():
         raise Invalid('Existing absolute path required: PROJECTOR_POLICY_FILE')
@@ -163,7 +172,7 @@ def prepare(envpath):
         'future_authorized_manual_work': [
             'build/distribute verified immutable images; local approved base IDs are not production provenance',
             'approve host capacity and engineering budgets; match identity token without disclosure',
-            'review gateway/TLS and URI/Authorization forwarding',
+            'review gateway/TLS and URI/Authorization forwarding; verify exact connection peers and any CDN real-IP trust',
             'coordinate same-version three-service force-recreate, health checks and rollback',
             'analysis may be interrupted by replacement or nonpersistent Redis restart; source originals remain',
             'future authorized private-backend operation needs explicit backend enabled=1; frontend release gates stay closed until acceptance and separate approval',

@@ -19,6 +19,7 @@ x-projector: &projector
     # Projection-only search budget; do not change legacy converter image defaults.
     PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS: "8"
     PROJECTOR_ENABLED: ${PROJECTOR_ENABLED:-0}
+    PROJECTOR_TRUSTED_PROXY_CIDRS: ${PROJECTOR_TRUSTED_PROXY_CIDRS:-}
     PROJECTOR_ROOT: /var/lib/projector
     PROJECTOR_REDIS_URL: redis://projector-redis:6379/0
     WX_BACKEND_URL: ${PROJECTOR_WX_BACKEND_URL:?explicit non-production identity backend required}

@@ -8,6 +8,7 @@ import time
 from flask import Blueprint, Response, current_app, g, jsonify, request
 import unicodedata
 from .billing import BillingRejected, identify_user
+from .projection_proxy import upload_rate_limit_ip
 from .projection_store import MAX_BODY, MAX_SOURCE, ProjectionRejected
 from .services.pdf_to_plt import load_fitz
 
@@ -54,7 +55,9 @@ def upload_document():
     owner = identify_user(request.headers.get('Authorization'))
     ledger = store()
     ledger.reconcile()
-    ledger.rate(owner, request.remote_addr or '', 'upload')
+    rate_ip = upload_rate_limit_ip(request.remote_addr, request.headers.get('X-Forwarded-For'),
+                                   current_app.config.get('PROJECTOR_TRUSTED_PROXY_CIDRS', ()))
+    ledger.rate(owner, rate_ip, 'upload')
     if request.content_length is not None and request.content_length > MAX_BODY:
         raise ProjectionRejected('projection_upload_too_large','上传文件不能超过20MB',413,0)
     # One live pattern per account: a new upload retires the owner's previous
