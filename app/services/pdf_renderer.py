@@ -5,6 +5,7 @@ import zlib
 import pymupdf
 
 from .pdf_metadata import encode_pdf_layout_metadata
+from .plt_parser import PLT_LABEL_FONT_SIZE_PT
 
 
 MM_TO_PT = 72 / 25.4
@@ -35,7 +36,7 @@ def measure_display_bounds(document):
     # markers preserve the label-to-ink mapping without guessing by position.
     probe_content = '\n'.join(
         'q 1 w 10 10 m 11 10 l S Q\n'
-        f'BT /F1 8 Tf 100 100 Td <{utf16be_hex(shape["text"])}> Tj ET'
+        f'BT /F1 {PLT_LABEL_FONT_SIZE_PT:g} Tf 100 100 Td <{utf16be_hex(shape["text"])}> Tj ET'
         for shape in labels
     )
     probe = build_pdf_document([probe_content], 1000, 1000)
@@ -330,6 +331,8 @@ def build_page_content(
     page_label='1-1',
     paper_label='A4',
     excluded_clip_rects=None,
+    show_guides=True,
+    clip_geometry=True,
 ):
     content = ['q']
     if excluded_clip_rects is not None:
@@ -390,6 +393,7 @@ def build_page_content(
                 clip_min_y,
                 clip_max_x,
                 clip_max_y,
+                clip_geometry=clip_geometry,
             )
         elif shape['type'] == 'circle':
             circles.append(shape)
@@ -421,6 +425,7 @@ def build_page_content(
             clip_min_y,
             clip_max_x,
             clip_max_y,
+            clip_geometry=clip_geometry,
         )
         if circle_content:
             content.extend(circle_content)
@@ -434,14 +439,14 @@ def build_page_content(
         content.extend([
             '0 0 0 rg',
             'BT',
-            '/F1 8 Tf',
+            f'/F1 {PLT_LABEL_FONT_SIZE_PT:g} Tf',
             f'{fmt(point[0])} {fmt(point[1])} Td',
             f'<{text}> Tj',
             'ET',
         ])
 
     content.append('Q')
-    if excluded_clip_rects is not None:
+    if show_guides and excluded_clip_rects is not None:
         content.append('q')
         append_exclusion_clip(
             content,
@@ -454,7 +459,7 @@ def build_page_content(
         if page_number == 1:
             append_scale_marker(content, page_width_pt, page_height_pt, margin_pt)
         content.append('Q')
-    else:
+    elif show_guides:
         append_page_guide(content, margin_pt, tile_width_pt, tile_height_pt)
         if page_number == 1:
             append_scale_marker(content, page_width_pt, page_height_pt, margin_pt)
@@ -483,7 +488,13 @@ def append_exclusion_clip(
     content.extend(['W*', 'n'])
 
 
-def append_clipped_paths(content, points, min_x, min_y, max_x, max_y):
+def append_clipped_paths(content, points, min_x, min_y, max_x, max_y, *, clip_geometry=True):
+    if not clip_geometry:
+        if len(points) > 1:
+            content.append(f'{fmt(points[0][0])} {fmt(points[0][1])} m')
+            content.extend(f'{fmt(point[0])} {fmt(point[1])} l' for point in points[1:])
+            content.append('')
+        return
     previous_end = None
     for start, end in zip(points, points[1:]):
         clipped = clip_segment(start, end, min_x, min_y, max_x, max_y)
@@ -720,3 +731,33 @@ def escape_pdf_string(text):
 
 def fmt(value):
     return f'{float(value):.3f}'
+
+
+def render_projection_pdf(document):
+    """Projection-only 1:1 single sheet: no print guides or roundtrip metadata."""
+    metrics = document['metrics']
+    display = measure_display_bounds(document)
+    bounds = [display['min_x_pt'], display['min_y_pt'], display['max_x_pt'], display['max_y_pt']]
+    line_width_pt = 0.265 * MM_TO_PT
+    # A horizontal/vertical path or a label anchor may have a zero geometry
+    # extent. Give only that axis a visible stroke-sized canvas, never rescale.
+    for axis in (0, 1):
+        if bounds[axis + 2] - bounds[axis] < line_width_pt:
+            center = (bounds[axis + 2] + bounds[axis]) / 2
+            bounds[axis], bounds[axis + 2] = center - line_width_pt / 2, center + line_width_pt / 2
+    width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+    maximum_mm = max(100, float(os.getenv('PLT_MAX_DIMENSION_MM', '10000')))
+    if any(not math.isfinite(value) or value <= 0 for value in (width, height)):
+        raise ValueError('PLT 投影页面尺寸无效')
+    if max(width, height) / MM_TO_PT > maximum_mm:
+        raise ValueError(f'PLT 投影单边尺寸超过 {maximum_mm:g}mm 限制')
+    unit_to_pt = 72 / float(metrics['units_per_inch'])
+    display_metrics = dict(metrics, min_x=metrics['min_x'] + bounds[0] / unit_to_pt,
+                           max_y=metrics['min_y'] + bounds[3] / unit_to_pt)
+    content = build_page_content(document['shapes'], display_metrics,
+        {'row': 0, 'column': 0, 'source_index': 0}, width, height,
+        # All shapes already fit this complete sheet. A second exact-boundary
+        # geometry clip can drop whole edges due to unit-conversion roundoff.
+        width, height, width, height, line_width_pt, False, 1, 1,
+        show_guides=False, clip_geometry=False)
+    return build_pdf_document([content], width, height)

@@ -1,0 +1,14 @@
+# FROM must be the pre-verified task-only local alias, never a bare sha256 image ID.
+# Increment only: approved immutable local base, no dependency/source rebuild.
+ARG PROJECTOR_BASE_IMAGE
+FROM ${PROJECTOR_BASE_IMAGE}
+WORKDIR /app
+COPY app/__init__.py app/projection.py app/projection_layout.py app/projection_app.py app/projection_store.py app/projection_runtime.py app/projection_child.py app/projection_stream.py ./app/
+COPY app/services/plt_parser.py app/services/pdf_renderer.py app/services/number_tokens.py app/services/pdf_metadata.py ./app/services/
+COPY run_projection.py projection_bootstrap.py ./
+# Seed the named volume's initial ownership for the non-root uid:gid.
+# COPY-only: no package manager, user creation or dependency install here.
+COPY --chown=10001:10001 docker/projector-data/ /var/lib/projector/
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+EXPOSE 80
+CMD ["gunicorn", "--bind", "0.0.0.0:80", "--workers", "1", "--threads", "8", "--timeout", "120", "--worker-tmp-dir", "/run/projector", "--access-logfile", "-", "--error-logfile", "-", "run_projection:app"]
