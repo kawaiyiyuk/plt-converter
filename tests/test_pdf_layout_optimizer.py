@@ -82,6 +82,29 @@ class PdfLayoutOptimizerTest(unittest.TestCase):
 
         self.assertIn((2, 4), candidates)
 
+    def test_explicit_projection_budget_finds_synthetic_header_with_five_blanks(self):
+        # Synthetic seam IDs only: no user's PDF, geometry or expected 5x7 layout.
+        rows = columns = 6
+        slots = []
+        page_count = 0
+        for column in range(columns):
+            for row in range(rows):
+                if row == 0 and column != 3:
+                    slots.append(None)
+                else:
+                    slots.append(page_count)
+                    page_count += 1
+        signatures = connected_signatures(rows, columns, slots, 'column')
+        self.assertNotIn((rows, columns), set(_candidate_grids(page_count, 4)))
+        self.assertIn((rows, columns), set(_candidate_grids(page_count, 8)))
+        result = choose_best_layout(signatures, page_count, maximum_blank_cells=8)
+        self.assertEqual((result['rows'], result['columns']), (rows, columns))
+        self.assertEqual(result['order'], 'column')
+        self.assertEqual(result['page_slots'], slots)
+        self.assertEqual(result['confidence'], 'high')
+        self.assertEqual(result['confidence_score'], 1.0)
+        self.assertEqual(result['zero_seams'], 0)
+
     def test_finds_extra_blank_column_layout_after_optimizing_blank_positions(self):
         slots = [0, 1, 2, 3, None, 4, None, None]
         signatures = connected_signatures(2, 4, slots, 'row')

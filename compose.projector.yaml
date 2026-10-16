@@ -16,6 +16,8 @@ x-projector: &projector
   env_file:
     - ${PROJECTOR_POLICY_FILE:?explicit reviewed policy file required}
   environment:
+    # Projection-only search budget; do not change legacy converter image defaults.
+    PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS: "8"
     PROJECTOR_ENABLED: ${PROJECTOR_ENABLED:-0}
     PROJECTOR_ROOT: /var/lib/projector
     PROJECTOR_REDIS_URL: redis://projector-redis:6379/0
