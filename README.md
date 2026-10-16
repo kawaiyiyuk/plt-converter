@@ -234,6 +234,8 @@ docker compose config
 
 `compose.projector.yaml` 是独立 `fengrenjiyi-projector` project，只有 projector-api、projector-layout-worker、projector-redis。API 与 Worker 共用显式 `PROJECTOR_IMAGE`，8092 仅供独立投影；8091 旧转换不变。旧 `compose.production.yaml` 与 `scripts/deploy-production.sh` 继续只部署旧栈，**不能启动投影**；将来配套发布必须另走新投影入口、确认身份后端与网关精确 `/api/v1/pdf/projection` 路由。其他 PDF/PLT 路由保留旧栈。两栈健康分别记录，不能用新健康掩盖旧 health 503。
 
+独立投影 Compose 在 API 与专用分析 Worker 中显式设置 `PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS=8`，修正未配置时沿用旧镜像默认4的限制。需要5–8个空槽的保序网格现在可以参与自动接缝比较；仍由原接缝得分、置信阈值和搜索顺序决定结果，不强制某个行列，也不保证任意PDF都能可靠拼接。该变量沿既有白名单传入分析子进程；90秒执行预算、队列上限20、裁边和页数等其他规则不变。此覆盖只属于 `compose.projector.yaml`，不修改共享分析器源码、旧8091栈或 `compose.production.yaml` 的配置。 该配置不会重算已保存的建议：同一文档、同一mode的ready结果仍会幂等复用，“一键排版”不保证重新分析。旧ready结果需重新上传文件建立新会话后才能按新上限分析；正常换源会按既有单纸样规则释放旧文档。
+
 当前 gate `PROJECTOR_ENABLED=0`；容量、限流以及待确认工程并发/执行 deadline 全部来自显式 `PROJECTOR_POLICY_FILE`，产品示例列出用户2026-10-14批准的2会话、40MiB源文件、global2GiB、free floor2GiB、owner5/IP30固定UTC minute上传及tile3/s burst5；示例不作为应用默认。启用时后端严格校验完整 policy；disabled readiness 返回 503 属预期。不得将本次模板称已运行或已部署。
 
 `.env.projector.example` 的 CPU、内存、PID、HTTP 线程/timeout 数值全是 **AI 建议 / 待确认的非生产工程验证预算**，不是已批准线上值；需实测子进程预算和身份延迟并确保 HTTP timeout 足够容纳 parse/tile deadline + 身份超时。`GLOBAL_DISK_BYTES` 是全部落盘应用账本预算，`FREE_FLOOR_BYTES` 是宿主余量；容器 `mem_limit`/子进程内存是 RAM，两者不可互称。Docker `projector-data` 是磁盘卷，普通 volume 不提供硬 filesystem quota；生产硬盘隔离需单独授权的专用 filesystem/project quota。源、multipart、staging、jobs、SQLite state 都只能写该新根；8MiB `/run/projector` 仅 Gunicorn 控制 scratch，禁止 PDF。Redis 独立 RAM 限额/noeviction，不启 AOF/RDB、不持久化排版任务；重启后失联分析明确失败可重试，源会话仍在磁盘。日志轮转是单独宿主日志预算。

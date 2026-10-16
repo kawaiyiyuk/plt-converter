@@ -61,6 +61,9 @@ class ManifestTests(unittest.TestCase):
             images.append(api['image'])
             self.assertEqual(api['environment']['PROJECTOR_ENABLED'],'0')
             self.assertEqual(api['environment']['PROJECTOR_ROOT'],'/var/lib/projector')
+            for service in (api, worker):
+                self.assertEqual(service['environment'].get('PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS'), '8')
+            self.assertNotIn('PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS', redis.get('environment', {}))
             self.assertEqual(api['environment']['PROJECTOR_REDIS_URL'],'redis://projector-redis:6379/0')
             self.assertEqual(set(api['depends_on']),{'projector-redis'})
             self.assertEqual(api['pid'],'service:projector-redis')
