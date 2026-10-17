@@ -75,6 +75,65 @@ def _has_visible_vector_content(page, fitz):
     return False
 
 
+def _edge_cut_edges(page, fitz):
+    box=page.rect
+    rx0,ry0,rx1,ry1=box.x0-1,box.y0-1,box.x1+1,box.y1+1
+    segments=0
+    edges=set()
+    for drawing in page.get_drawings():
+        stroke=drawing.get('color')
+        if not (stroke is not None and any(c < 1 for c in stroke) and drawing.get('stroke_opacity', 1) > 0):
+            continue
+        for item in drawing['items']:
+            if item[0]!='l':
+                continue
+            a,b=(point * page.rotation_matrix for point in item[1:3])
+            dx,dy=b.x-a.x,b.y-a.y
+            t0,t1=0.0,1.0
+            visible=True
+            for slope,offset in ((-dx,a.x-rx0),(dx,rx1-a.x),(-dy,a.y-ry0),(dy,ry1-a.y)):
+                if not slope:
+                    if offset<0:
+                        visible=False
+                        break
+                    continue
+                ratio=offset/slope
+                if slope<0:
+                    if ratio>t1:
+                        visible=False
+                        break
+                    t0=max(t0,ratio)
+                else:
+                    if ratio<t0:
+                        visible=False
+                        break
+                    t1=min(t1,ratio)
+            if not visible:
+                continue
+            hit=set()
+            for point in (a,b):
+                if point.x-box.x0<=1: hit.add('left')
+                if box.x1-point.x<=1: hit.add('right')
+                if point.y-box.y0<=1: hit.add('top')
+                if box.y1-point.y<=1: hit.add('bottom')
+            if hit:
+                segments+=1
+                edges|=hit
+    return segments,edges
+
+
+def _page0_pattern_evidence(page, fitz, samples):
+    """Page 0 keeps its own paper-pattern ink: vector density or cut strokes."""
+    count=_visible_drawing_count(page, fitz)
+    if count>=3:
+        ordered=sorted(samples);n=len(ordered)
+        median=ordered[n//2] if n%2 else (ordered[n//2-1]+ordered[n//2])/2
+        if count>=.5*median:
+            return True
+    segments,edges=_edge_cut_edges(page, fitz)
+    return segments>=4 and len(edges)>=2
+
+
 def detect_page_filter(document):
     from .projection_pdf_runtime import load_fitz
     fitz = load_fitz()
@@ -102,22 +161,31 @@ def detect_page_filter(document):
         later=[i for i in group if i>0]
         # Photo cover requires several independent signals, and a body formed
         # by vector paper pages. Pure scanned documents are never auto-filtered.
-        body=sum(not document[i].get_image_info() and _visible_drawing_count(document[i],fitz)>=3 for i in later)
         p=document[0];area=p.rect.get_area()
         image_area=max(((fitz.Rect(im['bbox']) * p.rotation_matrix & p.rect).get_area() for im in p.get_image_info()),default=0)
         different_size = abs(sizes[0][0]-sizes[group[0]][0])>.5 or abs(sizes[0][1]-sizes[group[0]][1])>.5
         cover_text = any(word in p.get_text() for word in ('效果图','封面','尺码表','款式图'))
-        if body>=3 and image_area>=area*.2 and (different_size or cover_text):
-            pix=p.get_pixmap(matrix=fitz.Matrix(min(.5,2048/max(p.rect.width,p.rect.height)),min(.5,2048/max(p.rect.width,p.rect.height))),colorspace=fitz.csRGB,alpha=False,annots=True)
-            data=pix.samples
-            colored_count = 0
-            bins = set()
-            for r,g,b in zip(data[0::3],data[1::3],data[2::3]):
-                if max(r,g,b)-min(r,g,b)>=24:
-                    colored_count += 1
-                    bins.add((r//16,g//16,b//16))
-            if colored_count>=pix.width*pix.height*.1 and len(bins)>=128:
-                excluded.append({'index':0,'reason':'cover','label':'封面'})
+        if image_area>=area*.2 and (different_size or cover_text):
+            samples=[]
+            for i in later:
+                if document[i].get_image_info():
+                    continue
+                c=_visible_drawing_count(document[i],fitz)
+                if c>=3:
+                    samples.append(c)
+                    if len(samples)>=8:
+                        break
+            if len(samples)>=3 and not _page0_pattern_evidence(p,fitz,samples):
+                pix=p.get_pixmap(matrix=fitz.Matrix(min(.5,2048/max(p.rect.width,p.rect.height)),min(.5,2048/max(p.rect.width,p.rect.height))),colorspace=fitz.csRGB,alpha=False,annots=True)
+                data=pix.samples
+                colored_count = 0
+                bins = set()
+                for r,g,b in zip(data[0::3],data[1::3],data[2::3]):
+                    if max(r,g,b)-min(r,g,b)>=24:
+                        colored_count += 1
+                        bins.add((r//16,g//16,b//16))
+                if colored_count>=pix.width*pix.height*.1 and len(bins)>=128:
+                    excluded.append({'index':0,'reason':'cover','label':'封面'})
     excluded.sort(key=lambda item:item['index'])
     omitted={item['index'] for item in excluded}
     return {'version':1,'included_page_indexes':[i for i in range(count) if i not in omitted],
