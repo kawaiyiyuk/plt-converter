@@ -114,9 +114,12 @@ def numbered_suggestion(source,indexes):
         indexes=engine.normalize_pdf_page_indexes(indexes,len(document))
         if len(indexes)<4:
             return None
-        frames=[_frame(document[i],fitz) for i in indexes]
-        if any(frame is None for frame in frames):
-            return None
+        frames=[]
+        for i in indexes:
+            frame=_frame(document[i],fitz)
+            if frame is None:
+                return None
+            frames.append(frame)
         width,height=frames[0][2]-frames[0][0],frames[0][3]-frames[0][1]
         if any(abs(f[2]-f[0]-width)>.5 or abs(f[3]-f[1]-height)>.5 for f in frames):
             return None

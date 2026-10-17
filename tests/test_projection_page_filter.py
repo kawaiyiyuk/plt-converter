@@ -89,6 +89,112 @@ class PageFilterTests(unittest.TestCase):
                 result=detect_page_filter(document)
         self.assertEqual([item['index'] for item in result['excluded_pages']],[0,4])
 
+    def _gradient_pixmap(self):
+        pix=fitz.Pixmap(fitz.csRGB,fitz.IRect(0,0,160,160),False)
+        for y in range(160):
+            for x in range(160): pix.set_pixel(x,y,(x*255//159,y*255//159,(x+y)*255//318))
+        return pix
+    def _stroke_lines(self,page,count,spacing=60):
+        for i in range(count): page.draw_line((40,40+i*spacing),(555,70+i*spacing))
+    def test_photo_tile_with_cover_keyword_is_kept(self):
+        d=fitz.open()
+        for index in range(4):
+            p=d.new_page(width=595,height=842)
+            self._stroke_lines(p,12)
+            if index==0:
+                p.insert_image(fitz.Rect(40,40,550,700),pixmap=self._gradient_pixmap())
+                p.insert_text((60,760),'款式图',fontname='china-s')
+        b=d.tobytes();d.close()
+        self.assertNotIn('cover',[item['reason'] for item in self.detect(b)['excluded_pages']])
+    def test_photo_tile_one_point_larger_is_kept(self):
+        d=fitz.open()
+        for index in range(4):
+            p=d.new_page(width=596 if index==0 else 595,height=842)
+            self._stroke_lines(p,12)
+            if index==0:
+                p.insert_image(fitz.Rect(40,40,550,700),pixmap=self._gradient_pixmap())
+        b=d.tobytes();d.close()
+        self.assertNotIn('cover',[item['reason'] for item in self.detect(b)['excluded_pages']])
+    def test_sparse_tile_kept_by_page_edge_cuts(self):
+        d=fitz.open()
+        for index in range(4):
+            p=d.new_page(width=595,height=842)
+            if index==0:
+                p.draw_polyline([(0,100),(200,300),(0,500),(300,200),(400,0)])
+                p.insert_image(fitz.Rect(40,40,550,700),pixmap=self._gradient_pixmap())
+                p.insert_text((60,760),'款式图',fontname='china-s')
+            else:
+                self._stroke_lines(p,24,30)
+        b=d.tobytes();d.close()
+        self.assertNotIn('cover',[item['reason'] for item in self.detect(b)['excluded_pages']])
+        with fitz.open(stream=b,filetype='pdf') as doc:
+            doc[0].set_rotation(90)
+            self.assertNotIn('cover',[item['reason'] for item in detect_page_filter(doc)['excluded_pages']])
+    def test_sparse_tile_with_offpage_endpoints_kept(self):
+        d=fitz.open()
+        for index in range(4):
+            p=d.new_page(width=595,height=842)
+            if index==0:
+                p.draw_polyline([(-80,100),(200,300),(-60,500),(300,200),(400,-90)])
+                p.insert_image(fitz.Rect(40,40,550,700),pixmap=self._gradient_pixmap())
+                p.insert_text((60,760),'款式图',fontname='china-s')
+            else:
+                self._stroke_lines(p,24,30)
+        b=d.tobytes();d.close()
+        self.assertNotIn('cover',[item['reason'] for item in self.detect(b)['excluded_pages']])
+        with fitz.open(stream=b,filetype='pdf') as doc:
+            doc[0].set_rotation(90)
+            self.assertNotIn('cover',[item['reason'] for item in detect_page_filter(doc)['excluded_pages']])
+    def test_photo_cover_with_small_vector_table_still_excluded(self):
+        d=fitz.open()
+        for index in range(4):
+            p=d.new_page(width=560 if index==0 else 595,height=650 if index==0 else 842)
+            if index==0:
+                p.insert_image(fitz.Rect(40,40,550,600),pixmap=self._gradient_pixmap())
+                p.insert_text((60,620),'尺码表',fontname='china-s')
+                for a,b in [((60,600),(500,600)),((60,100),(500,100)),((60,100),(60,600)),((500,100),(500,600))]:
+                    p.draw_line(a,b)
+            else:
+                self._stroke_lines(p,24,30)
+        b=d.tobytes();d.close()
+        self.assertEqual(self.detect(b)['excluded_pages'],[{'index':0,'reason':'cover','label':'封面'}])
+    def test_numbered_frame_probe_stops_at_first_missing_frame(self):
+        from app.projection_numbered_layout import numbered_suggestion, _frame as real_frame
+        d=fitz.open()
+        for _ in range(4):
+            p=d.new_page(width=595,height=842)
+            p.draw_line((40,40),(555,700))
+        b=d.tobytes();d.close()
+        with patch('app.projection_numbered_layout._frame',side_effect=real_frame) as mocked:
+            self.assertIsNone(numbered_suggestion(b,None))
+        self.assertEqual(mocked.call_count,1)
+    def test_sparse_tile_edge_cuts_respect_cropbox(self):
+        d=fitz.open()
+        for index in range(4):
+            p=d.new_page(width=595,height=842)
+            if index==0:
+                p.draw_polyline([(-20,60),(200,300),(10,500),(300,200),(400,-20)])
+                p.insert_image(fitz.Rect(40,40,550,700),pixmap=self._gradient_pixmap())
+                p.insert_text((60,760),'款式图',fontname='china-s')
+                p.set_cropbox(fitz.Rect(30,40,565,802))
+            else:
+                self._stroke_lines(p,24,30)
+        b=d.tobytes();d.close()
+        self.assertNotIn('cover',[item['reason'] for item in self.detect(b)['excluded_pages']])
+    def test_fully_offpage_lines_do_not_count_as_edge_cuts(self):
+        d=fitz.open()
+        for index in range(4):
+            p=d.new_page(width=560 if index==0 else 595,height=650 if index==0 else 842)
+            if index==0:
+                p.insert_image(fitz.Rect(40,40,550,600),pixmap=self._gradient_pixmap())
+                p.insert_text((60,620),'尺码表',fontname='china-s')
+                for a,b in [((-200,-50),(-100,-50)),((-200,-80),(-100,-80)),((700,100),(800,100)),((700,200),(800,200))]:
+                    p.draw_line(a,b)
+            else:
+                self._stroke_lines(p,24,30)
+        b=d.tobytes();d.close()
+        self.assertEqual(self.detect(b)['excluded_pages'],[{'index':0,'reason':'cover','label':'封面'}])
+
 import json
 from unittest.mock import patch
 import test_projection as fixtures
