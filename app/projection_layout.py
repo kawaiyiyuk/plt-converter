@@ -21,6 +21,7 @@ from redis.exceptions import RedisError
 from .projection_store import FIELDS, Policy, Store, ProjectionRejected
 from .services.pdf_layout_optimizer import optimize_pdf_layout
 from .services.pdf_to_plt import load_fitz
+from .projection_page_filter import normalize_selection, selection_details
 
 QUEUE_NAME = 'pdf-projection-layout'
 ANALYSIS_TIMEOUT = 90
@@ -103,10 +104,12 @@ def _integer(value, name):
         raise ValueError(f'{name} 必须为整数') from error
 
 
-def build_layout(pages, rows, columns, order, crop, page_slots=None, source='manual'):
+def build_layout(pages, rows, columns, order, crop, page_slots=None, source='manual', included_page_indexes=None, source_rects_mm=None):
+    indexes = normalize_selection(included_page_indexes, len(pages))
+    selected_pages = [pages[index] for index in indexes]
     rows, columns = _integer(rows, '行数'), _integer(columns, '列数')
-    if not (1 <= rows <= 24 and 1 <= columns <= 24) or rows * columns < len(pages):
-        raise ValueError('行列必须为 1 至 24，且格数不得少于 PDF 页数')
+    if not (1 <= rows <= 24 and 1 <= columns <= 24) or rows * columns < len(indexes):
+        raise ValueError('行列必须为 1 至 24，且格数不得少于参与拼版的页数')
     if order not in ('row', 'column'):
         raise ValueError('排列顺序只支持 row 或 column')
     margins = {}
@@ -120,20 +123,44 @@ def build_layout(pages, rows, columns, order, crop, page_slots=None, source='man
         margins[side] = value
     capacity = rows * columns
     if page_slots is None:
-        slots = list(range(len(pages))) + [None] * (capacity - len(pages))
+        slots = indexes + [None] * (capacity - len(indexes))
     else:
         if not isinstance(page_slots, list) or len(page_slots) != capacity:
             raise ValueError('排版槽位数量与网格不一致')
         slots = [None if value is None else _integer(value, '页面索引') for value in page_slots]
-    if sorted(index for index in slots if index is not None) != list(range(len(pages))):
-        raise ValueError('每页必须出现且仅出现一次，不能遗漏、重复或越界')
-    visible_sizes = []
-    for page in pages:
-        width = float(page['width_mm']) - margins['left'] - margins['right']
-        height = float(page['height_mm']) - margins['top'] - margins['bottom']
+    if sorted(index for index in slots if index is not None) != indexes:
+        raise ValueError('每个参与拼版的页面必须出现且仅出现一次，不能遗漏、重复或越界')
+    visible_sizes = {}
+    rectangles = {}
+    if source_rects_mm is not None:
+        if not isinstance(source_rects_mm,list):
+            raise ValueError('逐页源框必须是列表')
+        for rectangle in source_rects_mm:
+            if not isinstance(rectangle,dict) or type(rectangle.get('page_index')) is not int:
+                raise ValueError('逐页源框页码无效')
+            index=rectangle['page_index']
+            if index not in indexes or index in rectangles:
+                raise ValueError('每个参与页面必须恰有一个源框')
+            try:
+                values={key:float(rectangle[key]) for key in ('x_mm','y_mm','width_mm','height_mm')}
+            except (KeyError,TypeError,ValueError,OverflowError) as error:
+                raise ValueError('逐页源框数值无效') from error
+            if (not all(math.isfinite(value) for value in values.values())
+                    or min(values['x_mm'],values['y_mm'])<0
+                    or min(values['width_mm'],values['height_mm'])<1
+                    or values['x_mm']+values['width_mm']>float(pages[index]['width_mm'])+1e-7
+                    or values['y_mm']+values['height_mm']>float(pages[index]['height_mm'])+1e-7):
+                raise ValueError('逐页源框必须在原页范围内，且至少保留1mm × 1mm')
+            rectangles[index]=values
+        if sorted(rectangles)!=indexes:
+            raise ValueError('每个参与页面必须恰有一个源框')
+    for page in selected_pages:
+        rectangle=rectangles.get(page['index'])
+        width = rectangle['width_mm'] if rectangle else float(page['width_mm']) - margins['left'] - margins['right']
+        height = rectangle['height_mm'] if rectangle else float(page['height_mm']) - margins['top'] - margins['bottom']
         if not math.isfinite(width) or not math.isfinite(height) or width < 1 - 1e-9 or height < 1 - 1e-9:
             raise ValueError(f"第 {page['index'] + 1} 页裁边后必须至少保留 1mm × 1mm")
-        visible_sizes.append((width, height))
+        visible_sizes[page['index']] = (width, height)
     occupied = []
     column_widths, row_heights = [0.0] * columns, [0.0] * rows
     for slot, index in enumerate(slots):
@@ -144,8 +171,8 @@ def build_layout(pages, rows, columns, order, crop, page_slots=None, source='man
             row_heights[row] = max(row_heights[row], height)
             occupied.append((index, row, column, width, height))
     # Empty rows/columns retain a real blank cell instead of silently collapsing.
-    fallback_width = max(width for width, _ in visible_sizes)
-    fallback_height = max(height for _, height in visible_sizes)
+    fallback_width = max(width for width, _ in visible_sizes.values())
+    fallback_height = max(height for _, height in visible_sizes.values())
     column_widths = [width or fallback_width for width in column_widths]
     row_heights = [height or fallback_height for height in row_heights]
     width, height = sum(column_widths), sum(row_heights)
@@ -153,10 +180,13 @@ def build_layout(pages, rows, columns, order, crop, page_slots=None, source='man
         raise ValueError('拼版尺寸超出 PDF 渲染器数值范围')
     placements = [{'page_index': index, 'x_mm': sum(column_widths[:column]),
                    'y_mm': sum(row_heights[:row]), 'width_mm': page_width,
-                   'height_mm': page_height} for index, row, column, page_width, page_height in occupied]
+                   'height_mm': page_height,
+                   **({'source_x_mm':rectangles[index]['x_mm'],'source_y_mm':rectangles[index]['y_mm']} if index in rectangles else {})}
+                  for index, row, column, page_width, page_height in occupied]
     return {'rows': rows, 'columns': columns, 'order': order, 'page_slots': slots,
             'crop_margins_mm': margins, 'width_mm': width, 'height_mm': height,
-            'source': source, 'placements': placements}
+            'source': source, 'placements': placements, 'included_page_indexes':indexes,
+            **({'source_rects_mm':source_rects_mm} if source_rects_mm is not None else {})}
 
 
 def public_layout(layout):
@@ -164,7 +194,7 @@ def public_layout(layout):
 
 
 def analysis_response(analysis):
-    response = {key: analysis[key] for key in ('analysis_id', 'status', 'suggestion', 'reason', 'error') if key in analysis}
+    response = {key: analysis[key] for key in ('analysis_id', 'status', 'suggestion', 'reason', 'error', 'included_page_indexes', 'excluded_pages') if key in analysis}
     if analysis.get('status') == 'analyzing':
         response['phase'] = analysis.get('phase', 'queued')
     return response
@@ -178,19 +208,24 @@ def resolve_metadata_mode(meta, value):
     return value or 'current'
 
 
-def analyze_source(source, mode, embedded):
+def analyze_source(source, mode, embedded, included_page_indexes=None):
     # The deployed legacy engine has no metadata_mode argument. Selecting
     # current means removing Subject only in a temporary analysis document.
     # Original PDF bytes and the tile renderer always remain unchanged.
     if mode == 'original' and embedded and embedded.get('complete_layout'):
-        return {**embedded, 'confidence': 'high', 'confidence_score': 1.0, 'source': 'embedded_metadata'}
+        return {**embedded, 'page_slots':[index if included_page_indexes is None or index in included_page_indexes else None for index in embedded['page_slots']], 'confidence': 'high', 'confidence_score': 1.0, 'source': 'embedded_metadata'}
     if mode == 'current' or embedded:
         fitz = load_fitz()
         with fitz.open(stream=source, filetype='pdf') as document:
             if document.metadata.get('subject'):
                 document.set_metadata({**document.metadata, 'subject': ''})
                 source = document.tobytes()
-    return optimize_pdf_layout(source)
+    from .projection_numbered_layout import numbered_suggestion
+    numbered = numbered_suggestion(source,included_page_indexes)
+    if numbered is not None:
+        return numbered
+    return (optimize_pdf_layout(source) if included_page_indexes is None else
+            optimize_pdf_layout(source, page_indexes=included_page_indexes))
 
 
 def publish_analysis(ledger, document_id, owner, analysis_id, result, generation):
@@ -208,6 +243,7 @@ def execute_layout_analysis(document_id, owner, root_path, analysis_id, mode, co
         ledger.release(lease)
         return {'status':'discarded'}
     generation = meta['_generation']
+    indexes = normalize_selection((meta.get('analysis') or {}).get('included_page_indexes'), meta['page_count'])
     if not ledger.update_analysis(document_id,owner,analysis_id,generation,{'phase':'analyzing'}):
         ledger.release(lease)
         return {'status':'discarded'}
@@ -219,13 +255,14 @@ def execute_layout_analysis(document_id, owner, root_path, analysis_id, mode, co
                    (os.getpid(),process_identity(os.getpid()),lease))
     try:
         suggestion = run(ledger,lease,'analysis',ledger.source_path(document_id),
-                         {'mode':mode,'embedded':meta.get('embedded_layout')},deadline=ANALYSIS_TIMEOUT)
+                         {'mode':mode,'embedded':meta.get('embedded_layout'),'included_page_indexes':indexes},deadline=ANALYSIS_TIMEOUT)
         if suggestion.get('confidence') not in ('medium','high'):
             result = {'status':'insufficient_evidence','reason':suggestion.get('reason') or '无法可靠识别页面接缝，原分页保留'}
         else:
             layout = build_layout(meta['pages'],suggestion['rows'],suggestion['columns'],suggestion['order'],
                                   suggestion.get('crop_margins_mm') or {},suggestion['page_slots'],
-                                  suggestion.get('source') or 'vector_seams')
+                                  suggestion.get('source') or 'vector_seams', indexes, suggestion.get('source_rects_mm'))
+            layout.update(selection_details(meta,indexes))
             result = {'status':'ready','suggestion':{**public_layout(layout),
                       'confidence':suggestion['confidence'],'confidence_score':suggestion.get('confidence_score')}}
     except Exception as error:
@@ -238,7 +275,8 @@ def execute_layout_analysis(document_id, owner, root_path, analysis_id, mode, co
     return result if published else {'status':'discarded'}
 
 
-def submit_analysis(ledger, document_id, owner, meta, mode):
+def submit_analysis(ledger, document_id, owner, meta, mode, included_page_indexes=None):
+    indexes = normalize_selection(included_page_indexes, meta['page_count'])
     previous = meta.get('analysis') or {}
     if previous.get('status') == 'analyzing':
         refresh_analysis_failure(ledger,document_id,owner,meta)
@@ -256,7 +294,7 @@ def submit_analysis(ledger, document_id, owner, meta, mode):
             if current is None or current['_generation'] != meta['_generation']:
                 raise ProjectionRejected('projection_result_stale','投影会话或排版已变化',409,0)
             active = current.get('analysis') or {}
-            if active.get('mode') == mode and active.get('status') in ('analyzing','ready'):
+            if (active.get('mode') == mode and normalize_selection(active.get('included_page_indexes'), meta['page_count']) == indexes) and active.get('status') in ('analyzing','ready'):
                 return analysis_response(active)
             if not has_live_projection_worker(connection):
                 raise ProjectionWorkerUnavailable('投影排版Worker暂时不可用，原分页保留，请稍后重试')
@@ -272,7 +310,7 @@ def submit_analysis(ledger, document_id, owner, meta, mode):
                     '该账户已有正在进行的排版分析，请稍后重试',429,5)
             lease = ledger.reserve(owner,'analysis',document_id,current['_generation'])
             analysis_id = f'projection-layout-{document_id}-{secrets.token_hex(8)}'
-            analysis = {'analysis_id':analysis_id,'status':'analyzing','mode':mode,'phase':'queued','lease':lease}
+            analysis = {'analysis_id':analysis_id,'status':'analyzing','mode':mode,'phase':'queued','lease':lease,**selection_details(meta,indexes)}
             configuration = {'PROJECTOR_'+field:str(getattr(ledger.policy,field.lower())) for field in FIELDS}
             try:
                 replaced = ledger.replace_analysis(document_id,owner,analysis,current['_generation'],active.get('analysis_id'))

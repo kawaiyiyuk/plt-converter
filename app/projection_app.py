@@ -4,13 +4,31 @@ from pathlib import Path
 from flask import Flask, Request, g, jsonify
 from redis.exceptions import RedisError
 from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.formparser import FormDataParser, MultiPartParser
 from .projection_proxy import parse_trusted_proxy_cidrs
 from .projection_store import MAX_BODY, MAX_SOURCE, Policy, ProjectionRejected, Store
+
+
+class ProjectionFormDataParser(FormDataParser):
+    def _parse_multipart(self, stream, mimetype, content_length, options):
+        # The decoder retains a partial boundary between reads. A 64KiB read
+        # plus that carry exceeds the unchanged 64KiB memory/field allowance.
+        # Smaller reads leave bounded carry space without raising field limits.
+        parser = MultiPartParser(stream_factory=self.stream_factory,
+                                 max_form_memory_size=self.max_form_memory_size,
+                                 max_form_parts=self.max_form_parts,
+                                 cls=self.cls, buffer_size=16 * 1024)
+        boundary = options.get('boundary', '').encode('ascii')
+        if not boundary:
+            raise ValueError('Missing boundary')
+        form, files = parser.parse(stream, boundary, content_length)
+        return stream, form, files
 
 
 class BudgetedRequest(Request):
     # Flask parses only one file and bounded fields; the stream goes directly to
     # the pre-reserved disk directory, never Werkzeug's anonymous OS tmp spool.
+    form_data_parser_class = ProjectionFormDataParser
     max_form_parts = 4
     max_form_memory_size = 65536
 
