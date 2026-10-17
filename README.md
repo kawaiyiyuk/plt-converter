@@ -98,6 +98,12 @@ POST   /api/v1/pdf/projection/documents/<document_id>/layout
 
 每个接口通过主后台 `conversion/identity` 校验 `Authorization: Bearer ...`，会话仅创建者可用；不调用额度授权、计次、广告、布豆扣除或正式转换队列，不新增 VIP 门槛。限流与账本记录都在投影自有 SQLite，不经 Redis：上传按 owner 与 IP 两档计数，瓦片走 token bucket；取值全部来自显式 `PROJECTOR_POLICY_FILE`（代码不再提供 10/30 之类的默认值）。rate 行有界，写满时新请求 429 而不是无限增长。超限返回 429 与 `Retry-After`，存储或账本暂时不可用返回 503。原页、拼版瓦片、续期、手动应用和关闭都不访问 Redis；只有自动分析使用独立的 `pdf-projection-layout` 队列（Redis 仅承载该 RQ 队列），Redis 故障不阻止 renew/delete。
 
+投影只使用用户自己的 Bearer，不配置或持有 `CONVERSION_SERVICE_TOKEN`／`PROJECTOR_SERVICE_TOKEN`。API 和专用 Worker 启动时发现 `CONVERSION_SERVICE_TOKEN` 键（即使为空）立即拒绝；独立本地准备 base 与 apply 候选镜像也只查询镜像 ENV 变量名，存在该键就拒绝，不打印值。Dockerfile 的空值覆盖无法删除继承 ENV 或镜像历史；必须使用经核验、不含旧转换服务密钥的来源镜像，不能以覆盖空串代替清理，旧转换镜像与密钥不动。
+
+用户已确认：每个投影 API 进程最多同时进行 2 个不同 Bearer 的身份校验，相同 Bearer 的并发请求按 SHA256 摘要合并，只占 1 个槽；完成立即清除，不缓存成功或失败结果，下一个请求仍实时验证。超限立即返回 `503 projection_identity_busy`、`Retry-After: 1`，提示 1 秒后重试，不排队占用身份槽。上传、取图、续期和删除等全部身份接口适用，因此 renew／delete 也可能短暂繁忙；繁忙不删除文档、不续期，现有到期时间保持。此上限按进程计算，多进程总上限相应累加；不新增 IP 桶、冷却或 TTL，也不承诺阻止所有顺序请求洪泛。
+
+身份后端明确 401／403 保留认证拒绝；其他 HTTP 错误、连接／超时、坏 JSON 或无有效身份均返回 `503 projection_identity_unavailable` 与 `Retry-After: 1`，不删除源文档、不续期也不主动使会话失效。只有投影自身返回的 `projection_not_found` 404 表示文档不存在、过期或不属于当前账户。
+
 上传文件本体沿用 `PLT_MAX_UPLOAD_BYTES`（默认 20MB），接受 `.pdf`、`.plt`、`.hpgl`，优先使用 multipart 的 `original_filename` 确定格式，`source_format` 必须与文件类型一致。PDF 路径接受 1–200 页可读、未加密的文档，不截断页面；损坏、零页、超过 200 页及任意加密（含 owner-only）明确拒绝。沿用 `PDF_MAX_TOTAL_PIXELS`（默认 200,000,000，按页面 point 尺寸面积估算，不是嵌入扫描图片的原始像素数）及 `PDF_MAX_DRAWINGS`（默认 250,000）的解析保护。上传返回 HTTP 201：
 
 ```json

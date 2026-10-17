@@ -20,6 +20,9 @@ COPY app ./app
 COPY run.py .
 COPY worker.py .
 
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+
 EXPOSE 80
 
 CMD ["gunicorn", "--bind", "0.0.0.0:80", "--workers", "1", "--threads", "2", "--timeout", "30", "--access-logfile", "-", "--error-logfile", "-", "run:app"]

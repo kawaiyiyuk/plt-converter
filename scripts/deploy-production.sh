@@ -49,6 +49,19 @@ container_image_id() {
   fi
 }
 
+verify_runtime_revision() {
+  local expected_revision="$1" expected_api_image="$2" expected_worker_image="$3"
+  local service image_id expected_image revision
+  for service in api worker layout-worker; do
+    image_id="$(container_image_id "$service")"
+    expected_image="$expected_worker_image"
+    [[ "$service" != "api" ]] || expected_image="$expected_api_image"
+    [[ -n "$image_id" && "$image_id" == "$expected_image" ]] || fail "$service 未运行本次构建的镜像"
+    revision="$(docker image inspect "$image_id" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+    [[ "$revision" == "$expected_revision" ]] || fail "$service 镜像 revision 与本次 Git 提交不一致"
+  done
+}
+
 verify_runtime_health() {
   local failed=0
   curl --fail --silent --show-error --connect-timeout 3 --max-time 10 http://127.0.0.1:8091/health || failed=1
@@ -341,7 +354,11 @@ main() {
   rollback_enabled=1
 
   log "构建转换服务镜像"
-  "${build_compose[@]}" build api worker
+  "${build_compose[@]}" build --build-arg "SOURCE_REVISION=$new_head" api worker
+  local candidate_api_id candidate_worker_id
+  candidate_api_id="$(docker image inspect "$candidate_api_image" --format '{{.Id}}')"
+  candidate_worker_id="$(docker image inspect "$candidate_worker_image" --format '{{.Id}}')"
+  [[ -n "$candidate_api_id" && -n "$candidate_worker_id" ]] || fail "无法核对本次构建镜像"
   unset PLT_API_IMAGE PLT_WORKER_IMAGE
 
   trap 'rollback "$?"' EXIT
@@ -357,6 +374,9 @@ main() {
   docker image tag "$candidate_api_image" "$API_IMAGE"
   docker image tag "$candidate_worker_image" "$WORKER_IMAGE"
   "${compose[@]}" up -d --no-build --no-deps --wait --wait-timeout 120 api worker layout-worker
+
+  log "核对 API 与两个 Worker 的构建版本"
+  verify_runtime_revision "$new_head" "$candidate_api_id" "$candidate_worker_id"
 
   log "验证转换服务健康状态"
   verify_runtime_health

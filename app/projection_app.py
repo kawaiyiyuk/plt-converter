@@ -60,10 +60,18 @@ def ensure_disk_root(root):
         raise ValueError('PROJECTOR_ROOT must be disk storage, never tmpfs/ramfs')
 
 
+def reject_conversion_service_token(configuration):
+    # Presence (including an empty inherited ENV) is forbidden for this stack.
+    # Report the variable name only, never its value.
+    if 'CONVERSION_SERVICE_TOKEN' in configuration:
+        raise ValueError('CONVERSION_SERVICE_TOKEN must not be present in the projector environment')
+
+
 def create_projection_app(configuration=None):
     app = Flask(__name__)
     app.request_class = BudgetedRequest
     configuration = {**os.environ, **(configuration or {})}
+    reject_conversion_service_token(configuration)
     enabled = str(configuration.get('PROJECTOR_ENABLED', '0'))
     if enabled not in ('0', '1'):
         raise ValueError('PROJECTOR_ENABLED must be 0 or 1')

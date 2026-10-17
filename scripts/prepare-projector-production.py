@@ -22,7 +22,7 @@ BUDGETS = ('API_MEMORY API_CPUS API_PIDS WORKER_MEMORY WORKER_CPUS WORKER_PIDS '
 ENV_FIELDS = {'PROJECTOR_' + name for name in BUDGETS} | {
     'PROJECTOR_TRUSTED_PROXY_CIDRS', 'PROJECTOR_ENABLED', 'PROJECTOR_IMAGE', 'PROJECTOR_REDIS_IMAGE',
     'PROJECTOR_POLICY_FILE', 'PROJECTOR_BIND_ADDRESS', 'PROJECTOR_BIND_PORT',
-    'PROJECTOR_WX_BACKEND_URL', 'PROJECTOR_PUBLIC_BASE_URL', 'PROJECTOR_SERVICE_TOKEN',
+    'PROJECTOR_WX_BACKEND_URL', 'PROJECTOR_PUBLIC_BASE_URL',
 }
 
 class Invalid(ValueError):
@@ -171,7 +171,7 @@ def prepare(envpath):
         'limits': '21MiB HTTP body / 20MiB source; existing confirmed policy retained',
         'future_authorized_manual_work': [
             'build/distribute verified immutable images; local approved base IDs are not production provenance',
-            'approve host capacity and engineering budgets; match identity token without disclosure',
+            'approve host capacity and engineering budgets; confirm per-user Bearer identity forwarding',
             'review gateway/TLS and URI/Authorization forwarding; verify exact connection peers and any CDN real-IP trust',
             'coordinate same-version three-service force-recreate, health checks and rollback',
             'analysis may be interrupted by replacement or nonpersistent Redis restart; source originals remain',

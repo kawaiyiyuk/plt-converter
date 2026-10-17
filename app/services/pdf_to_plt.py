@@ -519,10 +519,13 @@ def _extract_page(
                         if respect_native_clips else ((drawing, crop_rect) for drawing in drawings))
     for drawing, visible_crop in visible_drawings:
         if respect_native_clips:
-            # White fill without a stroke is a background, not a visible
-            # black outline. Preserve the legacy extraction path unchanged.
+            # A fully transparent or pure white fill without a stroke has
+            # no ink in the preview. Keep near-white fills: they can still
+            # render to RGB 254, retaining a visible alpha of 1.
+            fill = drawing.get('fill')
             if (drawing.get('type') == 'f' and drawing.get('color') is None
-                    and tuple(drawing.get('fill') or ()) == (1.0, 1.0, 1.0)):
+                    and (drawing.get('fill_opacity', 1) <= 0
+                         or (fill is not None and all(channel >= 1 for channel in fill)))):
                 continue
         if ignore_internal_guides and is_internal_guide_drawing(drawing):
             continue

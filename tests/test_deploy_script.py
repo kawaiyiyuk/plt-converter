@@ -95,11 +95,11 @@ if [[ "${1:-}" == "compose" ]]; then
       printf 'worker-id\n'
       ;;
     *"ps -q layout-worker")
-      if [[ "${LAYOUT_WORKER_EXISTS:-0}" == "1" ]]; then
+      if [[ "${LAYOUT_WORKER_EXISTS:-0}" == "1" || -f "$DEPLOY_TEST_LOG.deployed" ]]; then
         printf 'layout-worker-id\n'
       fi
       ;;
-    *"build api worker")
+    *" build --build-arg "*)
       printf 'build-context %s\n' "${PLT_BUILD_CONTEXT:-}" >> "$DEPLOY_TEST_LOG"
       printf 'build-images %s %s\n' "${PLT_API_IMAGE:-}" "${PLT_WORKER_IMAGE:-}" >> "$DEPLOY_TEST_LOG"
       if [[ "${BUILD_FAIL:-0}" == "1" ]]; then
@@ -137,6 +137,7 @@ if [[ "${1:-}" == "compose" ]]; then
       fi
       ;;
     *"up -d"*)
+      touch "$DEPLOY_TEST_LOG.deployed"
       if [[ "${DEPLOY_UP_MODE:-success}" == "always_fail" ]]; then
         exit 1
       fi
@@ -153,9 +154,13 @@ case "${1:-}" in
   inspect)
     if [[ "$args" == *"{{.Image}}"* ]]; then
       case "${2:-}" in
-        api-id) printf 'old-api-image\n' ;;
-        worker-id) printf 'old-worker-image\n' ;;
-        layout-worker-id) printf 'old-worker-image\n' ;;
+        api-id)
+          if [[ -f "$DEPLOY_TEST_LOG.deployed" ]]; then printf 'candidate-api-id\n'; else printf 'old-api-image\n'; fi ;;
+        worker-id|layout-worker-id)
+          if [[ -f "$DEPLOY_TEST_LOG.deployed" ]]; then
+            if [[ "${RUNTIME_WRONG_IMAGE:-0}" == "1" && "${2:-}" == "layout-worker-id" ]]; then printf 'stale-worker-id\n'; else printf 'candidate-worker-id\n'; fi
+          else printf 'old-worker-image\n'; fi ;;
+
       esac
     elif [[ "${2:-}" == "redis-id" ]]; then
       printf 'healthy\n'
@@ -164,6 +169,20 @@ case "${1:-}" in
   ps)
     ;;
   image)
+    if [[ "${2:-}" == "inspect" ]]; then
+      if [[ "$args" == *"{{.Id}}"* ]]; then
+        case "${3:-}" in
+          plt-converter-api:candidate-*) printf 'candidate-api-id\n' ;;
+          plt-converter-worker:candidate-*) printf 'candidate-worker-id\n' ;;
+        esac
+      else
+        case "${RUNTIME_REVISION_MODE:-same}" in
+          wrong) printf 'stale-revision\n' ;;
+          missing) printf '<no value>\n' ;;
+          *) printf '%s\n' "${GIT_LOCAL_HEAD:-same-head}" ;;
+        esac
+      fi
+    fi
     ;;
 esac
 """
@@ -231,6 +250,29 @@ class DeployScriptTest(unittest.TestCase):
         path.write_text(textwrap.dedent(content), encoding="utf-8")
         path.chmod(0o755)
 
+    def test_runtime_revision_and_candidate_image_checks_allow_distinct_api_and_worker(self):
+        result, log = self.run_deploy()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('SOURCE_REVISION=same-head', log)
+        dockerfile = (PROJECT_ROOT / 'Dockerfile').read_text()
+        self.assertIn('ARG SOURCE_REVISION=unknown', dockerfile)
+        self.assertIn('LABEL org.opencontainers.image.revision=$SOURCE_REVISION', dockerfile)
+        self.assertIn('image inspect candidate-api-id', log)
+        self.assertIn('image inspect candidate-worker-id', log)
+        self.assertIn('ps -q layout-worker', log)
+
+    def test_runtime_mismatch_or_missing_revision_rolls_back(self):
+        for overrides in ({'RUNTIME_REVISION_MODE': 'wrong'},
+                          {'RUNTIME_REVISION_MODE': 'missing'},
+                          {'RUNTIME_WRONG_IMAGE': '1'}):
+            with self.subTest(overrides=overrides):
+                result, log = self.run_deploy(**overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('正在恢复上一版转换服务', result.stderr)
+                self.assertIn('image tag old-api-image plt-converter-api:production', log)
+                self.assertIn('image tag old-worker-image plt-converter-worker:production', log)
+                self.assertNotIn('部署成功', result.stdout)
+
     def test_queue_timeout_reopens_stopped_api(self):
         result, log = self.run_deploy(QUEUE_MODE="timeout")
 
@@ -264,28 +306,28 @@ class DeployScriptTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("远端 main", result.stderr)
-        self.assertNotIn("build api worker", log)
+        self.assertNotIn("build --build-arg SOURCE_REVISION=same-head api worker", log)
 
     def test_untracked_files_do_not_block_archived_build(self):
         result, log = self.run_deploy(GIT_UNTRACKED="1")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("git status --porcelain --untracked-files=no", log)
-        self.assertIn("build api worker", log)
+        self.assertIn("build --build-arg SOURCE_REVISION=same-head api worker", log)
 
     def test_tracked_changes_are_rejected_before_build(self):
         result, log = self.run_deploy(GIT_TRACKED_DIRTY="1")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("已跟踪文件", result.stderr)
-        self.assertNotIn("build api worker", log)
+        self.assertNotIn("build --build-arg SOURCE_REVISION=same-head api worker", log)
 
     def test_staged_tracked_files_are_rejected_before_build(self):
         result, log = self.run_deploy(GIT_TRACKED_STAGED="1")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("已跟踪文件", result.stderr)
-        self.assertNotIn("build api worker", log)
+        self.assertNotIn("build --build-arg SOURCE_REVISION=same-head api worker", log)
 
     def test_docker_context_excludes_local_secrets_and_python_caches(self):
         dockerignore = (PROJECT_ROOT / ".dockerignore").read_text(encoding="utf-8")
@@ -404,13 +446,13 @@ class DeployScriptTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("连续更新", result.stderr)
-        self.assertNotIn("build api worker", log)
+        self.assertNotIn("build --build-arg SOURCE_REVISION=same-head api worker", log)
 
     def test_successful_deploy_still_completes(self):
         result, log = self.run_deploy()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("build api worker", log)
+        self.assertIn("build --build-arg SOURCE_REVISION=same-head api worker", log)
         self.assertIn("up -d", log)
         self.assertIn("api worker layout-worker", log)
         self.assertIn("/health/worker", log)

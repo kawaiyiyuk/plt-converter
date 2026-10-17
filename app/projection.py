@@ -1,5 +1,9 @@
 """Authenticated projection HTTP controller; heavy PDF work runs only in supervised children."""
+from concurrent.futures import Future
 from decimal import Decimal, InvalidOperation
+import hashlib
+from http.client import HTTPException
+import threading
 import json
 import math
 from pathlib import Path
@@ -7,7 +11,7 @@ import re
 import time
 from flask import Blueprint, Response, current_app, g, jsonify, request
 import unicodedata
-from .billing import BillingRejected, identify_user
+from .billing import BillingRejected, _json_request as identity_request
 from .projection_proxy import upload_rate_limit_ip
 from .projection_store import MAX_BODY, MAX_SOURCE, ProjectionRejected
 from .projection_pdf_runtime import load_fitz
@@ -43,8 +47,74 @@ def owned(document_id, owner):
     return meta
 
 
+IDENTITY_MAX_INFLIGHT = 2
+_identity_flights = {}
+_identity_flights_lock = threading.Lock()
+
+
+def identify_user(authorization):
+    # Coalesce only concurrent calls. No completed identity, failure, or token is
+    # cached; the next request revalidates immediately after this flight ends.
+    # One process has at most two distinct in-flight identities; overload never
+    # waits for a slot or allocates another Future. No lock spans network/wait.
+    if not authorization:
+        return _identify_user(authorization)
+    key = hashlib.sha256(authorization.encode('utf-8')).digest()
+    with _identity_flights_lock:
+        future = _identity_flights.get(key)
+        leader = future is None
+        if leader:
+            if len(_identity_flights) >= IDENTITY_MAX_INFLIGHT:
+                raise ProjectionRejected('projection_identity_busy', '身份验证服务繁忙，请1秒后重试', 503, 1)
+            future = _identity_flights[key] = Future()
+    if not leader:
+        return future.result()
+    try:
+        owner = _identify_user(authorization)
+    except BaseException as error:
+        with _identity_flights_lock:
+            _identity_flights.pop(key, None)
+        future.set_exception(error)
+        raise
+    else:
+        with _identity_flights_lock:
+            _identity_flights.pop(key, None)
+        future.set_result(owner)
+        return owner
+
+
+def _identify_user(authorization):
+    """Projection identity only: upstream outages never mean document expiry."""
+    if not authorization:
+        raise BillingRejected('请先登录后再使用投影功能', 401)
+    try:
+        status, body = identity_request('/api/v1/points/conversion/identity', {},
+                                        {'Authorization': authorization})
+        if status in (401, 403):
+            raise BillingRejected('登录状态验证失败', status)
+        if status != 200 or not isinstance(body, dict):
+            raise ValueError('invalid identity response')
+        data = body.get('data')
+        if (not isinstance(data, dict) or type(data.get('user_id')) not in (str, int)
+                or not data['user_id']):
+            raise ValueError('invalid identity response')
+        return f"user:{data['user_id']}"
+    except BillingRejected as error:
+        if error.status_code in (401, 403):
+            raise
+        raise ProjectionRejected('projection_identity_unavailable', '身份验证服务暂时不可用，请重试', 503, 1) from None
+    except (ValueError, TypeError, UnicodeError, OSError, HTTPException):
+        raise ProjectionRejected('projection_identity_unavailable', '身份验证服务暂时不可用，请重试', 503, 1) from None
+
+
 @projection_bp.errorhandler(BillingRejected)
 def identity_error(error):
+    if error.status_code not in (401, 403):
+        response = jsonify(error='身份验证服务暂时不可用，请重试',
+                           error_code='projection_identity_unavailable', retry_after=1)
+        response.status_code = 503
+        response.headers['Retry-After'] = '1'
+        return response
     return jsonify({'error':str(error)}),error.status_code
 
 

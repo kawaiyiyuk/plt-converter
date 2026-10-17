@@ -158,6 +158,149 @@ class PageFilterTests(unittest.TestCase):
                 self._stroke_lines(p,24,30)
         b=d.tobytes();d.close()
         self.assertEqual(self.detect(b)['excluded_pages'],[{'index':0,'reason':'cover','label':'封面'}])
+    def decorated_cover(self, real_pattern=False, incomplete_dimension=False,
+                        incomplete_frame=False, mixed_arrow=False, mixed_frame=False, rotation=0):
+        document=fitz.open()
+        page=document.new_page(width=595,height=842)
+        page.insert_image(fitz.Rect(70,250,530,760),pixmap=self._gradient_pixmap())
+        page.insert_text((60,180),'效果图',fontname='china-s')
+        for box in ((55,60,550,130),(55,130,550,250),(55,250,550,770)):
+            page.draw_rect(fitz.Rect(box))
+        for index,(a,b) in enumerate((((25,40),(260,40)),((340,40),(570,40)),
+                                     ((40,25),(40,340)),((40,430),(40,790)))):
+            if not incomplete_dimension:
+                page.draw_polyline([a,b,a],color=None,fill=(0,0,0),closePath=False)
+            page.draw_line(a,b)
+            tip=fitz.Point(a);end=fitz.Point(b);unit=(end-tip)/abs(end-tip)
+            normal=fitz.Point(-unit.y,unit.x)
+            wings=[tip+unit*4+normal*3,tip,tip+unit*4-normal*3]
+            if mixed_arrow and index==0:
+                wings.append(fitz.Point(300,400))
+            page.draw_polyline(wings,closePath=False)
+        frame_lines=[((20,-1),(20,843)),((575,-1),(575,843)),
+                     ((0,20),(595,20)),((0,800),(595,800))]
+        for index,(a,b) in enumerate(frame_lines[:3 if incomplete_frame else 4]):
+            if mixed_frame and index==0:
+                shape=page.new_shape()
+                shape.draw_line(a,b)
+                shape.draw_line((0,400),(200,430))
+                shape.finish(color=(0,.7,.9),dashes='[2.8] 0',closePath=False)
+                shape.commit()
+            else:
+                page.draw_line(a,b,color=(0,.7,.9),dashes='[2.8] 0')
+        if real_pattern=='rectangles':
+            for i in range(12):
+                page.draw_rect(fitz.Rect(80+i*10,300+i*10,300+i*10,500+i*10))
+        elif real_pattern:
+            self._stroke_lines(page,12)
+        page.set_rotation(rotation)
+        for _ in range(8):
+            body=document.new_page(width=595,height=842)
+            self._stroke_lines(body,12)
+            body.set_rotation(rotation)
+        source=document.tobytes();document.close();return source
+
+    def test_dimension_and_complete_guide_frame_do_not_turn_a_cover_into_a_tile(self):
+        for rotation in (0,90,180,270):
+            with self.subTest(rotation=rotation):
+                result=self.detect(self.decorated_cover(rotation=rotation))
+                self.assertEqual(result['excluded_pages'],[{'index':0,'reason':'cover','label':'封面'}])
+
+    def test_dimension_decorations_do_not_hide_real_pattern_content(self):
+        for rotation in (0,90,180,270):
+            with self.subTest(rotation=rotation):
+                self.assertEqual(self.detect(self.decorated_cover(real_pattern=True,rotation=rotation))['excluded_pages'],[])
+
+    def test_rectangular_real_pattern_with_the_same_decorations_is_kept(self):
+        for rotation in (0,90,180,270):
+            with self.subTest(rotation=rotation):
+                self.assertEqual(self.detect(self.decorated_cover(real_pattern='rectangles',rotation=rotation))['excluded_pages'],[])
+
+    def test_incomplete_or_mixed_decorations_remain_pattern_evidence(self):
+        for changes in ({'incomplete_dimension':True},{'incomplete_frame':True},{'mixed_frame':True}):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.detect(self.decorated_cover(**changes))['excluded_pages'],[])
+
+    def test_mixed_arrow_drawing_and_its_unproven_dimension_are_not_removed(self):
+        from app.projection_page_filter import _page0_evidence_drawings
+        with fitz.open(stream=self.decorated_cover(mixed_arrow=True),filetype='pdf') as document:
+            page=document[0]
+            drawings=page.get_drawings()
+            mixed=next(d for d in drawings if d['type']=='s' and len(d['items'])==3)
+            baseline=next(d for d in drawings if d['type']=='s' and len(d['items'])==1
+                          and d['items'][0][0]=='l' and d['items'][0][1]==fitz.Point(25,40))
+            evidence=_page0_evidence_drawings(page,fitz)
+            self.assertIn(mixed,evidence)
+            self.assertIn(baseline,evidence)
+
+    def test_visible_fill_rectangles_straight_patterns_and_curves_stay_evidence(self):
+        from app.projection_page_filter import _page0_evidence_drawings
+        with fitz.open(stream=self.decorated_cover(),filetype='pdf') as document:
+            page=document[0]
+            # A narrow but nonzero-area filled path is not a measuring baseline.
+            page.draw_polyline([(25,90),(260,90),(25,90.1)],color=None,fill=(0,0,0),closePath=True)
+            page.draw_rect(fitz.Rect(100,300,220,430))
+            page.draw_line((0,400),(595,400))
+            page.draw_bezier((100,300),(200,350),(300,400),(400,450))
+            added=page.get_drawings()[-4:]
+            evidence=_page0_evidence_drawings(page,fitz)
+            for drawing in added:
+                self.assertIn(drawing,evidence)
+
+    def test_cover_text_is_extracted_once_for_an_eligible_image(self):
+        with fitz.open(stream=self.fixture('line', True), filetype='pdf') as original:
+            document = fitz.open()
+            document.insert_pdf(original, from_page=0, to_page=3)
+        document[0].set_mediabox(fitz.Rect(0, 0, 595, 842))
+        document[0].insert_text((60, 620), '尺码表', fontname='china-s')
+        get_text = fitz.Page.get_text
+        calls = []
+        def read_text(page, *args, **kwargs):
+            calls.append(page.number)
+            return get_text(page, *args, **kwargs)
+        with patch.object(fitz.Page, 'get_text', autospec=True, side_effect=read_text):
+            result = detect_page_filter(document)
+        self.assertEqual(result['excluded_pages'], [{'index': 0, 'reason': 'cover', 'label': '封面'}])
+        self.assertEqual(calls, [0])
+        document.close()
+
+    def test_cover_text_is_not_extracted_without_a_cover_sized_image(self):
+        document = fitz.open()
+        for _ in range(12):
+            page = document.new_page(width=595, height=842)
+            self._stroke_lines(page, 24, 30)
+        with patch.object(fitz.Page, 'get_text', side_effect=AssertionError('not a cover candidate')):
+            self.assertEqual(detect_page_filter(document)['excluded_pages'], [])
+        document.close()
+
+    def test_density_guard_keeps_eight_body_samples(self):
+        from app.projection_page_filter import _visible_drawing_count
+        document = fitz.open()
+        for i in range(13):
+            page = document.new_page(width=560 if i == 0 else 595, height=650 if i == 0 else 842)
+            if i == 0:
+                page.insert_image(fitz.Rect(40, 40, 550, 600), pixmap=self._gradient_pixmap())
+            self._stroke_lines(page, 4 if i < 4 else 24, 30)
+        with patch('app.projection_page_filter._visible_drawing_count', wraps=_visible_drawing_count) as probe:
+            result = detect_page_filter(document)
+        self.assertEqual(result['excluded_pages'], [{'index': 0, 'reason': 'cover', 'label': '封面'}])
+        self.assertEqual(sum(call.args[0].number > 0 for call in probe.call_args_list), 8)
+        document.close()
+
+    def test_cover_with_fewer_than_three_drawings_stops_after_three_body_samples(self):
+        from app.projection_page_filter import _visible_drawing_count
+        with fitz.open(stream=self.fixture('line', True), filetype='pdf') as original:
+            document = fitz.open()
+            document.insert_pdf(original, from_page=0, to_page=3)
+            for _ in range(12):
+                document.insert_pdf(original, from_page=1, to_page=1)
+        with patch('app.projection_page_filter._visible_drawing_count', wraps=_visible_drawing_count) as probe:
+            result = detect_page_filter(document)
+        self.assertEqual(result['excluded_pages'], [{'index': 0, 'reason': 'cover', 'label': '封面'}])
+        body_probes = [call for call in probe.call_args_list if call.args[0].number > 0]
+        self.assertEqual(len(body_probes), 3)
+        document.close()
+
     def test_numbered_frame_probe_stops_at_first_missing_frame(self):
         from app.projection_numbered_layout import numbered_suggestion, _frame as real_frame
         d=fitz.open()
