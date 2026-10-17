@@ -36,6 +36,11 @@ class ManifestTests(unittest.TestCase):
         self.run_script('--apply-local', '--docker-socket', 'tcp://server:2375', expected=2)
         self.run_script('--apply-local', '--docker-socket', 'ssh://server', expected=2)
 
+    def test_projector_does_not_inject_conversion_service_key(self):
+        text = (ROOT/'compose.projector.yaml').read_text()
+        self.assertNotIn('CONVERSION_SERVICE_TOKEN', text)
+        self.assertNotIn('PROJECTOR_SERVICE_TOKEN', text)
+
     def test_source_and_image_allowlist(self):
         text = (ROOT/'Dockerfile.projection').read_text()
         self.assertNotIn('pip install', text)
@@ -107,12 +112,13 @@ class ManifestTests(unittest.TestCase):
         proc=subprocess.run(['bash',str(ROOT/'scripts/start-projector-local.sh'),'--start-local','--env-file',str(self.env),'--docker-socket',str(sock)],env=env,capture_output=True,text=True)
         self.assertEqual(proc.returncode,0,proc.stdout+proc.stderr)
         commands=[json.loads(line) for line in log.read_text().splitlines()]
-        self.assertEqual(len(commands),4)
-        for command in commands:
+        self.assertEqual(len(commands),5)
+        self.assertIn('image',commands[0])
+        for command in commands[1:]:
             self.assertEqual(command[:2],['--host','unix://'+str(sock)])
             self.assertIn('fengrenjiyi-projector',command)
             self.assertFalse(any(x in command for x in ('down','stop','prune','build','pull','restart')))
-        up=commands[1]
+        up=commands[2]
         self.assertEqual(up[-3:],['projector-redis','projector-layout-worker','projector-api'])
         self.assertIn('--force-recreate',up)
         self.assertIn('--no-build',up); self.assertIn('never',up)
@@ -131,6 +137,34 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(proc.returncode,2,proc.stdout+proc.stderr)
         self.assertIn('Refusing to overwrite',proc.stderr)
         self.assertNotIn('image tag',log.read_text())
+
+    def test_local_projector_input_rejects_old_service_key_without_printing_value(self):
+        for key in ('CONVERSION_SERVICE_TOKEN','PROJECTOR_SERVICE_TOKEN'):
+            self.env.write_text(self.env_base+key+'=fixture-never-print\n')
+            result = self.run_script('--offline',expected=1)
+            self.assertIn(key,result.stdout+result.stderr)
+            self.assertNotIn('fixture-never-print',result.stdout+result.stderr)
+
+    def test_candidate_and_base_service_key_name_block_before_start_without_values(self):
+        bind = socket.socket(socket.AF_UNIX)
+        self.addCleanup(bind.close)
+        sock = self.folder / 'key-check.sock'; bind.bind(str(sock))
+        log = self.folder / 'key-check-log'
+        fake = self.folder / 'docker'
+        fake.write_text("#!/usr/bin/env python3\nimport os,sys\nwith open(os.environ['PROJECTOR_TEST_LOG'],'a') as f: f.write(' '.join(sys.argv[1:])+'\\n')\nif sys.argv[-1] == '{{.Id}}': print('sha256:60ac62f0cd72b32f5914385cf7ab299f1987b2dc8960b98e34574bbdd1557fc3')\nelif 'image' in sys.argv: print('PATH\\nCONVERSION_SERVICE_TOKEN')\n")
+        fake.chmod(0o700)
+        for mode in ('--apply-local','--prepare-base-local'):
+            with self.subTest(mode=mode):
+                log.write_text('')
+                text = self.env_base.replace('PROJECTOR_ENABLED=0','PROJECTOR_ENABLED=1' if mode == '--apply-local' else 'PROJECTOR_ENABLED=0')
+                self.env.write_text(text.replace('CHANGE-TO-UNIQUE-UUID','11111111-2222-4333-8444-555555555555'))
+                result = self.run_script(mode,'--docker-socket',str(sock),expected=1,
+                    env=dict(os.environ,PATH=str(self.folder)+os.pathsep+os.environ['PATH'],PROJECTOR_TEST_LOG=str(log)))
+                self.assertIn('CONVERSION_SERVICE_TOKEN',result.stdout+result.stderr)
+                calls = log.read_text()
+                for forbidden in (' up ',' exec ',' tag '):
+                    self.assertNotIn(forbidden,calls)
+                self.assertIn('split . "="',calls)  # daemon returns names, never raw ENV values
 
     def test_approved_base_only(self):
         self.env.write_text(self.env.read_text().replace('PROJECTOR_BASE_ID=sha256:60ac62f0cd72b32f5914385cf7ab299f1987b2dc8960b98e34574bbdd1557fc3','PROJECTOR_BASE_ID=python:latest'))

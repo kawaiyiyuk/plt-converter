@@ -76,6 +76,9 @@ def projection_fields(path):
 
 
 env = parse_env_file(envpath, '--env-file')
+for forbidden in ('CONVERSION_SERVICE_TOKEN', 'PROJECTOR_SERVICE_TOKEN'):
+    if forbidden in env:
+        raise SystemExit(forbidden + ' is forbidden in projector input')
 # compose.projector.yaml injects ${PROJECTOR_POLICY_FILE} verbatim as an env_file
 # for the API and Worker. A stray proxy variable there (http_proxy/HTTPS_PROXY/...)
 # would route urllib identity requests, including the user Bearer, past the WX
@@ -182,6 +185,12 @@ printf '%s\n' 'Future authorized local operations (printed only):'
 printf 'docker compose -p fengrenjiyi-projector --env-file %q -f %q config\n' "$envfile" "$ROOT/compose.projector.yaml"
 printf '%s\n' 'Use local default Docker driver, verified task-only alias and --pull=false; build only projector-api using compose.projector.build.yaml + clean context; require base/candidate/Redis images available locally, never fallback pull.'
 printf '%s\n' 'Start only: projector-redis projector-layout-worker projector-api; wait readiness and worker live-only-queue; inspect legacy health separately under its own authorization.'
+# Query names only: even an empty inherited key is forbidden. Dockerfile ENV
+# cannot remove an inherited key; never hide it by overriding an empty value.
+reject_conversion_key_in_image() {
+  docker --host "unix://$socket" image inspect "$1" --format '{{range .Config.Env}}{{println (index (split . "=") 0)}}{{end}}' |
+    python3 -c 'import sys; names = set(sys.stdin.read().splitlines()); sys.exit("CONVERSION_SERVICE_TOKEN is forbidden in projector image configuration" if "CONVERSION_SERVICE_TOKEN" in names else 0)'
+}
 if [[ "$mode" == --prepare-base-local ]]; then
   [[ "$socket" == /* && "$socket" != *$'\n'* && -S "$socket" ]] || {
     echo 'Explicit local absolute Unix Docker socket required' >&2; exit 2;
@@ -202,6 +211,7 @@ PYALIAS
   docker_local=(docker --host "unix://$socket")
   actual_id="$("${docker_local[@]}" image inspect "$base_id" --format '{{.Id}}')"
   [[ "$actual_id" == "$base_id" ]] || { echo 'Approved base ID mismatch' >&2; exit 2; }
+  reject_conversion_key_in_image "$base_id"
   if existing="$("${docker_local[@]}" image inspect "$base_alias" --format '{{.Id}}' 2>/dev/null)"; then
     [[ "$existing" == "$base_id" ]] || { echo 'Refusing to overwrite mismatched task alias' >&2; exit 2; }
   else
@@ -218,6 +228,14 @@ elif [[ "$mode" == --apply-local ]]; then
   # PROJECTOR_ENABLED=1 for --apply-local from the same parsed env file.
   # --host overrides DOCKER_HOST and the active context: no TCP/SSH endpoint.
   compose=(docker --host "unix://$socket" compose -p fengrenjiyi-projector --env-file "$envfile" -f "$ROOT/compose.projector.yaml")
+  candidate_image="$(python3 - "$envfile" <<'PYCANDIDATE'
+import sys
+for raw in open(sys.argv[1]):
+    line = raw.strip().removeprefix("export ").lstrip()
+    if line.startswith("PROJECTOR_IMAGE="): print(line.split("=", 1)[1].strip())
+PYCANDIDATE
+)"
+  reject_conversion_key_in_image "$candidate_image"
   "${compose[@]}" config --quiet
   # pull_policy never: candidate and reviewed Redis must already exist locally.
   "${compose[@]}" up -d --force-recreate --no-build --pull never --wait --wait-timeout 120 projector-redis projector-layout-worker projector-api

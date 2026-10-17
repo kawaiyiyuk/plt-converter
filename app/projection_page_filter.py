@@ -25,9 +25,9 @@ def selection_details(meta, indexes):
 
 
 
-def _visible_drawing_count(page, fitz):
+def _visible_drawing_count(page, fitz, drawings=None):
     count = 0
-    for drawing in page.get_drawings():
+    for drawing in page.get_drawings() if drawings is None else drawings:
         stroke = drawing.get('color')
         fill = drawing.get('fill')
         has_stroke = stroke is not None and any(c < 1 for c in stroke) and drawing.get('stroke_opacity', 1) > 0
@@ -75,12 +75,12 @@ def _has_visible_vector_content(page, fitz):
     return False
 
 
-def _edge_cut_edges(page, fitz):
+def _edge_cut_edges(page, fitz, drawings=None):
     box=page.rect
     rx0,ry0,rx1,ry1=box.x0-1,box.y0-1,box.x1+1,box.y1+1
     segments=0
     edges=set()
-    for drawing in page.get_drawings():
+    for drawing in page.get_drawings() if drawings is None else drawings:
         stroke=drawing.get('color')
         if not (stroke is not None and any(c < 1 for c in stroke) and drawing.get('stroke_opacity', 1) > 0):
             continue
@@ -122,15 +122,120 @@ def _edge_cut_edges(page, fitz):
     return segments,edges
 
 
-def _page0_pattern_evidence(page, fitz, samples):
+def _page0_evidence_drawings(page, fitz):
+    """Exclude only structurally proven measuring decorations from tile evidence.
+
+    Rendering, blank-page checks and body density keep the original drawings.
+    Mixed or incomplete objects stay, even if a subset resembles a decoration.
+    """
+    from .projection_numbered_layout import _frame, _style, _same_style
+    drawings=page.get_drawings()
+    tolerance=.15  # Same point tolerance as the existing numbered-frame probe.
+    omitted=set()
+
+    def near(a,b):
+        return abs(a-b)<=tolerance
+
+    def point_key(point):
+        # Buckets keep the matching bounded. Boundary misses conservatively
+        # retain a decoration; every match is checked geometrically below.
+        return round(point.x/tolerance),round(point.y/tolerance)
+
+    def line_key(a,b):
+        return tuple(sorted((point_key(a),point_key(b))))
+
+    fills={};arrows={}
+    for index,drawing in enumerate(drawings):
+        items=drawing['items']
+        if len(items)!=2 or any(item[0]!='l' for item in items):
+            continue
+        a,b=items[0][1:3];c,d=items[1][1:3]
+        if drawing.get('type')=='f' and a==d and b==c:
+            fills.setdefault(line_key(a,b),[]).append((index,a,b))
+        elif drawing.get('type')=='s' and near(b,c):
+            arrows.setdefault(point_key(b),[]).append((index,a,b,d))
+    for index,baseline in enumerate(drawings):
+        items=baseline['items']
+        if baseline.get('type')!='s' or len(items)!=1 or items[0][0]!='l':
+            continue
+        a,b=items[0][1:3]
+        length=abs(b-a)
+        if length<=tolerance:
+            continue
+        matching_fills=[entry for entry in fills.get(line_key(a,b),[])
+                        if (near(entry[1],a) and near(entry[2],b)
+                            or near(entry[1],b) and near(entry[2],a))
+                        and drawings[entry[0]].get('fill')==baseline.get('color')
+                        and drawings[entry[0]].get('fill_opacity',1)==baseline.get('stroke_opacity',1)]
+        if not matching_fills:
+            continue
+        for tip,end in ((a,b),(b,a)):
+            direction=(end-tip)/length
+            for arrow_index,first,vertex,last in arrows.get(point_key(tip),[]):
+                arrow=drawings[arrow_index]
+                if (not near(vertex,tip) or any(arrow.get(key)!=baseline.get(key)
+                        for key in ('color','width','dashes','stroke_opacity'))):
+                    continue
+                u,v=first-vertex,last-vertex
+                along_u=u.x*direction.x+u.y*direction.y
+                along_v=v.x*direction.x+v.y*direction.y
+                cross_u=u.x*direction.y-u.y*direction.x
+                cross_v=v.x*direction.y-v.y*direction.x
+                if (0<along_u<length and 0<along_v<length
+                        and abs(along_u-along_v)<=tolerance
+                        and abs(cross_u+cross_v)<=tolerance
+                        and cross_u*cross_v<0 and min(abs(cross_u),abs(cross_v))>tolerance):
+                    omitted.update((index,arrow_index))
+                    omitted.update(entry[0] for entry in matching_fills)
+
+    # Reuse the existing unique, complete same-style frame recognizer. An
+    # isolated dashed line, incomplete frame or mixed drawing is never removed.
+    styled=[(i,_style(drawing)) for i,drawing in enumerate(drawings)]
+    if any(style is not None for _,style in styled):
+        frame=_frame(page,fitz)
+        if frame is not None:
+            left,top,right,bottom=frame
+            groups=[]
+            for index,style in styled:
+                if style is None or drawings[index].get('type')!='s':
+                    continue
+                sides=set()
+                for item in drawings[index]['items']:
+                    if item[0]!='l':
+                        sides.clear();break
+                    a,b=(point*page.rotation_matrix for point in item[1:3])
+                    if abs(a.y-b.y)<=tolerance and abs(a.x-b.x)>=page.rect.width*.8:
+                        side=next((label for value,label in ((top,'top'),(bottom,'bottom'))
+                                   if abs(a.y-value)<=tolerance and abs(b.y-value)<=tolerance),None)
+                    elif abs(a.x-b.x)<=tolerance and abs(a.y-b.y)>=page.rect.height*.8:
+                        side=next((label for value,label in ((left,'left'),(right,'right'))
+                                   if abs(a.x-value)<=tolerance and abs(b.x-value)<=tolerance),None)
+                    else:
+                        side=None
+                    if side is None:
+                        sides.clear();break
+                    sides.add(side)
+                if not sides:
+                    continue
+                group=next((group for group in groups if _same_style(group[0],style)),None)
+                if group is None:
+                    group=[style,set(),[]];groups.append(group)
+                group[1].update(sides);group[2].append(index)
+            for _,sides,indexes in groups:
+                if len(sides)==4:
+                    omitted.update(indexes)
+    return [drawing for index,drawing in enumerate(drawings) if index not in omitted]
+
+
+def _page0_pattern_evidence(page, fitz, samples, drawing_count=None, edge_evidence=None):
     """Page 0 keeps its own paper-pattern ink: vector density or cut strokes."""
-    count=_visible_drawing_count(page, fitz)
+    count=_visible_drawing_count(page, fitz) if drawing_count is None else drawing_count
     if count>=3:
         ordered=sorted(samples);n=len(ordered)
         median=ordered[n//2] if n%2 else (ordered[n//2-1]+ordered[n//2])/2
         if count>=.5*median:
             return True
-    segments,edges=_edge_cut_edges(page, fitz)
+    segments,edges=_edge_cut_edges(page, fitz) if edge_evidence is None else edge_evidence
     return segments>=4 and len(edges)>=2
 
 
@@ -162,20 +267,29 @@ def detect_page_filter(document):
         # Photo cover requires several independent signals, and a body formed
         # by vector paper pages. Pure scanned documents are never auto-filtered.
         p=document[0];area=p.rect.get_area()
-        image_area=max(((fitz.Rect(im['bbox']) * p.rotation_matrix & p.rect).get_area() for im in p.get_image_info()),default=0)
+        images=p.get_image_info()
+        image_area=max(((fitz.Rect(im['bbox']) * p.rotation_matrix & p.rect).get_area() for im in images),default=0)
         different_size = abs(sizes[0][0]-sizes[group[0]][0])>.5 or abs(sizes[0][1]-sizes[group[0]][1])>.5
-        cover_text = any(word in p.get_text() for word in ('效果图','封面','尺码表','款式图'))
+        text=p.get_text() if image_area>=area*.2 and not different_size else ''
+        cover_text = any(word in text for word in ('效果图','封面','尺码表','款式图'))
         if image_area>=area*.2 and (different_size or cover_text):
+            evidence_drawings=_page0_evidence_drawings(p,fitz)
+            count0=_visible_drawing_count(p,fitz,evidence_drawings)
+            segments,edges=_edge_cut_edges(p,fitz,evidence_drawings)
             samples=[]
-            for i in later:
-                if document[i].get_image_info():
-                    continue
-                c=_visible_drawing_count(document[i],fitz)
-                if c>=3:
-                    samples.append(c)
-                    if len(samples)>=8:
-                        break
-            if len(samples)>=3 and not _page0_pattern_evidence(p,fitz,samples):
+            # Edge-cut evidence independently protects a real tile. For fewer
+            # than three drawings the median guard cannot apply, so only three
+            # qualifying body pages are needed; otherwise retain all eight.
+            if not (segments>=4 and len(edges)>=2):
+                for i in later:
+                    if document[i].get_image_info():
+                        continue
+                    c=_visible_drawing_count(document[i],fitz)
+                    if c>=3:
+                        samples.append(c)
+                        if len(samples)>=(3 if count0<3 else 8):
+                            break
+            if len(samples)>=3 and not _page0_pattern_evidence(p,fitz,samples,count0,(segments,edges)):
                 pix=p.get_pixmap(matrix=fitz.Matrix(min(.5,2048/max(p.rect.width,p.rect.height)),min(.5,2048/max(p.rect.width,p.rect.height))),colorspace=fitz.csRGB,alpha=False,annots=True)
                 data=pix.samples
                 colored_count = 0

@@ -28,7 +28,7 @@ class ProductionPreparationTests(unittest.TestCase):
         self.values.update(PROJECTOR_TRUSTED_PROXY_CIDRS='10.20.0.2/32', PROJECTOR_IMAGE='registry.invalid/projector@sha256:' + 'a'*64,
                            PROJECTOR_REDIS_IMAGE='registry.invalid/redis@sha256:' + 'b'*64,
                            PROJECTOR_POLICY_FILE=str(self.policy), PROJECTOR_PUBLIC_BASE_URL='https://files.invalid',
-                           PROJECTOR_WX_BACKEND_URL='https://identity.invalid', PROJECTOR_SERVICE_TOKEN='secret-fixture-NEVER-PRINT')
+                           PROJECTOR_WX_BACKEND_URL='https://identity.invalid')
         self.policy_text = (ROOT / '.env.projector.policy.example').read_text()
         self.save()
         self.addCleanup(patch.stopall)
@@ -41,6 +41,14 @@ class ProductionPreparationTests(unittest.TestCase):
     def save(self):
         self.envpath.write_text(''.join(key+'='+value+'\n' for key,value in self.values.items()))
         self.policy.write_text(self.policy_text)
+
+    def test_service_token_is_not_required_or_allowed(self):
+        self.assertNotIn('PROJECTOR_SERVICE_TOKEN', prep.ENV_FIELDS)
+        self.assertEqual(prep.prepare(self.envpath)['status'], 'offline-inputs-valid')
+        self.values['PROJECTOR_SERVICE_TOKEN'] = 'fixture-never-print'
+        self.save()
+        with self.assertRaises(prep.Invalid):
+            prep.prepare(self.envpath)
 
     def test_valid_plan_offline_and_redacted(self):
         plan = prep.prepare(self.envpath)
@@ -56,7 +64,7 @@ class ProductionPreparationTests(unittest.TestCase):
         self.envpath.write_text((ROOT / '.env.projector.production.example').read_text())
         plan = prep.prepare(self.envpath)
         self.assertEqual(set(plan), {'status', 'missing_fields'})
-        self.assertIn('PROJECTOR_SERVICE_TOKEN', plan['missing_fields'])
+        self.assertNotIn('PROJECTOR_SERVICE_TOKEN', plan['missing_fields'])
 
     def test_proxy_peers_are_explicit_required_and_redacted(self):
         for value in ('', None):

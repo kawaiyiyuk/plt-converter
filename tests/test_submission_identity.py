@@ -116,6 +116,55 @@ class SubmissionIdentityTest(unittest.TestCase):
                     self.redis, billing_request_id=request_id,
                 )['job_id'], old_job['job_id'])
 
+    def test_legacy_pdf_http_replay_with_default_outer_edges_keeps_completed_job(self):
+        from app.routes import parse_pdf_render_options
+        document = pymupdf.open()
+        page = document.new_page(width=300, height=300)
+        page.draw_line((20, 40), (280, 40))
+        source = document.tobytes()
+        document.close()
+        options = parse_pdf_render_options({})
+        options.pop('preserve_outer_edges')
+        options.pop('metadata_mode')
+        record = submit_job('pdf_to_plt', source, 'source.pdf', options, 'user:42',
+                            self.redis, billing_request_id='legacy-outer')
+        result_path = Path(record['input_path']).with_name('result.plt')
+        result_path.write_bytes(b'IN;PU0,0;PD10,10;')
+        record = update_job(record['job_id'], self.redis, status='done', result_path=str(result_path), billing_confirmed=True)
+        client = create_app().test_client()
+        with patch('app.routes.authorize_job', return_value={
+            'user_id': 42, 'request_id': 'legacy-outer', 'access_method': 'free',
+        }), patch('app.routes.commit_conversion') as commit, patch('app.routes.release_conversion') as release:
+            response = client.post('/api/v1/pdf/jobs', data={'file': (io.BytesIO(source), 'source.pdf')})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual(response.get_json()['job_id'], record['job_id'])
+            commit.assert_called_once_with(42, 'legacy-outer', record['job_id'])
+            commit.reset_mock()
+            for changed in ({'preserve_outer_edges': 'true'}, {'rows': '2'}, {'metadata_mode': 'current'}):
+                response = client.post('/api/v1/pdf/jobs', data={
+                    'file': (io.BytesIO(source), 'source.pdf'), **changed,
+                })
+                self.assertEqual(response.status_code, 409, response.get_json())
+            commit.assert_not_called()
+            release.assert_not_called()
+        unchanged = load_job(record['job_id'], self.redis)
+        self.assertEqual(unchanged['status'], 'done')
+        self.assertEqual(unchanged['options'], options)
+        self.assertEqual(unchanged['user_key'], 'user:42')
+        self.assertEqual(unchanged['result_path'], str(result_path))
+        # Fingerprintless legacy recovery also compares the saved input.
+        record.pop('fingerprint', None)
+        save_job(record, self.redis)
+        for key in self.redis.keys('plt-converter:fingerprint:*'):
+            self.redis.delete(key)
+        replay = submit_job('pdf_to_plt', source, 'source.pdf',
+                            {**options, 'metadata_mode': None, 'preserve_outer_edges': False},
+                            'user:42', self.redis, billing_request_id='legacy-outer')
+        self.assertEqual(replay['job_id'], record['job_id'])
+        other = submit_job('pdf_to_plt', source, 'source.pdf', options,
+                           'user:other', self.redis, billing_request_id='legacy-outer')
+        self.assertNotEqual(other['job_id'], record['job_id'])
+
     def test_legacy_missing_source_uses_index_or_rejects_without_touching_old_job(self):
         first = self.submit()
         first.pop('fingerprint', None)

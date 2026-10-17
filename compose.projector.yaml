@@ -23,7 +23,6 @@ x-projector: &projector
     PROJECTOR_ROOT: /var/lib/projector
     PROJECTOR_REDIS_URL: redis://projector-redis:6379/0
     WX_BACKEND_URL: ${PROJECTOR_WX_BACKEND_URL:?explicit non-production identity backend required}
-    CONVERSION_SERVICE_TOKEN: ${PROJECTOR_SERVICE_TOKEN:?identity service token required}
   volumes:
     - projector-data:/var/lib/projector
   tmpfs:

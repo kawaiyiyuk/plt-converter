@@ -332,6 +332,12 @@ def matches_billing_submission(record, job_type, source, filename, options, conn
             and options.get('metadata_mode') in (None, '')):
         # Before metadata selection, ordinary PDFs had no metadata_mode key.
         candidate_options = {key: value for key, value in options.items() if key != 'metadata_mode'}
+    if (job_type == 'pdf_to_plt'
+            and 'preserve_outer_edges' not in saved_options
+            and candidate_options.get('preserve_outer_edges') is False):
+        # Omitted by pre-feature clients and explicit False use the same geometry.
+        candidate_options = {key: value for key, value in candidate_options.items()
+                             if key != 'preserve_outer_edges'}
     candidate = submission_fingerprint(job_type, source, filename, candidate_options, output_version)
     expected = record.get('fingerprint')
     if not expected:

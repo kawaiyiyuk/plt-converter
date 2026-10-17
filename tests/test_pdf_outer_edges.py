@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from app.routes import parse_pdf_render_options
 from app.services.pdf_to_pdf import source_conversion_options
-from app.services.pdf_to_plt import convert_pdf_to_plt, load_fitz
+from app.services.pdf_to_plt import convert_pdf_to_plt, load_fitz, transparent_preview
 
 
 class PdfOuterEdgesTest(unittest.TestCase):
@@ -37,6 +37,38 @@ class PdfOuterEdgesTest(unittest.TestCase):
         with patch('app.services.pdf_to_plt.serialize_hpgl', side_effect=lambda paths, *_args: captured.extend(paths) or b'IN;'):
             _plt, result = convert_pdf_to_plt(source, options)
         return captured, result
+
+    def test_invisible_fill_background_does_not_become_a_cutting_outline(self):
+        fitz = load_fitz()
+        for fill, opacity, stroke, invisible in (
+            ((.999, .999, .999), 1, None, False),
+            ((1, 1, 1), 1, None, True),
+            ((0, 0, 0), 0, None, True),
+            ((.99, .99, .99), 1, None, False),
+            ((1, .99, 1), 1, None, False),
+            ((.999, .999, .999), 1, (0, 0, 0), False),
+        ):
+            with self.subTest(fill=fill, opacity=opacity, stroke=stroke):
+                document = fitz.open()
+                page = document.new_page(width=200, height=200)
+                page.draw_rect(page.rect, color=stroke, fill=fill, fill_opacity=opacity)
+                page.draw_line((30, 90), (170, 110), color=(.999, .999, .999))
+                pixmap = page.get_pixmap(alpha=False)
+                # Confirm what the actual preview renderer sees in the background.
+                self.assertEqual(pixmap.pixel(50, 50) == (255, 255, 255), invisible)
+                preview = transparent_preview(pixmap, fitz)
+                self.assertEqual(preview.pixel(50, 50)[3] == 0, invisible)
+                if fill == (.999, .999, .999) and opacity == 1:
+                    self.assertEqual(preview.pixel(50, 50)[3], 1)
+                source = document.tobytes()
+                document.close()
+                paths, result = self.geometry(source, {
+                    'rows': 1, 'columns': 1, 'preserve_outer_edges': True,
+                    'units_per_inch': 25400,
+                })
+                # The pale stroked line stays; a visible fill or stroke keeps its rectangle.
+                self.assertEqual(len(paths), 1 if invisible else 2)
+                self.assertEqual((result['width_mm'], result['height_mm']), (70.56, 70.56))
 
     def test_two_by_two_keeps_outer_content_without_moving_internal_seams(self):
         paths, result = self.geometry(self.source(), self.options())
