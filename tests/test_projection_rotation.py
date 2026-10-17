@@ -153,10 +153,10 @@ class ProjectionRotationTests(unittest.TestCase):
         self.assertEqual(rotated.status_code,200)
         pix=fitz.Pixmap(rotated.data);c,s=trig(137)
         # The source image center (40,40) becomes (40,40) after intrinsic 90°,
-        # then the crop/slot map places its center at world (125,35).
-        q=(2*(c*125-s*35-values['x_mm']),2*(s*125+c*35-values['y_mm']))
+        # then the crop/slot map places its center at world (130,40).
+        q=(2*(c*130-s*40-values['x_mm']),2*(s*130+c*40-values['y_mm']))
         color=pix.pixel(round(q[0]),round(q[1]));self.assertGreater(color[1],220);self.assertLess(max(color[0],color[2]),30)
-        blue_expected=(2*(c*145-s*20-values['x_mm']),2*(s*145+c*20-values['y_mm']))
+        blue_expected=(2*(c*150-s*25-values['x_mm']),2*(s*150+c*25-values['y_mm']))
         self.assertLessEqual(math.dist(centroid(pix,'blue'),blue_expected),1)
         self.assertEqual(json.dumps(self.metadata(doc_id)).encode(),meta_before)
         self.assertEqual((root/f'{doc_id}.pdf').read_bytes(),source)

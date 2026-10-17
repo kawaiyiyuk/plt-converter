@@ -114,9 +114,11 @@ PLT/HPGL 由独立投影子进程严格解析为临时内部单页 PDF；成功�
 
 POST 返回 HTTP 202 `{analysis_id,status:"analyzing",phase:"queued"}`；同模式进行中幂等复用，先检查失败／失联状态避免永久分析中。GET 返回当前 analysis_id 及 status（analyzing／ready／insufficient_evidence／failed），进行中 phase 为 queued/analyzing，ready 含 suggestion（rows、columns、order、page_slots、crop_margins_mm、width_mm、height_mm、confidence、source），其他终态含 reason/error。改模式产生新 ID，迟到旧任务不能覆盖新建议；手动应用使旧建议失效。
 
-`POST layout` 表单 `method=auto&analysis_id=...` 必须等于当前 ready 且可靠建议的 ID，否则 409；不采用客户端上传的自动方案。手动表单 `method=manual`、rows/columns（1–24）、order（row/column）、crop_left_mm/right/top/bottom：裁边为非负有限数，每页裁后宽高至少 1mm，无新增 100mm cap；格数必须覆盖全部页面，每页一次，尾部补空槽。不漏页、不重复、不拉伸。混尺寸按各列最大可见宽、各行最大可见高左上对齐；整行／整列空槽按所有裁后页面最大宽／高保留真实空白网格。返回 `{layout:{rows,columns,order,page_slots,crop_margins_mm,width_mm,height_mm,source},width_mm,height_mm}`。
+`POST layout` 表单 `method=auto&analysis_id=...` 必须等于当前 ready 且可靠建议的 ID，否则 409；不采用客户端上传的自动方案。手动表单 `method=manual`、rows/columns（1–24）、order（row/column）、crop_left_mm/right/top/bottom：裁边为非负有限数，每页裁后宽高至少 1mm，无新增 100mm cap；格数必须覆盖全部页面，每页一次，尾部补空槽。不漏页、不重复、不拉伸。混尺寸按各列最大可见宽、各行最大可见高左上对齐；整行／整列空槽按所有裁后页面最大宽／高保留真实空白网格。返回 `{layout:{rows,columns,order,page_slots,crop_margins_mm,width_mm,height_mm,source,preserve_outer_edges:true},width_mm,height_mm}`。
 
-拼版是独立虚拟位置元数据，瓦片仅对相交原页 `get_pixmap(annots=True)` 并等比例贴到有限画布；文字、颜色、图片和可见标注保留，不写新 PDF、不经 PDF→PLT，不继承旧输出 PDF 的 5080mm 单页限制。用户裁边会改变可见区域，但不更改原文件。低置信、异常或新建议仅改变分析状态，不擅自改变已显示页／已应用布局。
+新建投影布局（auto／manual）固定保留外围：四边裁边只用于相邻非空槽的内缝，朝网格外或空槽的一侧恢复到源页完整边界。裁后列最大宽／行最大高和空整行／列的网格占位保持；每页扩展自己的源 clip，整体平移到非负坐标，返回宽高包含外围扩展。新分析 suggestion、apply 与 summary 的 layout 均含 `preserve_outer_edges:true`，作为客户端能力契约；分析和应用都经同一 geometry builder，尺寸一致。既有 ready 建议重新应用时也重建此布局，不信任旧建议宽高；历史已存 layout 不回写，没有每页裁边时仍按旧全局裁边渲染。内部 placements 保存 `crop_margins_mm` 实际源裁边，不作为 public layout 返回。任意旋转时新布局同时按每页真实变换区域限制合成，避免 MuPDF 的 clip 外接矩形漏出已裁掉的内缝；旧无能力标志布局保留原渲染路径。
+
+拼版是独立虚拟位置元数据，瓦片仅对相交原页 `get_pixmap(annots=True)` 并等比例贴到有限画布；文字、颜色、图片和可见标注保留，不写新 PDF、不经 PDF→PLT，不继承旧输出 PDF 的 5080mm 单页限制。内缝裁边会改变相邻拼接处可见区域，外围完整保留，不更改原文件。低置信、异常或新建议仅改变分析状态，不擅自改变已显示页／已应用布局。
 
 新 `pdf-projection-layout` RQ 队列与 `projector-layout-worker` 只负责此分析，旧队列、Worker、计费及 health 定义不变。沿用旧分析预算：队列最多 20 个等待任务（满时 429），每次**执行**最长 90 秒，排队时间另计；入队记录 TTL 3600 秒作失联兜底。提交需 only-queue=pdf-projection-layout、idle/busy、heartbeat 未超过 RQ worker_ttl（默认 420 秒）的专用消费者，否则 503 保留原页。等待时消费者失联会标失败并取消新队列的旧任务；missing／failed／stopped／无结果完成／执行超时也明确失败可重试，避免无限 analyzing。90 秒分析在锁外执行，发布前重查身份、会话有效及最新 ID；离页删除、手动应用或改模式后不能复活／覆盖旧状态。新 worker 固定命令 `python -c 'from app.projection_layout import worker_main; worker_main()'`；新入口使用独立 Compose project、Redis 和磁盘卷，见下方启动模板。
 

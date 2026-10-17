@@ -186,7 +186,7 @@ def _finite_rotation_values(values):
         raise ValueError('旋转投影坐标超出 PDF 渲染器数值范围')
 
 
-def _source_over_block(canvas, output_width, pixmap, block):
+def _source_over_block(canvas, output_width, pixmap, block, clip_rows=None):
     """Composite MuPDF premultiplied RGBA without installing image libraries.
 
     Work only on the owned output block. Transparent rotated bounding-box
@@ -200,11 +200,33 @@ def _source_over_block(canvas, output_width, pixmap, block):
     if right <= left or bottom <= top:
         return
     samples = pixmap.samples
-    count = right - left
     for y in range(top, bottom):
-        source_start = ((y - pixmap.y) * pixmap.width + left - pixmap.x) * 4
+        row_left, row_right = left, right
+        if clip_rows is not None:
+            # MuPDF's rotated clip is an AABB, not the transformed source
+            # rectangle. Restrict composition to pixel centres inside the real
+            # placement using inverse-transform inequalities. Scanline spans
+            # need no extra pixmap/mask allocation and keep block budgets fixed.
+            for coefficient, origin, step_y, minimum, maximum in clip_rows:
+                offset = origin + step_y * (y + 0.5)
+                if coefficient == 0:
+                    if not minimum <= offset < maximum:
+                        row_right = row_left
+                        break
+                elif coefficient > 0:
+                    row_left = max(row_left, math.ceil((minimum - offset) / coefficient - 0.5))
+                    row_right = min(row_right, math.ceil((maximum - offset) / coefficient - 0.5))
+                else:
+                    # Dividing by a negative axis swaps both the endpoints
+                    # and which endpoint is inclusive: lower < x <= upper.
+                    row_left = max(row_left, math.floor((maximum - offset) / coefficient - 0.5) + 1)
+                    row_right = min(row_right, math.floor((minimum - offset) / coefficient - 0.5) + 1)
+            if row_right <= row_left:
+                continue
+        count = row_right - row_left
+        source_start = ((y - pixmap.y) * pixmap.width + row_left - pixmap.x) * 4
         source_end = source_start + count * 4
-        target_start = (y * output_width + left) * 3
+        target_start = (y * output_width + row_left) * 3
         target_end = target_start + count * 3
         alphas = samples[source_start + 3:source_end:4]
         if alphas.count(0) == count:
@@ -345,7 +367,6 @@ def render_rotated_tile(source, values, page_index=0, layout=None):
         else:
             placements = layout['placements']
             crop = layout['crop_margins_mm']
-        crop_left, crop_top = crop['left'] * PT_PER_MM, crop['top'] * PT_PER_MM
         display_lists = {}
         for block_top in range(0, height_px, ROTATION_BLOCK_PX):
             for block_left in range(0, width_px, ROTATION_BLOCK_PX):
@@ -364,6 +385,8 @@ def render_rotated_tile(source, values, page_index=0, layout=None):
                 world_top = min(point[1] for point in corners)
                 world_bottom = max(point[1] for point in corners)
                 for placement in placements:
+                    actual_crop = placement.get('crop_margins_mm', crop)
+                    crop_left, crop_top = actual_crop['left'] * PT_PER_MM, actual_crop['top'] * PT_PER_MM
                     left, top = placement['x_mm'] * PT_PER_MM, placement['y_mm'] * PT_PER_MM
                     right = left + placement['width_mm'] * PT_PER_MM
                     bottom = top + placement['height_mm'] * PT_PER_MM
@@ -402,7 +425,13 @@ def render_rotated_tile(source, values, page_index=0, layout=None):
                     maximum_side = 2 * (ROTATION_BLOCK_PX + 2 * ROTATION_HALO_PX) + 4
                     if pixmap.width > maximum_side or pixmap.height > maximum_side:
                         raise ValueError('旋转投影中间图块超过有限渲染预算')
-                    _source_over_block(canvas, width_px, pixmap, block)
+                    clip_rows = None
+                    if layout is not None and layout.get('preserve_outer_edges') is True:
+                        clip_rows = ((cosine, scale * (cosine * view_x + sine * view_y),
+                                      sine, left * scale, right * scale),
+                                     (-sine, scale * (-sine * view_x + cosine * view_y),
+                                      cosine, top * scale, bottom * scale))
+                    _source_over_block(canvas, width_px, pixmap, block, clip_rows)
     return fitz.Pixmap(fitz.csRGB, width_px, height_px, bytes(canvas), False).tobytes('png')
 
 
@@ -441,7 +470,8 @@ def render_tile(source, values, page_index=0, layout=None):
             if x >= right or y >= bottom or x + width <= left or y + height <= top:
                 continue
             page = document[placement['page_index']]
-            crop_left, crop_top = crop['left'] * PT_PER_MM, crop['top'] * PT_PER_MM
+            actual_crop = placement.get('crop_margins_mm', crop)
+            crop_left, crop_top = actual_crop['left'] * PT_PER_MM, actual_crop['top'] * PT_PER_MM
             clip = fitz.Rect(crop_left + max(x, left) - left,
                              crop_top + max(y, top) - top,
                              crop_left + min(x + width, right) - left,

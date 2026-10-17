@@ -148,15 +148,36 @@ def build_layout(pages, rows, columns, order, crop, page_slots=None, source='man
     fallback_height = max(height for _, height in visible_sizes)
     column_widths = [width or fallback_width for width in column_widths]
     row_heights = [height or fallback_height for height in row_heights]
-    width, height = sum(column_widths), sum(row_heights)
+    # Keep the cropped grid (including empty rows / columns) as the seam
+    # coordinate system. Only edges without an occupied neighbour extend back
+    # to the source boundary; setting all crop to zero would move inner seams.
+    occupied_cells = {(row, column) for _, row, column, _, _ in occupied}
+    placements = []
+    for index, row, column, page_width, page_height in occupied:
+        neighbours = {'left': (row, column - 1), 'right': (row, column + 1),
+                      'top': (row - 1, column), 'bottom': (row + 1, column)}
+        actual_crop = {side: margins[side] if cell in occupied_cells else 0.0
+                       for side, cell in neighbours.items()}
+        extension = {side: margins[side] - actual_crop[side] for side in margins}
+        placements.append({'page_index': index,
+                           'x_mm': sum(column_widths[:column]) - extension['left'],
+                           'y_mm': sum(row_heights[:row]) - extension['top'],
+                           'width_mm': page_width + extension['left'] + extension['right'],
+                           'height_mm': page_height + extension['top'] + extension['bottom'],
+                           'crop_margins_mm': actual_crop})
+    left = min(0.0, *(placement['x_mm'] for placement in placements))
+    top = min(0.0, *(placement['y_mm'] for placement in placements))
+    right = max(sum(column_widths), *(p['x_mm'] + p['width_mm'] for p in placements))
+    bottom = max(sum(row_heights), *(p['y_mm'] + p['height_mm'] for p in placements))
+    width, height = right - left, bottom - top
     if not all(math.isfinite(value) and 0 < value < 3.4e38 for value in (width, height)):
         raise ValueError('拼版尺寸超出 PDF 渲染器数值范围')
-    placements = [{'page_index': index, 'x_mm': sum(column_widths[:column]),
-                   'y_mm': sum(row_heights[:row]), 'width_mm': page_width,
-                   'height_mm': page_height} for index, row, column, page_width, page_height in occupied]
+    for placement in placements:
+        placement['x_mm'] -= left
+        placement['y_mm'] -= top
     return {'rows': rows, 'columns': columns, 'order': order, 'page_slots': slots,
             'crop_margins_mm': margins, 'width_mm': width, 'height_mm': height,
-            'source': source, 'placements': placements}
+            'source': source, 'placements': placements, 'preserve_outer_edges': True}
 
 
 def public_layout(layout):
