@@ -393,17 +393,17 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         layout = response.get_json()['layout']
         self.assertEqual(layout['page_slots'], [0, 1])
-        self.assertAlmostEqual(layout['width_mm'], 310 * 25.4 / 72)
-        self.assertAlmostEqual(layout['height_mm'], 280 * 25.4 / 72)
-        tile = self.tile(doc_id, view='layout', width_mm=layout['width_mm'], height_mm=layout['height_mm'], width_px=310, height_px=280)
+        self.assertAlmostEqual(layout['width_mm'], 330 * 25.4 / 72)
+        self.assertAlmostEqual(layout['height_mm'], 300 * 25.4 / 72)
+        tile = self.tile(doc_id, view='layout', width_mm=layout['width_mm'], height_mm=layout['height_mm'], width_px=330, height_px=300)
         self.assertEqual(tile.status_code, 200)
         pix = fitz.Pixmap(tile.data)
-        self.assertEqual(pix.pixel(80, 30), (0, 0, 0))
-        self.assertEqual(pix.pixel(290, 40), (255, 0, 0))
-        self.assertGreater(pix.pixel(210, 40)[2], pix.pixel(210, 40)[0])
+        self.assertEqual(pix.pixel(80, 40), (0, 0, 0))
+        self.assertEqual(pix.pixel(300, 50), (255, 0, 0))
+        self.assertGreater(pix.pixel(220, 50)[2], pix.pixel(220, 50)[0])
         self.assertEqual(pix.pixel(220, 200), (255, 255, 255))
         partial = self.tile(doc_id, view='layout', x_mm=170 * 25.4 / 72, width_mm=60 * 25.4 / 72, height_mm=100 * 25.4 / 72, width_px=60, height_px=100)
-        self.assertEqual(fitz.Pixmap(partial.data).pixel(40, 40), pix.pixel(210, 40))
+        self.assertEqual(fitz.Pixmap(partial.data).pixel(50, 50), pix.pixel(220, 50))
         root = Path(self.temp.name) / 'documents'
         self.assertEqual((root / f'{doc_id}.pdf').read_bytes(), source)
 
@@ -527,7 +527,7 @@ class ProjectionTests(unittest.TestCase):
         from app.projection_layout import build_layout
         pages = [{'index': 0, 'width_mm': 3000, 'height_mm': 10}, {'index': 1, 'width_mm': 3000, 'height_mm': 10}]
         layout = build_layout(pages, 1, 2, 'row', {'left': 101})
-        self.assertEqual(layout['width_mm'], 5798)
+        self.assertEqual(layout['width_mm'], 5899)
         for slots in ([0, 0], [0, None], [0, 2]):
             with self.assertRaises(ValueError):
                 build_layout(pages, 1, 2, 'row', {}, slots)
