@@ -5,8 +5,8 @@ from pathlib import Path
 
 
 def inspect(source):
-    from .services.pdf_to_plt import (MAX_PDF_PAGES, load_fitz, open_pdf_document,
-                                     read_pdf_layout_metadata_from_document, validate_pdf_complexity)
+    from .projection_pdf_runtime import (MAX_PDF_PAGES, load_fitz, open_pdf_document,
+                                         read_pdf_layout_metadata_from_document, validate_pdf_complexity)
     from .projection import PT_PER_MM
     fitz = load_fitz()
     with open_pdf_document(source, fitz) as document:
@@ -22,13 +22,15 @@ def inspect(source):
             if any(not math.isfinite(v) or v <= 0 for v in dimensions):
                 raise ValueError(f'第 {index+1} 页 PDF 页面尺寸无效')
             pages.append({'index':index,'width_mm':dimensions[0],'height_mm':dimensions[1]})
+        from .projection_page_filter import detect_page_filter
+        page_filter = detect_page_filter(document)
         try:
             embedded = read_pdf_layout_metadata_from_document(document)
         except (ValueError, TypeError, OverflowError):
             embedded = None
     return {'pages':pages,'page_count':len(pages),'width_mm':pages[0]['width_mm'],
             'height_mm':pages[0]['height_mm'],'requires_metadata_choice':bool(embedded),
-            'embedded_layout':embedded}
+            'embedded_layout':embedded,'page_filter':page_filter}
 
 
 def execute(spec):
@@ -61,7 +63,7 @@ def execute(spec):
         elif spec['operation'] == 'analysis':
             from .projection_layout import analyze_source
             p = spec['parameters']
-            result = analyze_source(source, p['mode'], p.get('embedded'))
+            result = analyze_source(source, p['mode'], p.get('embedded'), p.get('included_page_indexes'))
         else:
             raise ValueError('unknown projection operation')
         output.write_bytes(result if isinstance(result, bytes) else json.dumps(result, allow_nan=False).encode())

@@ -27,6 +27,8 @@ FIELDS = ('OWNER_MAX_DOCUMENTS OWNER_SOURCE_BYTES GLOBAL_DISK_BYTES FREE_FLOOR_B
           'GLOBAL_RENDERERS GLOBAL_PARSERS PARSE_WALL_SECONDS TILE_WALL_SECONDS '
           'CHILD_CPU_SECONDS CHILD_MEMORY_BYTES').split()
 
+_UNSET_ANALYSIS = object()
+
 class ProjectionRejected(Exception):
     def __init__(self, code, message, status=429, retry_after=1):
         super().__init__(message)
@@ -643,13 +645,17 @@ class Store:
                            analysis_replacement=(expected_analysis_id,analysis))
 
     def update(self, document, owner, meta, generation, invalidate=False, analysis_guard=None,
-               analysis_replacement=None):
+               analysis_replacement=None, expected_analysis_id=_UNSET_ANALYSIS):
         new=self.metadata_path(document,secrets.token_hex(8));old=None
         try:
             with self.transaction() as db:
                 row = self._load(db, document, owner)
                 if row is None or row['generation'] != generation:
                     return False
+                if expected_analysis_id is not _UNSET_ANALYSIS:
+                    latest_analysis = self.read_metadata(row).get('analysis') or {}
+                    if latest_analysis.get('analysis_id') != expected_analysis_id:
+                        return False
                 if analysis_replacement is not None:
                     expected_analysis_id,analysis=analysis_replacement
                     latest=self.read_metadata(row)

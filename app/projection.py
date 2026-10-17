@@ -10,7 +10,7 @@ import unicodedata
 from .billing import BillingRejected, identify_user
 from .projection_proxy import upload_rate_limit_ip
 from .projection_store import MAX_BODY, MAX_SOURCE, ProjectionRejected
-from .services.pdf_to_plt import load_fitz
+from .projection_pdf_runtime import load_fitz
 
 projection_bp = Blueprint('projection', __name__, url_prefix='/api/v1/pdf/projection')
 TTL_SECONDS = 3600
@@ -119,6 +119,7 @@ def upload_document():
         return jsonify({key:meta[key] for key in ('filename','page_count','pages','width_mm','height_mm','requires_metadata_choice')} |
                        {'document_id':document_id,'expires_in':TTL_SECONDS,'rotation_supported':True,
                         'session_summary_supported':True,'source_format':source_format,
+                        'page_filter':meta.get('page_filter'),
                         **({'rendering_warnings':meta.get('rendering_warnings',[])} if is_plt else {})}),201
     finally:
         for stream in streams:
@@ -364,6 +365,8 @@ def render_rotated_tile(source, values, page_index=0, layout=None):
                 world_top = min(point[1] for point in corners)
                 world_bottom = max(point[1] for point in corners)
                 for placement in placements:
+                    crop_left = placement.get('source_x_mm',crop['left']) * PT_PER_MM
+                    crop_top = placement.get('source_y_mm',crop['top']) * PT_PER_MM
                     left, top = placement['x_mm'] * PT_PER_MM, placement['y_mm'] * PT_PER_MM
                     right = left + placement['width_mm'] * PT_PER_MM
                     bottom = top + placement['height_mm'] * PT_PER_MM
@@ -441,7 +444,8 @@ def render_tile(source, values, page_index=0, layout=None):
             if x >= right or y >= bottom or x + width <= left or y + height <= top:
                 continue
             page = document[placement['page_index']]
-            crop_left, crop_top = crop['left'] * PT_PER_MM, crop['top'] * PT_PER_MM
+            crop_left = placement.get('source_x_mm',crop['left']) * PT_PER_MM
+            crop_top = placement.get('source_y_mm',crop['top']) * PT_PER_MM
             clip = fitz.Rect(crop_left + max(x, left) - left,
                              crop_top + max(y, top) - top,
                              crop_left + min(x + width, right) - left,
@@ -476,12 +480,13 @@ def render_tile(source, values, page_index=0, layout=None):
 
 @projection_bp.get('/documents/<document_id>')
 def session_summary(document_id):
-    from .projection_layout import public_layout
+    from .projection_layout import public_layout, analysis_response
     owner = identify_user(request.headers.get('Authorization'))
     meta = owned(document_id,owner)
     return jsonify(source_format=meta.get('source_format','pdf'),
                    **({'rendering_warnings':meta.get('rendering_warnings',[])} if meta.get('source_format') == 'plt' else {}),
                    document_id=document_id,pages=meta['pages'],page_count=meta['page_count'],
+                   page_filter=meta.get('page_filter'),analysis=analysis_response(meta.get('analysis') or {}),
                    layout=public_layout(meta['layout']) if meta.get('layout') else None,
                    rotation_supported=True,session_summary_supported=True,
                    expires_in=max(0,math.ceil(meta['expires_at']-time.time())))
@@ -557,9 +562,11 @@ def layout_analysis(document_id):
         return jsonify(refresh_analysis_failure(store(),document_id,owner,meta))
     try:
         mode = resolve_metadata_mode(meta,request.form.get('metadata_mode'))
+        from .projection_page_filter import normalize_selection
+        indexes = normalize_selection(request.form.get('included_page_indexes'),meta['page_count'])
     except ValueError as error:
         return jsonify(error=str(error)),422
-    result = submit_analysis(store(),document_id,owner,meta,mode)
+    result = submit_analysis(store(),document_id,owner,meta,mode,indexes)
     return jsonify(result),202 if result['status'] == 'analyzing' else 200
 
 
@@ -568,11 +575,20 @@ def apply_layout(document_id):
     from .projection_layout import build_layout, public_layout
     owner = identify_user(request.headers.get('Authorization'))
     meta = owned(document_id,owner)
+    from .projection_page_filter import normalize_selection, selection_details
+    try:
+        indexes = normalize_selection(request.form.get('included_page_indexes'),meta['page_count'])
+    except ValueError as error:
+        return jsonify(error=str(error)),400
+    if meta.get('source_format') == 'plt' and indexes != list(range(meta['page_count'])):
+        return jsonify(error='PLT 投影保留完整图形'),400
     method = request.form.get('method')
     if method == 'auto':
         analysis = meta.get('analysis') or {}
         if analysis.get('status') != 'ready' or not request.form.get('analysis_id') or request.form['analysis_id'] != analysis.get('analysis_id'):
             return jsonify(error='排版建议已变化或尚未就绪，请重新分析'),409
+        if indexes != normalize_selection(analysis.get('included_page_indexes'),meta['page_count']):
+            return jsonify(error='参与拼版页已变化，请重新分析'),409
         options = analysis.get('suggestion') or {}
         if options.get('confidence') not in ('medium','high'):
             return jsonify(error='没有可靠排版建议，原分页保留'),409
@@ -584,14 +600,17 @@ def apply_layout(document_id):
         return jsonify(error='排版方式只支持 auto 或 manual'),400
     try:
         layout = build_layout(meta['pages'],options.get('rows'),options.get('columns'),options.get('order'),
-                              options.get('crop_margins_mm') or {},options.get('page_slots'),options.get('source') or method)
+                              options.get('crop_margins_mm') or {},options.get('page_slots'),options.get('source') or method,indexes,options.get('source_rects_mm'))
+        layout.update(selection_details(meta,indexes))
     except ValueError as error:
         return jsonify(error=str(error)),400
+    expected_analysis_id = (meta.get('analysis') or {}).get('analysis_id')
     meta['layout'] = layout
     prior_analysis = None
     if method == 'manual':
         prior_analysis = meta.pop('analysis',None)
-    if not store().update(document_id,owner,meta,meta['_generation'],invalidate=True):
+    if not store().update(document_id,owner,meta,meta['_generation'],invalidate=True,
+                          expected_analysis_id=expected_analysis_id):
         raise ProjectionRejected('projection_result_stale','投影排版或会话已变化，请重试',409,0)
     # The manual layout replaced any pending analysis, and the update above
     # invalidated the document generation. Only now is it safe to retire the
