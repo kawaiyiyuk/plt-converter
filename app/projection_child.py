@@ -5,8 +5,8 @@ from pathlib import Path
 
 
 def inspect(source):
-    from .services.pdf_to_plt import (MAX_PDF_PAGES, load_fitz, open_pdf_document,
-                                     read_pdf_layout_metadata_from_document, validate_pdf_complexity)
+    from .projection_pdf_runtime import (MAX_PDF_PAGES, load_fitz, open_pdf_document,
+                                         read_pdf_layout_metadata_from_document, validate_pdf_complexity)
     from .projection import PT_PER_MM
     fitz = load_fitz()
     with open_pdf_document(source, fitz) as document:

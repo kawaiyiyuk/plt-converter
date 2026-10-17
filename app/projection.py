@@ -10,7 +10,7 @@ import unicodedata
 from .billing import BillingRejected, identify_user
 from .projection_proxy import upload_rate_limit_ip
 from .projection_store import MAX_BODY, MAX_SOURCE, ProjectionRejected
-from .services.pdf_to_plt import load_fitz
+from .projection_pdf_runtime import load_fitz
 
 projection_bp = Blueprint('projection', __name__, url_prefix='/api/v1/pdf/projection')
 TTL_SECONDS = 3600

@@ -1,7 +1,7 @@
 """Projection-only numbered sheet candidates, verified by vector seam evidence."""
 import math
 import re
-from .services import pdf_layout_optimizer as engine
+from .projection_pdf_runtime import engine
 
 
 def _style(drawing):

@@ -6,7 +6,7 @@ import json
 
 
 def normalize_selection(value, page_count):
-    from .services.pdf_layout_optimizer import normalize_pdf_page_indexes
+    from .projection_pdf_runtime import engine
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -14,7 +14,7 @@ def normalize_selection(value, page_count):
                 raise ValueError('invalid page list')
         except (ValueError, TypeError) as error:
             raise ValueError('included_page_indexes 必须是 JSON 页码列表') from error
-    return normalize_pdf_page_indexes(value, page_count)
+    return engine.normalize_pdf_page_indexes(value, page_count)
 
 
 def selection_details(meta, indexes):
@@ -76,7 +76,7 @@ def _has_visible_vector_content(page, fitz):
 
 
 def detect_page_filter(document):
-    from .services.pdf_to_plt import load_fitz
+    from .projection_pdf_runtime import load_fitz
     fitz = load_fitz()
     count=len(document)
     excluded=[]

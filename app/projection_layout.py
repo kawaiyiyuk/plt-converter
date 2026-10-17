@@ -19,8 +19,7 @@ from flask import current_app, has_app_context
 from redis import Redis
 from redis.exceptions import RedisError
 from .projection_store import FIELDS, Policy, Store, ProjectionRejected
-from .services.pdf_layout_optimizer import optimize_pdf_layout
-from .services.pdf_to_plt import load_fitz
+from .projection_pdf_runtime import optimize_pdf_layout, load_fitz
 from .projection_page_filter import normalize_selection, selection_details
 
 QUEUE_NAME = 'pdf-projection-layout'
