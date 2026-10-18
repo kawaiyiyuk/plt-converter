@@ -26,6 +26,8 @@ def _public_child_error(operation, payload):
     # without the flag) is replaced by a fixed Chinese message.
     if payload.get('public') is True:
         return str(payload.get('error') or '')[:500]
+    if operation == 'scene':
+        return '本地投影素材准备失败，请重试或更换文件'
     if operation == 'analysis':
         return '排版分析失败，请重试或手动排版'
     if operation == 'plt':
@@ -80,7 +82,7 @@ def run(store, lease, operation, source, parameters=None, deadline=None):
             'parameters': parameters or {}, 'parent': os.getpid(),
             'module_root':str(Path(__file__).absolute().parent.parent),
             'limits': {'memory': policy.child_memory_bytes, 'cpu': policy.child_cpu_seconds,
-                       'file': max(META_BOUND, PNG_BOUND, policy.derived_max_bytes if operation == 'plt' else 0)}}
+                       'file': max(META_BOUND, PNG_BOUND, policy.derived_max_bytes if operation in ('plt','scene') else 0)}}
     specification = folder / 'request.json'
     serialized = json.dumps(spec, allow_nan=False).encode()
     if len(serialized) > META_BOUND:
@@ -111,7 +113,7 @@ def run(store, lease, operation, source, parameters=None, deadline=None):
         if error_file.exists():
             error = json.loads(error_file.read_bytes()[:65536])
             logger.warning('projection child %s failed: %s', operation, error.get('error'))
-            raise ProjectionRejected('projection_invalid_plt' if operation == 'plt' else 'projection_invalid_pdf',
+            raise ProjectionRejected('projection_scene_unsupported' if operation == 'scene' else ('projection_invalid_plt' if operation == 'plt' else 'projection_invalid_pdf'),
                                      _public_child_error(operation, error), 400)
         if process.returncode != 0 or not output.is_file():
             raise ProjectionRejected('projection_child_failed', '投影处理进程失败或资源不足，请重试，原画面保留', 503)

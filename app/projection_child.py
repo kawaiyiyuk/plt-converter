@@ -56,6 +56,13 @@ def execute(spec):
                 __import__('os').fsync(file.fileno())
             result = inspect(pdf)
             result.update(source_format='plt', rendering_warnings=document.get('warnings', []))
+        elif spec['operation'] == 'scene':
+            from .projection_scene import export_scene_bundle
+            p=spec['parameters']
+            bundle_result=export_scene_bundle(source,p['layout'],output.parent/'scene.zip',p['derived_max_bytes'])
+            # Assets/tree belong inside the bounded ZIP, never the small
+            # metadata JSON supervisor channel.
+            result={key:bundle_result[key] for key in ('sha256','bytes','unpacked_bytes','source_sha256')}
         elif spec['operation'] == 'tile':
             from .projection import render_tile
             p = spec['parameters']

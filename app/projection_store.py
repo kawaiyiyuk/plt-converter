@@ -115,7 +115,10 @@ def reserved_budget(db):
     return db.execute('SELECT COALESCE(SUM(budget),0) FROM leases').fetchone()[0]
 
 
-class Store:
+from .projection_scene_store import SceneStoreMixin
+
+
+class Store(SceneStoreMixin):
     def __init__(self, root, policy):
         self.root, self.policy = Path(root), policy
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -140,6 +143,8 @@ class Store:
             for table, column in (('sessions', 'derived_bytes'), ('leases', 'derived_budget')):
                 if column not in {row['name'] for row in db.execute('PRAGMA table_info(' + table + ')')}:
                     db.execute('ALTER TABLE ' + table + ' ADD COLUMN ' + column + ' INTEGER NOT NULL DEFAULT 0')
+        with self.transaction() as db:
+            self.initialize_scenes(db)
         self.reconcile()
 
     @contextmanager
@@ -162,7 +167,8 @@ class Store:
 
     def _expire(self, db):
         db.execute("UPDATE sessions SET state='deleted',generation=generation+1 WHERE state='active' AND expires<=?", (time.time(),))
-        for row in db.execute("SELECT id,meta FROM sessions WHERE state='deleted' AND NOT EXISTS(SELECT 1 FROM leases WHERE document=sessions.id)").fetchall():
+        self.expire_scenes(db)
+        for row in db.execute("SELECT id,meta FROM sessions WHERE state='deleted' AND NOT EXISTS(SELECT 1 FROM leases WHERE document=sessions.id) AND NOT EXISTS(SELECT 1 FROM scene_bundles WHERE document=sessions.id)").fetchall():
             path = self.source_path(row['id'])
             try:
                 path.unlink(missing_ok=True)
@@ -197,8 +203,8 @@ class Store:
                     key='system'
                 elif relative[0].startswith('state.sqlite3') and len(relative)==1:
                     key='system'
-                elif relative[0]=='documents' and len(relative)==2 and path.stem in sessions:
-                    key='session:'+path.stem
+                elif relative[0]=='documents' and len(relative)==2 and relative[1].split('.',1)[0] in sessions:
+                    key='session:'+relative[1].split('.',1)[0]
                 elif relative[0]=='metadata' and len(relative)==2 and relative[1].split('.',1)[0] in sessions:
                     key='session:'+relative[1].split('.',1)[0]
                 elif relative[0] in ('staging','operations') and len(relative)>=2 and relative[1] in leases:
@@ -291,8 +297,8 @@ class Store:
                 if session['generation'] != generation:
                     raise ProjectionRejected('projection_result_stale', '投影会话已变化，请重新加载最新画面', 409, 0)
                 if kind == 'tile':
-                    global_count = db.execute("SELECT COUNT(*) FROM leases WHERE kind='tile'").fetchone()[0]
-                    owner_count = db.execute("SELECT COUNT(*) FROM leases WHERE kind='tile' AND owner=?", (owner,)).fetchone()[0]
+                    global_count = db.execute("SELECT COUNT(*) FROM leases WHERE kind IN ('tile','scene','scene-download')").fetchone()[0]
+                    owner_count = db.execute("SELECT COUNT(*) FROM leases WHERE kind IN ('tile','scene','scene-download') AND owner=?", (owner,)).fetchone()[0]
                     if global_count >= policy.global_renderers or owner_count >= policy.owner_renderers:
                         raise ProjectionRejected('projection_renderer_busy', '投影渲染繁忙，正在等待最新画面')
                 budget = policy.operation_bytes
@@ -689,6 +695,7 @@ class Store:
                 self._write_metadata(new,clean)
                 db.execute('UPDATE sessions SET meta=?,generation=generation+? WHERE id=?',
                            (new.name,int(invalidate),document))
+                if invalidate:self.expire_scenes(db)
         except BaseException:
             new.unlink(missing_ok=True)
             raise
@@ -731,6 +738,9 @@ class Store:
             for path in (self.root/'documents').glob('*.pdf'):
                 if path.stem not in expected:
                     path.unlink(missing_ok=True)
+            scene_files={self.scene_path(r['document'],r['revision']).name for r in db.execute('SELECT document,revision FROM scene_bundles WHERE revision IS NOT NULL')}
+            for path in (self.root/'documents').glob('*.zip'):
+                if path.name not in scene_files and re.fullmatch(r'[0-9a-f]{64}\.[0-9a-f]{64}\.zip',path.name):path.unlink(missing_ok=True)
             # A reserve->claim race can leave a fully-named lease directory that
             # never got its ledger row (or lost it); those leftovers would be
             # charged to the disk budget forever. Remove only 64-hex directories

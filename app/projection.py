@@ -697,3 +697,95 @@ def apply_layout(document_id):
             # generation; release is a no-op for it and reclaims an idle lease.
             store().release(lease)
     return jsonify(layout=public_layout(layout),width_mm=layout['width_mm'],height_mm=layout['height_mm'])
+
+
+@projection_bp.post('/documents/<document_id>/scene')
+def prepare_scene(document_id):
+    from .projection_runtime import run
+    from .projection_layout import build_layout
+    owner=identify_user(request.headers.get('Authorization'))
+    ledger=store()
+    ledger.reconcile()
+    meta=owned(document_id,owner)
+    view=request.form.get('view')
+    if view is None:
+        if meta.get('layout'):view='layout'
+        elif meta['page_count']==1:view='page'
+        else:raise ProjectionRejected('projection_scene_layout_required','请先完成拼版后准备本地投影素材',409,0)
+    if view not in ('page','layout'):
+        return jsonify(error='显示方式只支持 page 或 layout'),400
+    if view=='layout':
+        if request.form.get('page_index') not in (None,''):
+            return jsonify(error='拼版素材不能指定原页页码'),400
+        layout=meta.get('layout')
+        if layout is None:
+            raise ProjectionRejected('projection_scene_layout_required','尚未应用拼版，请先完成拼版',409,0)
+        variant='layout'
+    else:
+        try:
+            page_index=int(request.form.get('page_index','0'))
+            if not 0<=page_index<meta['page_count']:raise ValueError()
+        except (TypeError,ValueError):
+            return jsonify(error='原页页码必须是有效整数'),400
+        # Explicit page mode preserves the full original page, including any
+        # cover that is excluded from the normal final-layout placements.
+        page=meta['pages'][page_index]
+        layout={'width_mm':page['width_mm'],'height_mm':page['height_mm'],
+                'crop_margins_mm':dict(left=0,right=0,top=0,bottom=0),
+                'placements':[{'page_index':page_index,'x_mm':0,'y_mm':0,
+                               'width_mm':page['width_mm'],'height_mm':page['height_mm']}]}
+        variant='page:'+str(page_index)
+    generation=meta['_generation']
+    scene,leader=ledger.scene_begin(document_id,owner,generation,variant)
+    if leader:
+        lease=scene['lease']
+        try:
+            result=run(ledger,lease,'scene',ledger.source_path(document_id),
+                       {'layout':layout,'derived_max_bytes':ledger.policy.derived_max_bytes})
+            ledger.scene_publish(document_id,owner,generation,variant,lease,meta,layout,result)
+        except BaseException:
+            ledger.scene_failed(document_id,generation,variant,lease)
+            raise
+        finally:
+            ledger.release(lease)
+    else:
+        # Only in-flight coalescing: no owner/token result is ever cached. The
+        # next HTTP request always revalidates Authorization before this point.
+        ends=time.monotonic()+ledger.policy.parse_wall_seconds+1
+        while scene['state']=='pending':
+            if time.monotonic()>=ends:
+                raise ProjectionRejected('projection_scene_busy','本地投影素材仍在准备，请稍后重试',503,1)
+            time.sleep(0.05)
+            scene=ledger.scene_snapshot(document_id,owner,generation,variant)
+    scene=ledger.scene_snapshot(document_id,owner,generation,variant)
+    return jsonify(ledger.scene_descriptor(document_id,owner,scene))
+
+
+@projection_bp.get('/documents/<document_id>/scene/<revision>/bundle')
+def download_scene_bundle(document_id,revision):
+    owner=identify_user(request.headers.get('Authorization'))
+    if not ID_PATTERN.fullmatch(document_id) or not ID_PATTERN.fullmatch(revision):
+        raise ProjectionRejected('projection_not_found','投影文件不存在或已过期',404,0)
+    ledger=store()
+    file,lease,bundle=ledger.scene_open(document_id,owner,revision)
+    closed=False
+    def close():
+        nonlocal closed
+        if not closed:
+            closed=True
+            file.close()
+            ledger.scene_close(lease)
+    def chunks():
+        try:
+            while ledger.valid_lease(lease):
+                data=file.read(64*1024)
+                if not data:break
+                yield data
+        finally:
+            close()
+    response=Response(chunks(),mimetype='application/zip')
+    response.content_length=bundle['bytes']
+    response.headers['Content-Disposition']='attachment; filename="scene.zip"'
+    response.headers['X-Content-Type-Options']='nosniff'
+    response.call_on_close(close)
+    return response
