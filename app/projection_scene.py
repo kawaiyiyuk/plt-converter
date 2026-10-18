@@ -28,6 +28,16 @@ XLINK_NS='http://www.w3.org/1999/xlink'
 class SceneUnsupported(ValueError):
     """Input would lose fidelity with the supported scene contract."""
 
+def _load_pymupdf():
+    """Load both supported package names without hiding broken native imports."""
+    try:
+        import pymupdf
+    except ModuleNotFoundError as error:
+        if error.name != 'pymupdf':
+            raise
+        import fitz as pymupdf
+    return pymupdf
+
 def finite(value, context='number'):
     try: out=float(value)
     except (TypeError,ValueError) as e: raise SceneUnsupported(f'{context}: invalid number {value!r}') from e
@@ -199,7 +209,7 @@ class SvgScene:
         if rule not in ['nonzero','evenodd']:raise SceneUnsupported('clipPath: unsupported winding')
         return [dict(path=self.path_id(child),transform=transform(ca.get('transform')),fillRule=rule)]
     def image(self,a,build_levels=True,sampling_override=None):
-        import pymupdf
+        pymupdf=_load_pymupdf()
         href=a.get('href','');match=re.fullmatch(r'data:image/png;base64,([A-Za-z0-9+/=\s]+)',href)
         if not match:raise SceneUnsupported('image: only source-embedded PNG accepted')
         try:
@@ -240,10 +250,10 @@ class SvgScene:
         self.image_sources[id(result)]=(result,pix,w,h)
         return result
     def attach_levels(self,result,pix,w,h,interpolate):
-        import pymupdf
+        pymupdf=_load_pymupdf()
         working=pymupdf.Pixmap(pix,pix.alpha);levels=[];factor=1
         while working.width>1 or working.height>1:
-            factor*=2;working=pymupdf.Pixmap(pix,math.ceil(pix.width/factor),math.ceil(pix.height/factor))
+            factor*=2;working=pymupdf.Pixmap(pix,math.ceil(pix.width/factor),math.ceil(pix.height/factor),None)
             data=working.tobytes('png')
             level=self.image(dict(href='data:image/png;base64,'+base64.b64encode(data).decode('ascii'),width=str(w),height=str(h),preserveAspectRatio='none'),False,True)
             level=self.bound_image_level(level,w,h)
@@ -262,7 +272,7 @@ class SvgScene:
     def combined_mask_levels(self,group):
         # Image soft masks must be filtered jointly in premultiplied space.
         # Filtering unassociated RGB and alpha independently creates halos.
-        import pymupdf
+        pymupdf=_load_pymupdf()
         if group['mask']['type']!='luminance' or len(group['children'])!=1:return
         rgb=self.one_image_source(group['children'][0]);mask=self.one_image_source(group['mask']['tree'])
         if rgb is None or mask is None:return
@@ -273,7 +283,7 @@ class SvgScene:
             rgba[4*i]=round(colors[3*i]*a/255);rgba[4*i+1]=round(colors[3*i+1]*a/255);rgba[4*i+2]=round(colors[3*i+2]*a/255);rgba[4*i+3]=a
         original=pymupdf.Pixmap(pymupdf.csRGB,pix.width,pix.height,bytes(rgba),True);working=original;levels=[];factor=1
         while working.width>1 or working.height>1:
-            factor*=2;working=pymupdf.Pixmap(original,math.ceil(pix.width/factor),math.ceil(pix.height/factor));pixels=working.samples;count=working.width*working.height;rgbbytes=bytearray(count*3);abytes=bytearray(count)
+            factor*=2;working=pymupdf.Pixmap(original,math.ceil(pix.width/factor),math.ceil(pix.height/factor),None);pixels=working.samples;count=working.width*working.height;rgbbytes=bytearray(count*3);abytes=bytearray(count)
             for i in range(count):
                 a=pixels[4*i+3];abytes[i]=a
                 if a:
@@ -373,7 +383,7 @@ def path_signature(commands,frame):
     return json.dumps(transformed,separators=(',',':'))
 
 def source_path_signature(path,ctm):
-    import pymupdf
+    pymupdf=_load_pymupdf()
     m=pymupdf.mupdf
     Walker=getattr(source_path_signature,'_walker_type',None)
     if Walker is None:
@@ -439,7 +449,7 @@ def inspect_scene_semantics(page):
     Unused PDF resources are not a reason to reject a page. This device runs the
     source display operations and deliberately never renders pixels.
     """
-    import pymupdf
+    pymupdf=_load_pymupdf()
     m=pymupdf.mupdf
     class Probe(m.FzDevice2):
         def __init__(self):
@@ -519,7 +529,7 @@ def inspect_scene_semantics(page):
 
 def export_scene(source,layout):
     """Serialize only pages placed by the already-decided existing layout."""
-    import pymupdf
+    pymupdf=_load_pymupdf()
     if not isinstance(source,bytes):raise TypeError('source must be original PDF bytes')
     for key in ['width_mm','height_mm','placements','crop_margins_mm']:
         if key not in layout:raise SceneUnsupported(f'layout: missing {key}')

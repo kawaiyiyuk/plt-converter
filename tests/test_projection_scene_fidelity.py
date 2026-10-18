@@ -262,6 +262,54 @@ def canvas_fixtures(directory):
   with pymupdf.open(stream=source,filetype='pdf') as document:document[0].get_pixmap(matrix=pymupdf.Matrix(3,3)).save(str(directory/(name+'-reference.png')))
  print(json.dumps(dict(directory=str(directory),cases=list(sources))))
 
+
+class DependencyCompatibility(unittest.TestCase):
+ def test_fitz_only_installation_exports_real_bundle(self):
+  import builtins,fitz
+  from unittest.mock import patch
+  source,_=image_pdf()
+  real_import=builtins.__import__
+  def legacy_import(name,*args,**kwargs):
+   if name=='pymupdf':raise ModuleNotFoundError("No module named 'pymupdf'",name='pymupdf')
+   return real_import(name,*args,**kwargs)
+  with tempfile.TemporaryDirectory() as directory,patch('builtins.__import__',side_effect=legacy_import):
+   target=Path(directory)/'scene.zip'
+   result=export_scene_bundle(source,layout(),target,64*1024**2)
+   self.assertGreater(result['bytes'],0)
+   with zipfile.ZipFile(target) as archive:
+    scene=json.loads(archive.read('scene.json'))
+    self.assertTrue(scene['assets']);self.assertIn('0',scene['pages'])
+ def test_legacy_pixmap_scaling_signature_preserves_rgb_and_alpha_levels(self):
+  import sys,types
+  from unittest.mock import patch
+  # The real module stays intact: only imports by the exporter see the proxy.
+  # Old 1.24 bindings require the explicit fourth clipping argument.
+  class LegacyModule(types.ModuleType):
+   def __getattr__(self,name):return getattr(pymupdf,name)
+  legacy=LegacyModule('pymupdf');scaled=[]
+  def pixmap(*args,**kwargs):
+   if len(args)>=3 and isinstance(args[0],pymupdf.Pixmap) and isinstance(args[1],(int,float)) and isinstance(args[2],(int,float)):
+    if len(args)!=4:raise ValueError('legacy Pixmap scaling requires four arguments')
+    self.assertIsNone(args[3]);scaled.append(bool(args[0].alpha))
+   return pymupdf.Pixmap(*args,**kwargs)
+  legacy.Pixmap=pixmap
+  source,_=image_pdf()
+  with patch.dict(sys.modules,{'pymupdf':legacy}):scene=export_scene(source,layout())
+  self.assertTrue(scene['assets'])
+  # The source's separate RGB/mask pyramids and combined RGBA pyramid execute.
+  self.assertIn(False,scaled);self.assertIn(True,scaled)
+  self.assertTrue(any(n.get('imageLevels') for n in nodes(scene['pages']['0']['tree'])))
+ def test_internal_dependency_import_failure_is_not_hidden_by_fitz(self):
+  import builtins
+  from unittest.mock import patch
+  real_import=builtins.__import__
+  def broken_import(name,*args,**kwargs):
+   if name=='pymupdf':raise ModuleNotFoundError('broken native binding',name='pymupdf._mupdf')
+   return real_import(name,*args,**kwargs)
+  with patch('builtins.__import__',side_effect=broken_import):
+   with self.assertRaises(ModuleNotFoundError) as error:export_scene(hairline_pdf(),layout())
+  self.assertEqual(error.exception.name,'pymupdf._mupdf')
+
 if __name__=='__main__':
  import sys
  if len(sys.argv)==3 and sys.argv[1]=='--canvas-fixtures':canvas_fixtures(sys.argv[2])
