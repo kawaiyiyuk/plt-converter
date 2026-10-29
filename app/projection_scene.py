@@ -38,6 +38,21 @@ def _load_pymupdf():
         import fitz as pymupdf
     return pymupdf
 
+_INVERT_BYTES=bytes(range(255,-1,-1))
+
+def _jpeg_has_adobe_marker(data):
+    """Scan JPEG marker segments before SOS for the Adobe APP14 transform."""
+    pos=2
+    while pos+4<=len(data):
+        if data[pos]!=0xff:return False
+        marker=data[pos+1]
+        if marker in (0xd9,0xda):return False
+        if marker==0x01 or 0xd0<=marker<=0xd8:pos+=2;continue
+        length=struct.unpack('>H',data[pos+2:pos+4])[0]
+        if marker==0xee and data[pos+4:pos+9]==b'Adobe':return True
+        pos+=2+length
+    return False
+
 def finite(value, context='number'):
     try: out=float(value)
     except (TypeError,ValueError) as e: raise SceneUnsupported(f'{context}: invalid number {value!r}') from e
@@ -210,14 +225,25 @@ class SvgScene:
         return [dict(path=self.path_id(child),transform=transform(ca.get('transform')),fillRule=rule)]
     def image(self,a,build_levels=True,sampling_override=None):
         pymupdf=_load_pymupdf()
-        href=a.get('href','');match=re.fullmatch(r'data:image/png;base64,([A-Za-z0-9+/=\s]+)',href)
-        if not match:raise SceneUnsupported('image: only source-embedded PNG accepted')
+        href=a.get('href','');match=re.fullmatch(r'data:image/(png|jpe?g);base64,([A-Za-z0-9+/=\s]+)',href)
+        if not match:raise SceneUnsupported('image: only source-embedded PNG or JPEG accepted')
+        png=match[1].lower()=='png'
         try:
-            data=base64.b64decode(re.sub(r'\s','',match[1]),validate=True)
-            if data[:8]!=b'\x89PNG\r\n\x1a\n' or data[12:16]!=b'IHDR':raise ValueError('PNG header')
-            width,height=struct.unpack('>II',data[16:24]);pix=pymupdf.Pixmap(data)
-            if (pix.width,pix.height)!=(width,height):raise ValueError('PNG dimensions')
-        except Exception as e:raise SceneUnsupported('image: invalid embedded PNG') from e
+            data=base64.b64decode(re.sub(r'\s','',match[2]),validate=True)
+            if png:
+                if data[:8]!=b'\x89PNG\r\n\x1a\n' or data[12:16]!=b'IHDR':raise ValueError('PNG header')
+                width,height=struct.unpack('>II',data[16:24]);pix=pymupdf.Pixmap(data)
+                if (pix.width,pix.height)!=(width,height):raise ValueError('PNG dimensions')
+            else:
+                if data[:2]!=b'\xff\xd8':raise ValueError('JPEG header')
+                pix=pymupdf.Pixmap(data)
+                # Adobe APP14 CMYK JPEGs store inverted ink samples; undo before RGB.
+                if pix.n-pix.alpha==4 and _jpeg_has_adobe_marker(data):pix=pymupdf.Pixmap(pymupdf.csCMYK,pix.width,pix.height,bytes(pix.samples).translate(_INVERT_BYTES),False)
+                # MuPDF emits JPEG source bytes verbatim; JPEG has no alpha, so
+                # CMYK and other non-RGB/grayscale spaces must be converted.
+                if not pix.alpha and (pix.colorspace is None or pix.colorspace.n not in (1,3)):pix=pymupdf.Pixmap(pymupdf.csRGB,pix)
+                data=pix.tobytes('png');width,height=pix.width,pix.height
+        except Exception as e:raise SceneUnsupported('image: invalid embedded PNG' if png else 'image: invalid embedded JPEG') from e
         key=hashlib.sha256(data).hexdigest()
         w,h=finite(a.get('width')),finite(a.get('height'))
         if w<=0 or h<=0:raise SceneUnsupported('image: invalid dimensions')
