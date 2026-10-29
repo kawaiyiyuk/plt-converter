@@ -23,14 +23,15 @@ def decode_plt(source):
 
 
 def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
-              max_chord_error_mm=None):
+              max_chord_error_mm=None, projection=False):
+    projection_semantics = strict or projection
     # Opt-in projection rules must not change the formal converter's parser.
     if not math.isfinite(float(units_per_inch)) or float(units_per_inch) <= 0:
         raise ValueError('PLT 单位必须为正有限数值')
     if max_chord_error_mm is not None and (not math.isfinite(max_chord_error_mm) or max_chord_error_mm <= 0):
         raise ValueError('PLT 圆弧精度必须为正有限数值')
     text = decode_plt(source) if isinstance(source, (bytes, bytearray)) else str(source or '')
-    if strict and '\x00' in text:
+    if projection_semantics and '\x00' in text:
         raise ValueError('PLT 含无效空字符，无法保证投影图形完整')
     text = text.replace('\x00', '')
     index = 0
@@ -50,13 +51,20 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
     maximum_points = max(1000, int(os.getenv('PLT_MAX_POINTS', '500000')))
     maximum_shapes = max(100, int(os.getenv('PLT_MAX_PATHS', '100000')))
     maximum_text_chars = max(1000, int(os.getenv('PLT_MAX_TEXT_CHARS', '100000')))
-    if strict:
+    if projection_semantics:
         maximum_commands = min(maximum_commands, 250000)
         maximum_points = min(maximum_points, 500000)
         maximum_shapes = min(maximum_shapes, 100000)
         maximum_text_chars = min(maximum_text_chars, 100000)
     text_char_count = 0
     warnings = []
+    ignored_commands = set()
+    ignored_command_count = 0
+
+    def warn(message):
+        if message not in warnings:
+            warnings.append(message)
+
 
     def create_shape(shape):
         nonlocal next_shape_id
@@ -91,12 +99,12 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             }
         else:
             point = {'x': x, 'y': y}
-        if strict and not all(math.isfinite(value) for value in point.values()):
+        if projection_semantics and not all(math.isfinite(value) for value in point.values()):
             raise ValueError('PLT 累计坐标超出有限数值范围')
         current_position = point
-        if strict:
+        if projection_semantics:
             label_carriage_return = dict(point)
-        if pen_down and (not strict or current_pen != 0):
+        if pen_down and (not projection_semantics or current_pen != 0):
             if not stroke:
                 stroke.append(start)
             stroke.append(point)
@@ -108,12 +116,12 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         if point_count > maximum_points:
             raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
         start = dict(current_position)
-        if strict and not all(math.isfinite(value) for value in point.values()):
+        if projection_semantics and not all(math.isfinite(value) for value in point.values()):
             raise ValueError('PLT 累计坐标超出有限数值范围')
         current_position = point
-        if strict:
+        if projection_semantics:
             label_carriage_return = dict(point)
-        if pen_down and (not strict or current_pen != 0):
+        if pen_down and (not projection_semantics or current_pen != 0):
             if not stroke:
                 stroke.append(start)
             stroke.append(point)
@@ -124,9 +132,13 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             current_position['x'] - center['x'],
             current_position['y'] - center['y'],
         )
+        if projection and not strict and (not math.isfinite(radius) or not math.isfinite(angle_degrees)):
+            raise ValueError('HPGL 圆弧半径或角度超出有限数值范围')
         if radius <= 0 or not math.isfinite(radius) or not math.isfinite(angle_degrees):
             if strict:
                 raise ValueError('HPGL 圆弧半径或角度无效')
+            if projection:
+                warn('已忽略无法绘制的 PLT 圆弧参数，内容可能不完整')
             return
         start_angle = math.atan2(
             current_position['y'] - center['y'],
@@ -135,7 +147,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         chord_angle = max(abs(float(chord_angle_degrees or 5)), 0.1)
         if max_chord_error_mm is not None:
             chord_angle = min(chord_angle, math.degrees(chord_step_angle(radius, units_per_inch, max_chord_error_mm)))
-        if strict and (abs(angle_degrees) / 360 > maximum_points or
+        if projection_semantics and (abs(angle_degrees) / 360 > maximum_points or
                        chord_angle < abs(angle_degrees) / maximum_points):
             raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
         steps = max(1, math.ceil(abs(angle_degrees) / chord_angle))
@@ -210,7 +222,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                 warnings.append(warning)
 
     while index < len(text):
-        if text[index] in '\n\r\t ,' or (strict and text[index] == ';'):
+        if text[index] in '\n\r\t ,' or (projection_semantics and text[index] == ';'):
             index += 1
             continue
 
@@ -219,6 +231,8 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         if len(command) != 2 or not command.isalpha():
             if strict:
                 raise ValueError('PLT 命令格式无效，无法保证投影图形完整')
+            if projection:
+                warn('已跳过无法识别的 PLT 命令片段，内容可能不完整')
             index += 1
             continue
         command_count += 1
@@ -226,7 +240,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             raise ValueError(f'PLT 命令数量过多，最多支持 {maximum_commands} 条')
 
         if command == 'LB':
-            if strict:
+            if projection_semantics:
                 flush_stroke()
             text_start = index
             while index < len(text) and text[index] not in '\x03;':
@@ -236,7 +250,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                 text_char_count += len(label)
                 if text_char_count > maximum_text_chars:
                     raise ValueError(f'PLT 文本内容过多，最多支持 {maximum_text_chars} 个字符')
-                if strict:
+                if projection_semantics:
                     add_projection_label(label)
                 else:
                     shapes.append(create_shape({
@@ -267,6 +281,14 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                     raise ValueError(f'HPGL 命令 {command} 参数格式无效')
                 if not math.isfinite(float(token)):
                     raise ValueError(f'HPGL 命令 {command} 坐标必须有限')
+        if projection and not strict:
+            for token in iter_number_tokens(argument_text):
+                try:
+                    valid_number = math.isfinite(float(token))
+                except ValueError:
+                    valid_number = False
+                if not valid_number:
+                    warn('已忽略无法解析或非有限的 PLT 参数，内容可能不完整')
         remaining_values = max((maximum_points - point_count) * 2, 0)
         value_limit = remaining_values if command in {'PA', 'PR', 'PU', 'PD'} else 10000
         numbers = parse_numbers(argument_text, maximum_values=value_limit)
@@ -278,6 +300,22 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                 raise ValueError(f'HPGL 命令 {command} 参数数量无效')
             if command == 'SP' and numbers and (not numbers[0].is_integer() or numbers[0] < 0):
                 raise ValueError('HPGL 命令 SP 画笔编号必须为非负整数')
+
+        if projection and not strict:
+            supported = {'IN', 'SP', 'PA', 'PR', 'PU', 'PD', 'CI', 'AA', 'AR', 'PW', 'VS'}
+            if command not in supported:
+                # At most 16 command names are retained; never retain source arguments.
+                if command not in ignored_commands and len(ignored_commands) < 16:
+                    ignored_commands.add(command)
+                ignored_command_count += 1
+                continue
+            if command in {'PA', 'PR', 'PU', 'PD'} and len(numbers) % 2:
+                warn('已忽略 PLT 坐标末尾未配对的参数，内容可能不完整')
+            lengths = {'IN': {0}, 'SP': {0, 1}, 'CI': {1, 2}, 'AA': {3, 4}, 'AR': {3, 4}, 'PW': {0, 1, 2}, 'VS': {0, 1, 2}}
+            if command in lengths and len(numbers) not in lengths[command]:
+                warn('PLT 参数数量不完整或多余，已按兼容方式处理')
+            if command == 'CI' and numbers and numbers[0] <= 0:
+                warn('已忽略无法绘制的 PLT 圆参数，内容可能不完整')
 
         if command == 'IN':
             flush_stroke()
@@ -292,17 +330,17 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             flush_stroke()
             # HPGL SP without a parameter stores the pen, just like SP0.
             # Preserve the formal converter's historical default outside strict.
-            current_pen = int(numbers[0]) if numbers else (0 if strict else 1)
+            current_pen = int(numbers[0]) if numbers else (0 if projection_semantics else 1)
             current_line_width = pen_widths.get(current_pen)
         elif command == 'PA':
             mode = 'absolute'
             add_coordinate_pairs(numbers, add_point)
-            if strict:
+            if projection_semantics:
                 label_carriage_return = dict(current_position)
         elif command == 'PR':
             mode = 'relative'
             add_coordinate_pairs(numbers, add_point)
-            if strict:
+            if projection_semantics:
                 label_carriage_return = dict(current_position)
         elif command == 'PU':
             flush_stroke()
@@ -313,7 +351,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             add_coordinate_pairs(numbers, add_point)
         elif command == 'CI':
             flush_stroke()
-            if strict and current_pen == 0:
+            if projection_semantics and current_pen == 0:
                 continue
             radius = numbers[0] if numbers else 0
             if strict and radius <= 0:
@@ -347,7 +385,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                 'y': current_position['y'] + numbers[1],
             }, numbers[2], numbers[3] if len(numbers) > 3 else 5)
         elif command == 'VS':
-            if strict and '已忽略绘图速度 VS，投影使用统一黑线' not in warnings:
+            if projection_semantics and '已忽略绘图速度 VS，投影使用统一黑线' not in warnings:
                 warnings.append('已忽略绘图速度 VS，投影使用统一黑线')
         elif command == 'PW':
             if numbers and numbers[0] >= 0:
@@ -357,17 +395,20 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                     current_line_width = numbers[0]
 
     flush_stroke()
+    if ignored_command_count:
+        names = '、'.join(sorted(ignored_commands))
+        warn(f'已跳过未支持的 HPGL 命令（最多列16种）：{names}；共{ignored_command_count}条，图形可能缺失或尺寸不正确')
     if not shapes:
         raise ValueError('没有解析到有效的 PLT 矢量内容')
     metrics = measure_document(shapes, units_per_inch)
     # A path split (SP/PU/IN) repeats its start in the rendered shape. Include
     # those starts in the strict output cap as well as incoming coordinates.
-    if strict and metrics['point_count'] > maximum_points:
+    if projection_semantics and metrics['point_count'] > maximum_points:
         raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
     return {
         'shapes': shapes,
         'metrics': metrics,
-        **({'warnings': warnings} if strict else {}),
+        **({'warnings': warnings} if projection_semantics else {}),
     }
 
 

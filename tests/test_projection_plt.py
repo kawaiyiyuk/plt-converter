@@ -64,15 +64,15 @@ class ProjectionPltTests(unittest.TestCase):
                         self.assertIn('hello', document[0].get_text())
                         self.assertTrue(any('8 Tf' in document.xref_stream(x).decode() for x in document[0].get_contents()))
 
-    def test_unknown_geometric_commands_rejected_without_leaks(self):
+    def test_unknown_commands_are_lenient_but_strict_api_still_rejects(self):
+        from app.services.plt_parser import parse_plt
         for command in ('SC0,100,0,100', 'IP0,0,4000,4000', 'ZZ1', 'RO90', 'AA1,2'):
-            response = self.upload(('IN;PU0,0;PD4000,4000;' + command + ';').encode(), 'bad.plt')
-            self.assertEqual(response.status_code, 400, response.get_json())
-            self.assertIn(command[:2], response.get_json()['error'])
-            self.assertFalse(list((self.ledger.root / 'staging').iterdir()))
-            self.assertFalse(list((self.ledger.root / 'documents').iterdir()))
-            with self.ledger.transaction() as db:
-                self.assertEqual(db.execute('SELECT COUNT(*) FROM leases').fetchone()[0], 0)
+            source = ('IN;PU0,0;PD4000,4000;' + command + ';').encode()
+            with self.assertRaises(ValueError):
+                parse_plt(source, strict=True)
+            response = self.upload(source, 'compatible.plt')
+            self.assertEqual(response.status_code, 201, response.get_json())
+            self.assertTrue(response.get_json()['rendering_warnings'])
 
     def test_plt_skips_layout_analysis(self):
         body = self.upload(b'IN;PU0,0;PD4000,4000;', 'pattern.plt').get_json()
@@ -196,13 +196,21 @@ class ProjectionPltTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '500000'):
                 parse_plt('IN;PU1e12,0;PD;AA0,0,360;', strict=True, max_chord_error_mm=0.05)
 
-    def test_safe_ignored_command_warns_and_malformed_numbers_reject(self):
+    def test_safe_ignored_command_and_malformed_parameter_tolerance(self):
+        from app.services.plt_parser import parse_plt
         response = self.upload(b'IN;VS10;PD100,100;', 'x.plt')
         self.assertEqual(response.status_code, 201)
         self.assertIn('VS', response.get_json()['rendering_warnings'][0])
         for argument in ('1e,1', '1,inf', '1e999,1', '1,2,3', '1e,1e,500,600',
                          'inf,inf,500,600', '1e999,1e999,500,600', '1.2.3,4.5.6,500,600'):
-            response = self.upload(('IN;PD' + argument + ';').encode(), 'x.plt')
+            source = ('IN;PU0,0;PD400,200;PD' + argument + ';').encode()
+            with self.assertRaises(ValueError):
+                parse_plt(source, strict=True)
+            response = self.upload(source, 'x.plt')
+            self.assertEqual(response.status_code, 201, response.get_json())
+            self.assertTrue(response.get_json()['rendering_warnings'])
+        for source in (b'IN;PD1e,1;', b'IN;PDinf,inf;'):
+            response = self.upload(source, 'empty.plt')
             self.assertEqual(response.status_code, 400, response.get_json())
         self.assert_empty()
 
@@ -247,11 +255,12 @@ class ProjectionPltTests(unittest.TestCase):
 
     def test_strict_rejects_compound_numeric_tokens_without_dropping_coordinates(self):
         source = b'IN;PU0,0;PD100-200,300-400,500,600;'
+        from app.services.plt_parser import parse_plt
+        with self.assertRaisesRegex(ValueError, '参数格式无效'):
+            parse_plt(source, strict=True)
         response = self.upload(source, 'compound.plt')
-        self.assertEqual(response.status_code, 400, response.get_json())
-        self.assertIn('PD', response.get_json()['error'])
-        self.assertIn('参数格式无效', response.get_json()['error'])
-        self.assert_empty()
+        self.assertEqual(response.status_code, 201, response.get_json())
+        self.assertTrue(response.get_json()['rendering_warnings'])
 
     def test_legacy_compound_numeric_token_behavior_is_unchanged(self):
         from app.services.plt_parser import parse_plt
