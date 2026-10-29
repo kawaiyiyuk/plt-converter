@@ -43,7 +43,7 @@ def execute(spec):
             from .services.plt_parser import parse_plt
             from .services.pdf_renderer import render_projection_pdf
             # Leave headroom under 0.05mm for the PDF writer's 0.001pt rounding.
-            document = parse_plt(source, strict=True, max_chord_error_mm=0.049)
+            document = parse_plt(source, projection=True, max_chord_error_mm=0.049)
             pdf = render_projection_pdf(document)
             maximum = spec['parameters']['derived_max_bytes']
             if len(pdf) > maximum:
