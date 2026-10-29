@@ -239,6 +239,55 @@ def _page0_pattern_evidence(page, fitz, samples, drawing_count=None, edge_eviden
     return segments>=4 and len(edges)>=2
 
 
+def _leading_raster_cover_pages(document, fitz, group, sizes, dominant, excluded):
+    """Leading differently-sized raster pages before a vector body are covers."""
+    covered={item['index'] for item in excluded}
+    result=[]
+    for i in range(3):
+        if i>=len(document):
+            break
+        if i in covered:
+            if i==0:
+                continue
+            break
+        w,h=sizes[i]
+        if abs(w-sizes[group[0]][0])<=.5 and abs(h-sizes[group[0]][1])<=.5:
+            break
+        if w*h<=dominant*.1:
+            break
+        p=document[i]
+        area=p.rect.get_area()
+        images=p.get_image_info()
+        image_area=max(((fitz.Rect(im['bbox']) * p.rotation_matrix & p.rect).get_area() for im in images),default=0)
+        if image_area<area*.2:
+            break
+        evidence=_page0_evidence_drawings(p,fitz)
+        drawing_count=_visible_drawing_count(p,fitz,evidence)
+        if drawing_count>=3:
+            break
+        segments,edges=_edge_cut_edges(p,fitz,evidence)
+        if segments>=4 and len(edges)>=2:
+            break
+        samples=[]
+        for j in group:
+            if j<=i:
+                continue
+            body=document[j]
+            if body.get_image_info():
+                continue
+            c=_visible_drawing_count(body,fitz)
+            if c>=3:
+                samples.append(c)
+                if len(samples)>=3:
+                    break
+        if len(samples)<3:
+            break
+        if _page0_pattern_evidence(p,fitz,samples,drawing_count,(segments,edges)):
+            break
+        result.append(i)
+    return result
+
+
 def detect_page_filter(document):
     from .projection_pdf_runtime import load_fitz
     fitz = load_fitz()
@@ -300,6 +349,8 @@ def detect_page_filter(document):
                         bins.add((r//16,g//16,b//16))
                 if colored_count>=pix.width*pix.height*.1 and len(bins)>=128:
                     excluded.append({'index':0,'reason':'cover','label':'封面'})
+        for i in _leading_raster_cover_pages(document,fitz,group,sizes,dominant,excluded):
+            excluded.append({'index':i,'reason':'cover','label':'封面'})
     excluded.sort(key=lambda item:item['index'])
     omitted={item['index'] for item in excluded}
     return {'version':1,'included_page_indexes':[i for i in range(count) if i not in omitted],
