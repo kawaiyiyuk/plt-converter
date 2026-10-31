@@ -27,6 +27,17 @@ def inspect_pdf(source, preview_folder, preview_id):
         if document.page_count == 0:
             raise ValueError('PDF 没有可用页面')
         validate_pdf_complexity(document)
+        # Imported here: the projection image packages this module without
+        # pdf_cover_filter (see Dockerfile.projection) and never builds previews.
+        from .pdf_cover_filter import detect_leading_cover_pages
+        try:
+            cover_pages = set(detect_leading_cover_pages(document, fitz))
+        except Exception:
+            # Cover hints are advisory; a detection failure must not block the preview.
+            cover_pages = set()
+        # The crop editor opens on the first participating page, so it also
+        # needs the high-resolution preview when leading covers are excluded.
+        editor_indexes = {0, min(set(range(document.page_count)) - cover_pages, default=0)}
         pages = []
         for index in range(document.page_count):
             page = document.load_page(index)
@@ -42,7 +53,9 @@ def inspect_pdf(source, preview_folder, preview_id):
                 'height_mm': rect.height * 25.4 / 72,
                 'preview_name': preview_path.name,
             }
-            if index == 0:
+            if index in cover_pages:
+                page_result['suggested_exclusion'] = 'cover'
+            if index in editor_indexes:
                 editor_scale = min(2, EDITOR_PREVIEW_WIDTH_PX / max(rect.width, 1))
                 editor_pixmap = page.get_pixmap(
                     matrix=fitz.Matrix(editor_scale, editor_scale),

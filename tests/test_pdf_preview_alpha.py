@@ -92,7 +92,7 @@ class PdfPreviewAlphaTest(unittest.TestCase):
                 response = client.get('/api/v1/pdf/preview/jobs/old-job')
                 self.assertEqual(response.status_code, 200)
                 url = response.get_json()['pages'][0]['preview_path']
-                self.assertIn('v=4-transparent-thumbnails', url)
+                self.assertIn('v=5-cover-suggestion', url)
                 allowed = client.get(url)
                 self.assertEqual(allowed.status_code, 200)
                 png = fitz.Pixmap(allowed.data)
@@ -112,4 +112,4 @@ class PdfPreviewAlphaTest(unittest.TestCase):
                     current.close()
 
     def test_opaque_preview_cache_version_is_retired(self):
-        self.assertEqual(JOB_OUTPUT_VERSIONS['pdf_preview'], '4-transparent-thumbnails')
+        self.assertEqual(JOB_OUTPUT_VERSIONS['pdf_preview'], '5-cover-suggestion')
