@@ -1,5 +1,8 @@
 """One-click PDF repagination through the existing PDF->PLT->PDF pipeline."""
 
+import logging
+
+from .pdf_cover_filter import detect_leading_cover_pages
 from .pdf_layout_optimizer import optimize_pdf_layout
 from .pdf_renderer import render_pdf
 from .pdf_to_plt import MAX_PDF_PAGES, convert_pdf_to_plt, load_fitz, open_pdf_document
@@ -8,6 +11,8 @@ from .plt_parser import parse_plt
 
 SUPPORTED_PAPER_SIZES = {'A0', 'A1', 'A2', 'A3', 'A4'}
 SINGLE_PAGE_PAPER_SIZE = 'SINGLE'
+
+logger = logging.getLogger(__name__)
 
 
 def pdf_page_count(source):
@@ -22,6 +27,22 @@ def pdf_page_count(source):
         if page_count > MAX_PDF_PAGES:
             raise ValueError(f'PDF 页数过多，最多支持 {MAX_PDF_PAGES} 页')
         return page_count
+    finally:
+        document.close()
+
+
+def _skipped_cover_page_indexes(source):
+    """Best-effort leading cover detection; real PDF errors surface in analysis."""
+    fitz = load_fitz()
+    try:
+        document = open_pdf_document(source, fitz)
+    except Exception:
+        return []
+    try:
+        return detect_leading_cover_pages(document, fitz)
+    except Exception as error:
+        logger.warning('leading cover detection failed: %r', error)
+        return []
     finally:
         document.close()
 
@@ -44,7 +65,17 @@ def automatic_layout_suggestion(source, source_page_count=None, metadata_mode=No
             'output_rotation': 0,
             'source': 'single_page',
         }
-    suggestion = optimize_pdf_layout(source, metadata_mode=metadata_mode)
+    skipped_page_indexes = _skipped_cover_page_indexes(source)
+    page_indexes = (
+        [index for index in range(page_count) if index not in skipped_page_indexes]
+        if skipped_page_indexes else None
+    )
+    suggestion = optimize_pdf_layout(
+        source,
+        metadata_mode=metadata_mode,
+        page_indexes=page_indexes,
+    )
+    suggestion['skipped_page_indexes'] = skipped_page_indexes
     if suggestion.get('confidence') not in {'high', 'medium'}:
         reason = suggestion.get('reason') or '接缝证据不足'
         raise ValueError(
@@ -117,6 +148,7 @@ def convert_pdf_to_pdf(source, options=None):
         'target_layout': target_layout,
         'layout_source': suggestion.get('source'),
         'layout_confidence': suggestion.get('confidence'),
+        'skipped_page_indexes': list(suggestion.get('skipped_page_indexes') or []),
     }
     if target_layout.get('page_width_pt') and target_layout.get('page_height_pt'):
         result['output_width_mm'] = round(target_layout['page_width_pt'] * 25.4 / 72, 2)

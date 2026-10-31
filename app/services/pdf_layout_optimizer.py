@@ -87,7 +87,9 @@ def optimize_pdf_layout(source, metadata_mode=None, page_indexes=None):
         document.close()
 
     if not _uniform_page_sizes(page_sizes):
-        return _insufficient_suggestion('页面尺寸不一致，暂时无法可靠判断接缝')
+        return _insufficient_suggestion(
+            _size_mismatch_reason(page_sizes, selected_indexes)
+        )
     if not any(segments_by_page):
         return _insufficient_suggestion('没有检测到可用于拼接判断的矢量线条')
 
@@ -657,6 +659,35 @@ def _uniform_page_sizes(page_sizes):
         abs(other_width - width) <= 0.5 and abs(other_height - height) <= 0.5
         for other_width, other_height in page_sizes[1:]
     )
+
+
+def _size_mismatch_reason(page_sizes, page_indexes):
+    """Name the pages that differ from the most common size, or keep the generic reason."""
+    default_reason = '页面尺寸不一致，暂时无法可靠判断接缝'
+    clusters = []
+    for index, size in enumerate(page_sizes):
+        for cluster in clusters:
+            width, height = cluster['size']
+            if abs(size[0] - width) <= 0.5 and abs(size[1] - height) <= 0.5:
+                cluster['indexes'].append(index)
+                break
+        else:
+            clusters.append({'size': size, 'indexes': [index]})
+    if not clusters:
+        return default_reason
+    majority = max(clusters, key=lambda cluster: len(cluster['indexes']))
+    if sum(1 for cluster in clusters
+           if len(cluster['indexes']) == len(majority['indexes'])) > 1:
+        return default_reason
+    majority_width, majority_height = majority['size']
+    differing = [
+        index for index, (width, height) in enumerate(page_sizes)
+        if abs(width - majority_width) > 0.5 or abs(height - majority_height) > 0.5
+    ]
+    if not differing:
+        return default_reason
+    page_numbers = '、'.join(str(page_indexes[index] + 1) for index in differing)
+    return f'第 {page_numbers} 页尺寸与其他页不同（可能是封面或效果图），请删除这些页后再识别'
 
 
 def _embedded_layout_suggestion(metadata, page_indexes=None):

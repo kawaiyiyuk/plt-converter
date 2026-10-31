@@ -149,7 +149,7 @@ class JobQueueTest(unittest.TestCase):
                                  'user-a', connection=self.redis)
         self.assertNotEqual(replacement['job_id'], first['job_id'])
         self.assertFalse(replacement['deduplicated'])
-        self.assertEqual(replacement['output_version'], '4-transparent-thumbnails')
+        self.assertEqual(replacement['output_version'], '5-cover-suggestion')
 
     def test_pdf_to_plt_metric_pen_width_version_invalidates_old_completed_result(self):
         options = {'units_per_inch': 1016, 'line_width_mm': 1.0}

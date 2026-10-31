@@ -122,6 +122,26 @@ class ProjectionBaseCompatibilityTests(unittest.TestCase):
             self.assertFalse(packaged)
             self.assertEqual(Path(engine.__file__), Path(legacy.__file__))
 
+    def test_private_runtime_imports_with_only_dockerfile_packaged_files(self):
+        """The image copies a fixed file list; module-level imports must stay inside it."""
+        import app.projection_pdf_runtime as runtime
+        candidate = Path(runtime.__file__).parents[1]
+        copy_line = next(line for line in (candidate / 'Dockerfile.projection').read_text().splitlines()
+                         if line.startswith('COPY ') and line.rstrip().endswith('./app/_projection_pdf/'))
+        packaged_files = shlex.split(copy_line)[1:-1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / 'app'
+            (package / '_projection_pdf').mkdir(parents=True)
+            (package / '__init__.py').write_text('')
+            shutil.copy2(runtime.__file__, package / 'projection_pdf_runtime.py')
+            for name in packaged_files:
+                shutil.copy2(candidate / name, package / '_projection_pdf' / Path(name).name)
+            result = subprocess.run([sys.executable, '-c', 'import app.projection_pdf_runtime'],
+                                    cwd=root, capture_output=True, text=True,
+                                    env={**__import__('os').environ, 'PYTHONPATH': str(root)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_image_missing_or_incomplete_private_runtime_never_uses_legacy(self):
         import app.projection_pdf_runtime as runtime
         for incomplete in (False, True):
