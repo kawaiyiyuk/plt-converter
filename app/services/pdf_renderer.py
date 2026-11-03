@@ -733,6 +733,27 @@ def fmt(value):
     return f'{float(value):.3f}'
 
 
+def projection_source_bounds_mm(document):
+    """Map the cropped projection PDF origin back to native PLT/layout mm.
+
+    This is an offset, never a fabric size. Layout PLT uses x right/y negative
+    down; an uninked cloth margin cannot be inferred from an HPGL path bbox.
+    Include the same text ink / degenerate-axis expansion as the PDF renderer.
+    """
+    metrics = document['metrics']
+    display = measure_display_bounds(document)
+    bounds = [display['min_x_pt'], display['min_y_pt'], display['max_x_pt'], display['max_y_pt']]
+    minimum = 0.265 * MM_TO_PT
+    for axis in (0, 1):
+        if bounds[axis+2] - bounds[axis] < minimum:
+            center = (bounds[axis+2] + bounds[axis])/2
+            bounds[axis], bounds[axis+2] = center-minimum/2, center+minimum/2
+    units = metrics['units_per_inch']/25.4
+    return {'x': metrics['min_x']/units + bounds[0]/MM_TO_PT,
+            'y': -(metrics['min_y']/units + bounds[3]/MM_TO_PT),
+            'w': (bounds[2]-bounds[0])/MM_TO_PT, 'h': (bounds[3]-bounds[1])/MM_TO_PT}
+
+
 def render_projection_pdf(document):
     """Projection-only 1:1 single sheet: no print guides or roundtrip metadata."""
     metrics = document['metrics']
