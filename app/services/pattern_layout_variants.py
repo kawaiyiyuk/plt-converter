@@ -3,6 +3,7 @@ import math
 from shapely.geometry import LineString, Polygon
 from shapely import make_valid
 from shapely.ops import unary_union
+from .pattern_layout.closed_loop import PARAMS
 
 
 PARAMETERS={'numeric_epsilon_plotter_units':1e-7,'one_rectangle_per_alternative':True}
@@ -29,13 +30,16 @@ def is_rectangle(polygon,eps):
 
 def add_rectangle_alternatives(result):
     eps=PARAMETERS['numeric_epsilon_plotter_units']/result['source']['units_per_mm']
-    paths={p['id']:p for p in result['paths']};rectangles=[]
+    paths={p['id']:p for p in result['paths']};rectangles=[];ignored_small_rectangles=[]
     for face in result['source_discovery_audit']['atomic_faces']:
         ids=face.get('complete_boundary_source_path_ids',[])
         if not face.get('independent_complete_paths') or not ids:continue
         polygon=Polygon(face['outer'])
         if not polygon.is_valid or polygon.area<=eps*eps:continue
         if not is_rectangle(polygon,eps):continue
+        if polygon.area<PARAMS['min_candidate_area_mm2']:
+            if not any(polygon.equals(r['polygon']) for r in ignored_small_rectangles):ignored_small_rectangles.append({'polygon':polygon,'path_ids':sorted(ids),'face_index':face['face_index']})
+            continue
         source_lines=[LineString(paths[id]['points']) for id in ids]
         if any(line.difference(polygon.boundary).length>eps for line in source_lines):continue
         if polygon.boundary.difference(unary_union(source_lines)).length>eps:continue
@@ -76,7 +80,7 @@ def add_rectangle_alternatives(result):
                            semantic_piece_verified=False)
             variants.append(variant);changes.append({'candidate_id':variant['id'],'original_id':original['id'],'removed_path_ids':rectangle['path_ids'],'removed_fragment_count':len(chosen)})
     result['pieces'].extend(variants)
-    result['rectangle_alternative_audit']={'parameters':PARAMETERS,'originals_modified':False,'variants':changes,'semantic_classification':False}
+    result['rectangle_alternative_audit']={'parameters':PARAMETERS,'originals_modified':False,'variants':changes,'semantic_classification':False,'ignored_small_rectangle_count':len(ignored_small_rectangles)}
     return result
 
 

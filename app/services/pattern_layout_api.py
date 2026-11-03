@@ -60,6 +60,9 @@ def recognize_source(raw, name='source.plt'):
             return [p for part in getattr(geometry,'geoms',()) for p in polygon_components(part)]
         poly=unary_union(polygon_components(repaired))
         if poly.is_empty or poly.area<=eps*eps:continue
+        if poly.area<PARAMS['min_candidate_area_mm2']:
+            result['small_candidate_filter']['ignored_source_contour_count']+=1
+            continue
         contour_issues=[] if original_polygon.is_valid else [{'code':'source_self_intersection_region_ambiguous'}]
         fragments = []
         for source in paths:

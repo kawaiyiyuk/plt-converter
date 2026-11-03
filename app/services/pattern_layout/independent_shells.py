@@ -15,13 +15,15 @@ def shell_of_network(lines,region,eps,delta,area_epsilon):
         if missing<=area_epsilon and outside<=area_epsilon:witness.append({'area_mm2':p.area,'missing_area_mm2':missing,'outside_near_band_area_mm2':outside})
     return {'complete':bool(witness),'valid_shells':witness,'invalid_ring_count':len(invalid.geoms),'missing_area_mm2':region.difference(fill).area}
 def support_refs(poly,paths,eps):
-    refs=[]
+    refs=[];band=poly.boundary.buffer(eps);minx,miny,maxx,maxy=band.bounds
     for source in paths:
         dist=0.
         for si,(a,b) in enumerate(zip(source['points'],source['points'][1:])):
             line=LineString([a,b]);length=line.length
             if length<=eps:continue
-            hit=line.intersection(poly.boundary.buffer(eps))
+            if max(a[0],b[0])<minx or min(a[0],b[0])>maxx or max(a[1],b[1])<miny or min(a[1],b[1])>maxy:
+                dist+=length;continue
+            hit=line.intersection(band)
             for g in getattr(hit,'geoms',[hit]):
                 if g.geom_type!='LineString' or g.length<=eps:continue
                 ts=[line.project(Point(v))/length for v in g.coords];t0=max(0,min(ts));t1=min(1,max(ts))
