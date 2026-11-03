@@ -8,7 +8,7 @@ from .independent_shells import discover,whole_path_owners,support_refs
 from .layout_marker_v5 import classify_layout_markers
 # AI 实验假设：仅扩大疑框边界和近包含关系容差；不证明裁片语义。
 # 原点、完整源环、内线与待核观察记录仍按冻结 V5 逻辑保留。
-PARAMS={'numeric_epsilon_plotter_units':1e-7,'near_containment_outside_mm2':10.,'near_containment_relative':.0002,'frame_body_witness_area_mm2':1000.,'frame_boundary_fraction':.05,'circle_arc_chord_error_mm':.05,'whole_path_near_band_plotter_units':2.,'structural_shell_area_epsilon_mm2':1e-6,'layout_marker_min_span_to_symbol_ratio':20.0,'min_candidate_area_mm2':100.,'near_closed_tolerance_mm':1.}
+PARAMS={'numeric_epsilon_plotter_units':1e-7,'near_containment_outside_mm2':10.,'near_containment_relative':.0002,'frame_body_witness_area_mm2':1000.,'frame_boundary_fraction':.05,'frame_min_envelope_fill':.9,'circle_arc_chord_error_mm':.05,'whole_path_near_band_plotter_units':2.,'structural_shell_area_epsilon_mm2':1e-6,'layout_marker_min_span_to_symbol_ratio':20.0,'min_candidate_area_mm2':100.,'near_closed_tolerance_mm':1.}
 ROOT=Path(__file__).resolve().parents[1]
 def digest(v):return hashlib.sha256(json.dumps(v,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
 def bounds_of_points(pts):

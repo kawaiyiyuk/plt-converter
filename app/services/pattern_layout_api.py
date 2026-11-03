@@ -49,6 +49,7 @@ def recognize_source(raw, name='source.plt'):
     result['experimental_grouping'] = copy.deepcopy({'pieces': result['pieces'], 'auxiliary': result['auxiliary']})
     eps = PARAMS['numeric_epsilon_plotter_units']/units
     alternatives = []
+    alternative_polys = {}
     for path in paths:
         line = LineString(path['points'])
         if len(path['points'])<4 or math.dist(path['points'][0],path['points'][-1])>PARAMS['near_closed_tolerance_mm']:
@@ -80,7 +81,35 @@ def recognize_source(raw, name='source.plt'):
                              'content_complete_for_region': True,
                              'issues': contour_issues+[{'code': 'interior_geometry_may_include_other_real_pieces_or_sizes'},
                                         {'code': 'not_semantic_piece_truth_no_exclusive_owner_assumed'}]})
-    result['pieces'].extend(alternatives)
+        alternative_polys[alternatives[-1]['id']] = poly
+    frame_candidates = []
+    main_frame_ids = set(result['geometry_audit']['frame_path_ids'])
+    for candidate in alternatives:
+        if candidate['source_closed_path_ids'][0] in main_frame_ids:
+            continue
+        poly = alternative_polys[candidate['id']]
+        x0, y0, x1, y1 = poly.bounds
+        if not (m['width_mm'] > 0 and m['height_mm'] > 0):
+            continue
+        if max(x0, m['width_mm'] - x1) > m['width_mm'] * PARAMS['frame_boundary_fraction'] or max(y0, m['height_mm'] - y1) > m['height_mm'] * PARAMS['frame_boundary_fraction']:
+            continue
+        envelope = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+        if envelope.area <= 0 or poly.area / envelope.area < PARAMS['frame_min_envelope_fill']:
+            continue
+        witnesses = [q for q in alternatives if q is not candidate and alternative_polys[q['id']].area >= PARAMS['frame_body_witness_area_mm2'] and alternative_polys[q['id']].area < poly.area and poly.covers(alternative_polys[q['id']].representative_point())]
+        witness_polys = [alternative_polys[q['id']] for q in witnesses]
+        independent = any(not a.covers(b) and not b.covers(a) and a.intersection(b).area <= eps * eps for i, a in enumerate(witness_polys) for b in witness_polys[:i])
+        if independent:
+            frame_candidates.append((candidate, len(witnesses)))
+    for candidate, witness_count in frame_candidates:
+        candidate['status'] = 'suspected_layout_frame'
+        candidate['issues'] = [{'code': 'suspected_layout_frame_contains_other_pieces', 'witness_count': witness_count}] + candidate['issues']
+        result['auxiliary'].append(candidate)
+    moved = {id(candidate) for candidate, _ in frame_candidates}
+    result['pieces'].extend(candidate for candidate in alternatives if id(candidate) not in moved)
+    result['source_contour_frame_audit'] = {'frame_candidate_ids': [candidate['id'] for candidate, _ in frame_candidates],
+                                            'min_envelope_fill': PARAMS['frame_min_envelope_fill'], 'boundary_fraction': PARAMS['frame_boundary_fraction'],
+                                            'witness_area_mm2': PARAMS['frame_body_witness_area_mm2']}
     result.update(schema_version=1, paths=paths,
                   source={'sha256': hashlib.sha256(raw).hexdigest(), 'name': name, 'width_mm': m['width_mm'], 'height_mm': m['height_mm'],
                           'units_per_mm': units, 'raw_bounds': [m['min_x'],m['min_y'],m['max_x'],m['max_y']], 'warnings': parsed['warnings'],
