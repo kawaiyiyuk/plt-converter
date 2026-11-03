@@ -13,6 +13,8 @@ from .pattern_layout.parse_source import parse
 from .pattern_layout.closed_loop import build_geometry, interval_parts, bounds_of_points, PARAMS
 from .pattern_layout.layout_marker_v5 import classify_layout_markers
 
+ENGINE_VERSION='v6b-program-only-experimental-with-source-contour-alternatives'
+
 
 def runtime_version():
     from .pattern_layout_fingerprint import recognition_runtime_version
@@ -77,7 +79,7 @@ def recognize_source(raw, name='source.plt'):
     result.update(schema_version=1, paths=paths,
                   source={'sha256': hashlib.sha256(raw).hexdigest(), 'name': name, 'width_mm': m['width_mm'], 'height_mm': m['height_mm'],
                           'units_per_mm': units, 'raw_bounds': [m['min_x'],m['min_y'],m['max_x'],m['max_y']], 'warnings': parsed['warnings'],
-                          'engine_version': 'v6b-program-only-experimental-with-source-contour-alternatives',
+                          'engine_version': ENGINE_VERSION,
                           'algorithm_parameters': PARAMS, 'semantic_verified': False, 'runtime_version': runtime_version()},
                   non_path_shapes=[s for s in parsed['shapes'] if 'points' not in s])
     for candidate in result['pieces']:

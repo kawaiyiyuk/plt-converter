@@ -38,6 +38,11 @@ def recognition_runtime_version():
     return sha(json.dumps({'schema':'recognition-v2','components':recognition_components(),'implementation':implementation,'environment':environment()},sort_keys=True,separators=(',',':')).encode())
 
 
+def recognition_code_version():
+    implementation=function_components(__file__,{'sha','function_components','recognition_components','recognition_code_version'})
+    return sha(json.dumps({'schema':'recognition-code-v1','components':recognition_components(),'implementation':implementation},sort_keys=True,separators=(',',':')).encode())
+
+
 def export_runtime_version():
     parts=function_components(ROOT/'pattern_layout_api.py',{'export_project','source_paths','source_phase_prefixes','finite','hpgl_decimal','PatternLayoutExportError'})
     for name in ('plt_parser.py','number_tokens.py','pattern_layout/parse_source.py','pattern_layout_verify.py'):

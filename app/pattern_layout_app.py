@@ -5,8 +5,10 @@ all capacity/retention limits; this module defines no implicit user count cap.
 """
 import concurrent.futures
 import fcntl
+import gzip
 import hmac
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -100,9 +102,22 @@ def _execute_locked(folder_string):
     try:
         raw=(folder/'source.plt').read_bytes()
         if meta['kind']=='recognize':
-            result=recognize_source(raw,meta['filename'])
+            client_payload=None
+            if meta.get('origin')=='browser':
+                from .services.pattern_layout_client_result import verify_client_result
+                client_payload=json.loads((folder/'client-result.json').read_bytes())
+                result=verify_client_result(raw,client_payload)
+            else:result=recognize_source(raw,meta['filename'])
             from .services.pattern_layout_resources import write_resources
             output_bytes=write_resources(folder,result,meta['result_budget_bytes'])
+            if client_payload is not None:
+                from .services.pattern_layout_resources import write_archive, write_gzip
+                resources=folder/'resources'
+                used=sum(path.stat().st_size for path in folder.rglob('*') if path.is_file() and path.name not in ('audit.json.gz','archive.zip'))
+                budget={'used':used,'maximum':meta['result_budget_bytes']}
+                write_gzip(resources/'audit.json.gz',client_payload,budget)
+                write_archive(folder,result['source'],budget)
+                output_bytes=budget['used']
             data=None
             archive_digest=hashlib.sha256()
             with (folder/'archive.zip').open('rb') as stream:
@@ -243,17 +258,18 @@ class DiskQueue:
                     with self.lock:
                         shutil.rmtree(folder);self.futures.pop(identifier,None)
 
-    def submit(self,upload,kind,owner,project=None,idempotency_key=None):
+    def submit(self,upload,kind,owner,project=None,idempotency_key=None,payload=None,origin=None):
         # Werkzeug has already spooled large uploads to disk. Determine file
         # length without reading each queued source into Python/RQ memory.
         stream=upload.stream;stream.seek(0,2);size=stream.tell();stream.seek(0)
         project_data=json.dumps(project,ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode() if project is not None else b''
+        payload_data=payload if payload is not None else b''
         digest=hashlib.sha256()
         while chunk:=stream.read(1024*1024):digest.update(chunk)
         stream.seek(0)
-        content_key=hashlib.sha256((kind+':'+digest.hexdigest()).encode()+project_data).hexdigest()
+        content_key=hashlib.sha256((kind+':'+digest.hexdigest()).encode()+project_data+payload_data).hexdigest()
         request_key=hashlib.sha256((idempotency_key or content_key).encode()).hexdigest()
-        reserved=size+len(project_data)+self.result_budget+4096
+        reserved=size+len(project_data)+len(payload_data)+self.result_budget+4096
         with self.lock:
             self.reap();used=0
             for folder in self.root.iterdir():
@@ -277,9 +293,11 @@ class DiskQueue:
             meta={'id':identifier,'status':'queued','kind':kind,'queued_at':time.time(),'filename':Path(upload.filename or 'source.plt').name,
                   'owner_sha256':owner,'request_key':request_key,'content_key':content_key,
                   'reserved_bytes':reserved,'result_budget_bytes':self.result_budget,'retention_seconds':self.retention,'restart_count':0}
+            if origin is not None:meta['origin']=origin
             try:
                 with (folder/'source.plt').open('xb') as target:shutil.copyfileobj(stream,target,1024*1024)
                 if project is not None:(folder/'project.json').write_bytes(project_data)
+                if payload is not None:(folder/'client-result.json').write_bytes(payload_data)
                 _atomic_json(folder/'job.json',meta);future=self._dispatch(identifier)
             except Exception: shutil.rmtree(folder);raise
             return meta,future
@@ -311,6 +329,26 @@ class DiskQueue:
         fcntl.flock(self.process_lock,fcntl.LOCK_UN);self.process_lock.close()
 
 
+MAX_CLIENT_RESULT_GZIP=8*1024*1024
+MAX_CLIENT_RESULT_JSON=64*1024*1024
+
+
+class ClientResultTooLarge(Exception):pass
+
+
+def decompress_client_result(data):
+    output=[];total=0
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(data),mode='rb') as stream:
+            while chunk:=stream.read(1024*1024):
+                total+=len(chunk)
+                if total>MAX_CLIENT_RESULT_JSON:raise ClientResultTooLarge()
+                output.append(chunk)
+    except ClientResultTooLarge:raise
+    except Exception as error:raise ValueError('invalid compressed client result') from error
+    return b''.join(output)
+
+
 def create_app():
     app=Flask(__name__);queue=DiskQueue();app.config['MAX_CONTENT_LENGTH']=queue.max_request
     app.extensions['pattern_layout_queue']=queue
@@ -327,7 +365,7 @@ def create_app():
         key=os.getenv('PATTERN_LAYOUT_SERVICE_KEY','')
         if not key:return jsonify(error=MESSAGES['configuration_required'],error_code='configuration_required'),503
         if not hmac.compare_digest(request.headers.get('Authorization',''),'Bearer '+key):return jsonify(error='private service authentication required'),401
-        if request.path.startswith('/internal/pattern-layout/jobs') or request.path=='/internal/pattern-layout/export':
+        if request.path.startswith('/internal/pattern-layout/jobs') or request.path in ('/internal/pattern-layout/export','/internal/pattern-layout/client-results'):
             if not request.headers.get('X-Pattern-Layout-Owner'):return jsonify(error='internal task owner required'),400
 
     def owner_digest():return hashlib.sha256(request.headers['X-Pattern-Layout-Owner'].encode()).hexdigest()
@@ -338,15 +376,32 @@ def create_app():
 
     @app.get('/internal/pattern-layout/capabilities')
     def capabilities():
-        from .services.pattern_layout_api import runtime_version
-        from .services.pattern_layout_fingerprint import export_runtime_version
-        return jsonify(export_runtime_version=export_runtime_version(),fingerprint_schema=2,schema_version=1,runtime_version=runtime_version(),engine_version='v6b-program-only-experimental-with-source-contour-alternatives',semantic_verified=False,memory_limit_enforcement='linux_rlimit_as' if sys.platform.startswith('linux') else 'unverified_non_linux',hard_cancel=True)
+        from .services.pattern_layout_api import ENGINE_VERSION, runtime_version
+        from .services.pattern_layout_fingerprint import export_runtime_version, recognition_code_version
+        return jsonify(export_runtime_version=export_runtime_version(),fingerprint_schema=2,schema_version=1,runtime_version=runtime_version(),recognition_code_version=recognition_code_version(),client_result_format_version=1,engine_version=ENGINE_VERSION,semantic_verified=False,memory_limit_enforcement='linux_rlimit_as' if sys.platform.startswith('linux') else 'unverified_non_linux',hard_cancel=True)
 
     @app.post('/internal/pattern-layout/jobs')
     def recognize():
         upload=request.files.get('file')
         if upload is None:return jsonify(error='file required'),400
         try:meta,_future=queue.submit(upload,'recognize',owner_digest(),idempotency_key=request.headers.get('X-Idempotency-Key'))
+        except OSError as error:return jsonify(error=MESSAGES['storage_unavailable'],error_code='storage_unavailable',status='storage_unavailable'),503
+        except ValueError as error:return jsonify(error=MESSAGES['idempotency_conflict'],error_code='idempotency_conflict',status='idempotency_conflict'),409
+        return jsonify(id=meta['id'],status=meta['status'],retention_seconds=queue.retention),202
+
+    @app.post('/internal/pattern-layout/client-results')
+    def client_result():
+        upload=request.files.get('file');result_part=request.files.get('result')
+        if upload is None:return jsonify(error='file required'),400
+        if result_part is None:return jsonify(error='result required'),400
+        raw_gzip=result_part.stream.read(MAX_CLIENT_RESULT_GZIP+1)
+        if len(raw_gzip)>MAX_CLIENT_RESULT_GZIP:return jsonify(error=MESSAGES['client_result_too_large'],error_code='client_result_too_large'),413
+        try:payload_bytes=decompress_client_result(raw_gzip)
+        except ClientResultTooLarge:return jsonify(error=MESSAGES['client_result_too_large'],error_code='client_result_too_large'),413
+        except ValueError:return jsonify(error=MESSAGES['client_result_invalid'],error_code='client_result_invalid'),400
+        try:json.loads(payload_bytes)
+        except (ValueError,UnicodeError):return jsonify(error=MESSAGES['client_result_invalid'],error_code='client_result_invalid'),400
+        try:meta,_future=queue.submit(upload,'recognize',owner_digest(),idempotency_key=request.headers.get('X-Idempotency-Key'),payload=payload_bytes,origin='browser')
         except OSError as error:return jsonify(error=MESSAGES['storage_unavailable'],error_code='storage_unavailable',status='storage_unavailable'),503
         except ValueError as error:return jsonify(error=MESSAGES['idempotency_conflict'],error_code='idempotency_conflict',status='idempotency_conflict'),409
         return jsonify(id=meta['id'],status=meta['status'],retention_seconds=queue.retention),202
@@ -410,7 +465,7 @@ def create_app():
                 # Retain only light index/metadata for retry/idempotency.
                 folder=queue.root/identifier
                 shutil.rmtree(folder/'resources',ignore_errors=True)
-                for name in ('source.plt','archive.zip'):(folder/name).unlink(missing_ok=True)
+                for name in ('source.plt','archive.zip','client-result.json'):(folder/name).unlink(missing_ok=True)
                 meta['reserved_bytes']=retained_bytes(folder)
                 _atomic_json(folder/'job.json',meta)
             return jsonify(id=identifier,archive_acknowledged=True)

@@ -18,6 +18,7 @@
 
 - `GET /internal/pattern-layout/capabilities`：schema、实际 runtime_version、实验状态。
 - `POST /internal/pattern-layout/jobs`：multipart `file`，异步识别，202 `{id,status,retention_seconds}`。
+- `POST /internal/pattern-layout/client-results`：multipart `file` + gzip `result`，核验浏览器识别结果后走同一归档流程；契约与边界见下节。
 - `POST /internal/pattern-layout/export`：multipart `file` + `project` 第二文件part（`project.json`, `application/json`, UTF8 JSON），异步导出，同样202。
 - `GET /internal/pattern-layout/jobs/<id>`：JSON 状态 `queued/processing/cancelling/done/failed/cancelled`；识别完成含轻量 `result`；导出完成含 `result_ready:true`。
 - `GET /internal/pattern-layout/jobs/<id>/result`：仅成功导出的 PLT bytes。
@@ -33,6 +34,16 @@
 轻量索引保留全部 pieces/auxiliary id、bounds、状态、issue_codes、fragment_count、resource_id；不随主响应带 fragments/详细审计。`preview_outline` 明确为0.5mm容差的缩略预览（simplified=true/not_for_export=true），精确 outer 仍在单候选资源中。原图路径使用 `segment_style_ids` 引用 `style_table`。单候选每段增加 `preview_phase_mm`，与导出共用原 path 的 LT 代数累计相位，不修改原区间。
 
 指纹已分责：recognition runtime_version 覆盖内核、正式parser及number_tokens、源适配、精确函数源码、分层资源和矩形后处理；export_runtime_version覆盖导出、共享相位/数值函数、源parser和独立验证器。两者均覆盖Shapely/GEOS/CAPI、Python、NumPy、架构和系统。导出独占代码改变不会使识别缓存失效，且测试证明；不同实际运行时不复用旧识别缓存。
+
+## 浏览器识别结果核验与归档
+
+`POST /internal/pattern-layout/client-results` 接收 multipart `file`（原件PLT）与 `result`（gzip 后的浏览器识别结果 JSON），异步任务 kind 仍为 `recognize`，返回、轮询、候选/原图/审计/归档资源、ACK、DELETE 与普通识别任务一致。鉴权与 `X-Pattern-Layout-Owner` 要求同 `POST /internal/pattern-layout/jobs`；`X-Idempotency-Key` 语义不变，未显式提供时 content_key 同时包含原件字节和结果字节，避免同一原件不同识别结果互相复用。
+
+`result` gzip 原始字节上限 8 MiB，解压上限 64 MiB（流式限读；超限 HTTP 413 `client_result_too_large`）。payload 合同 `format=pattern-layout-client-result`、`format_version=1`：`source` 提供原件 sha256/name/path_count/text_count/warnings；`engine` 提供 engine_version、code_version、runtime_version 与 Pyodide/Python/NumPy/Shapely/GEOS runtime；`pieces`/`auxiliary` 的候选只携带 id、status、fragments（`path_id/segment_index/t0/t1`）、outer、可选 issues/parent/variant/loop/source_closed_path_ids/area/excluded_rectangle/content_complete_for_region（布尔）；服务端对浏览器候选一律写 `semantic_piece_verified=false`；`unassigned` 为 count/length_mm。候选总数≤5000、fragments 总数≤500000、单候选 outer≤50000 点，所有数字必须有限。
+
+服务端只做结构核验，不重跑几何识别：核对原件 SHA256、`engine.code_version` 与服务端 `recognition_code_version()`、`engine.engine_version` 与服务端 `ENGINE_VERSION`；用服务端 `source_paths` 复核 path/text 计数与 warnings（逐字逐项）；每个 fragment 必须引用存在的源路径、整数且在范围内的 segment 及 `0<=t0<t1<=1`，a/b/style 由服务端按源重算；outer 必须落在原件毫米范围外扩 1mm 内，bounds 与文字 text_ids 由服务端重算。失败码为 `client_result_invalid`、`source_sha_mismatch`、`engine_code_mismatch`、`parser_mismatch`、`invalid_source_fragment`、`outer_out_of_bounds`，经现有 public_task_error 暴露，不透出内部异常。
+
+核验通过后使用与服务端识别相同的分层资源/archive 产出，`result.source` 标记 `recognition_origin=browser`、`server_verification=structure_only`，并记录客户端 runtime/code_version；audit 资源保留客户端原始 payload（解压后的 JSON）。`GET /internal/pattern-layout/capabilities` 同时提供 `recognition_code_version` 与 `client_result_format_version:1`。该接口只证明提交结果与原件及同批代码在结构上一致，不证明候选由服务端算法产出，也不验证候选裁片语义、问题分级或外轮廓真实性；这些仍需按既有语义边界展示和人工核验。
 
 ## 坐标、导出和未支持边界
 
