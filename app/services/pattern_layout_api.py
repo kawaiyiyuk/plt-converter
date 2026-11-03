@@ -51,7 +51,7 @@ def recognize_source(raw, name='source.plt'):
     alternatives = []
     for path in paths:
         line = LineString(path['points'])
-        if len(path['points'])<4 or path['points'][0]!=path['points'][-1]:
+        if len(path['points'])<4 or math.dist(path['points'][0],path['points'][-1])>PARAMS['near_closed_tolerance_mm']:
             continue
         original_polygon=Polygon(path['points'])
         repaired=make_valid(original_polygon) if not original_polygon.is_valid else original_polygon
@@ -64,6 +64,8 @@ def recognize_source(raw, name='source.plt'):
             result['small_candidate_filter']['ignored_source_contour_count']+=1
             continue
         contour_issues=[] if original_polygon.is_valid else [{'code':'source_self_intersection_region_ambiguous'}]
+        if path['points'][0]!=path['points'][-1]:
+            contour_issues=[{'code':'source_path_not_exactly_closed','gap_mm':math.dist(path['points'][0],path['points'][-1])}]+contour_issues
         fragments = []
         for source in paths:
             for index, (a, b) in enumerate(zip(source['points'], source['points'][1:])):
