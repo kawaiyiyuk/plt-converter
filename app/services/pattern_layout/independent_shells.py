@@ -56,10 +56,11 @@ def discover(paths,original,frame_ids,params,eps):
     root_anchor_ids={id for r in original_roots for id in r['source_ids']}
     net=unary_union(list(available.values()));faces,cuts,dangles,invalid=polygonize_full(net);atomic=[]
     # EPS不变：缓存每条真实原path的buffer，再union；不buffer noded union来决定源支持。
-    path_covers={pid:line.buffer(eps) for pid,line in available.items()};coverage_audit=[]
+    path_covers={pid:line.buffer(eps) for pid,line in available.items()};path_bounds={pid:line.bounds for pid,line in available.items()};path_lengths={pid:line.length for pid,line in available.items()};coverage_audit=[]
     # 这项独立链证书要求所有周边由完整的非借用原path支持；没有面积门槛。
     def complete_path_support(poly,exclude=frozenset()):
-        ids=[id for id,l in available.items() if id not in exclude and l.length>eps and l.difference(poly.boundary.buffer(eps)).length<=eps]
+        band=poly.boundary.buffer(eps);bx0,by0,bx1,by1=band.bounds
+        ids=[id for id,l in available.items() if id not in exclude and path_lengths[id]>eps and path_bounds[id][0]>=bx0-eps and path_bounds[id][1]>=by0-eps and path_bounds[id][2]<=bx1+eps and path_bounds[id][3]<=by1+eps and l.difference(band).length<=eps]
         cover=unary_union([path_covers[id] for id in ids]);missing=poly.boundary.difference(cover).length
         return missing<=eps,ids,missing
     for index,f in enumerate(faces.geoms):
@@ -93,17 +94,21 @@ def discover(paths,original,frame_ids,params,eps):
         if separated:alternatives.append({**r,'kind':'mixed_shell_alternative','reason':'source_composite_shell_not_single_body','proof_level':'composite_not_certified_single_body'})
         else:active.append(r)
     # 每个原子闭面都留账；不能区分的借边小片/假口采用同等级待核，不按面积决定真假。
+    alt_buckets={}
+    for a in alternatives:alt_buckets.setdefault(tuple(a['poly'].bounds),[]).append(a)
     for f in atomic:
-        poly=f['poly']
+        poly=f['poly'];key=tuple(poly.bounds)
         if any(r['poly'].covers(poly) for r in active):continue
-        if any(a['poly'].equals(poly) for a in alternatives):continue
-        alternatives.append({'poly':poly,'source_ids':[],'kind':'source_backed_closed_face_needs_review','id':f'FACE{f["face_index"]:04d}','reason':'source_support_dependency','proof_level':'source_backed_but_independent_ownership_unproved','proofs':[{'kind':'atomic_face_boundary_only','face_index':f['face_index'],'complete_path_boundary':f['independent_complete_paths']}]})
+        if any(a['poly'].equals(poly) for a in alt_buckets.get(key,[])):continue
+        item={'poly':poly,'source_ids':[],'kind':'source_backed_closed_face_needs_review','id':f'FACE{f["face_index"]:04d}','reason':'source_support_dependency','proof_level':'source_backed_but_independent_ownership_unproved','proofs':[{'kind':'atomic_face_boundary_only','face_index':f['face_index'],'complete_path_boundary':f['independent_complete_paths']}]}
+        alternatives.append(item);alt_buckets.setdefault(key,[]).append(item)
     return active,alternatives,{'source_support_coverage_audit':coverage_audit,'source_support_method':'per_original_path_buffer_then_union','source_support_epsilon_mm':eps,'scenario_audit':scenario_audit,'atomic_faces':[{'face_index':f['face_index'],'outer':[list(p) for p in f['poly'].exterior.coords],'area_mm2':f['poly'].area,'independent_complete_paths':f['independent_complete_paths'],'complete_boundary_source_path_ids':f['complete_boundary_source_path_ids']} for f in atomic],'atomic_face_count':len(atomic),'cut_count':len(cuts.geoms),'dangle_count':len(dangles.geoms),'invalid_ring_count':len(invalid.geoms)}
 
 def whole_path_owners(paths,roots,families,loop_byid,units,eps,params):
     lines={p['id']:LineString(p['points']) for p in paths if len(p['points'])>=2};delta=params['whole_path_near_band_plotter_units']/units;owners={};shared=[];audit=[];family_conflicts=[];closed_family_support={};shared_support={};regions={r['id']:r['poly'] for r in roots};family_paths={rid:{pid for lid in lids for pid in loop_byid[lid]['source_ids']} for rid,lids in families.items()};eligibility={}
+    boundary_bands={rid:p.boundary.buffer(eps) for rid,p in regions.items()};near_bands={rid:p.buffer(delta) for rid,p in regions.items()}
     for pid,line in lines.items():
-        common=[rid for rid,p in regions.items() if line.length>eps and line.difference(p.boundary.buffer(eps)).length<=eps]
+        common=[rid for rid,p in regions.items() if line.length>eps and line.difference(boundary_bands[rid]).length<=eps]
         if len(common)>=2:shared.append(pid);shared_support[pid]=set(common);audit.append({'path_id':pid,'state':'protected_whole_boundary_shared','owner_loop_ids':common});continue
         family_candidates=[rid for rid,ids in family_paths.items() if pid in ids]
         whole_original_closed=bool(line.is_valid and line.is_ring and Polygon(line).is_valid)
@@ -111,7 +116,7 @@ def whole_path_owners(paths,roots,families,loop_byid,units,eps,params):
             rid=family_candidates[0];owners[pid]=rid;closed_family_support[pid]=rid;audit.append({'path_id':pid,'state':'unique_original_closed_path_family_owner','owner_loop_id':rid,'family_loop_ids':family_candidates,'whole_original_closed_path':True,'source_closed_subpath_only':False,'inside_existing_whole_path_near_band':line.difference(regions[rid].buffer(delta)).length<=eps,'near_band_plotter_units':params['whole_path_near_band_plotter_units'],'near_band_mm':delta,'rule':'unique original whole closed path family identity; no coordinate/band change'});continue
         if whole_original_closed and len(family_candidates)>1:
             family_conflicts.append(pid);audit.append({'path_id':pid,'state':'original_closed_path_family_conflict','family_loop_ids':sorted(family_candidates),'whole_original_closed_path':True,'automatic_owner_chosen':False});continue
-        candidates=[rid for rid,p in regions.items() if line.length>eps and line.difference(p.buffer(delta)).length<=eps and line.intersection(p).length>eps and not any(pid in refs and foreign!=rid for foreign,refs in family_paths.items())];eligibility[pid]=candidates
+        candidates=[rid for rid,p in regions.items() if line.length>eps and line.difference(near_bands[rid]).length<=eps and line.intersection(p).length>eps and not any(pid in refs and foreign!=rid for foreign,refs in family_paths.items())];eligibility[pid]=candidates
     def external_tail_subloop_proof(pid,region):
         # 只在原开放path内返回原顶点的真实子链上判证；该子链不能兜底保留片外余尾。
         line=lines[pid]

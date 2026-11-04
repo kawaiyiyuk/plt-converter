@@ -59,7 +59,7 @@ def recognize_source(raw, name='source.plt'):
         def polygon_components(geometry):
             if geometry.geom_type=='Polygon':return [geometry]
             return [p for part in getattr(geometry,'geoms',()) for p in polygon_components(part)]
-        poly=unary_union(polygon_components(repaired))
+        poly=unary_union(polygon_components(repaired));poly_bounds=poly.bounds
         if poly.is_empty or poly.area<=eps*eps:continue
         if poly.area<PARAMS['min_candidate_area_mm2']:
             result['small_candidate_filter']['ignored_source_contour_count']+=1
@@ -70,7 +70,7 @@ def recognize_source(raw, name='source.plt'):
         fragments = []
         for source in paths:
             for index, (a, b) in enumerate(zip(source['points'], source['points'][1:])):
-                selected=[(0.,1.)] if source['id']==path['id'] and math.dist(a,b)>eps else interval_parts(a,b,poly,eps)
+                selected=[(0.,1.)] if source['id']==path['id'] and math.dist(a,b)>eps else interval_parts(a,b,poly,eps,poly_bounds)
                 for t0, t1 in selected:
                     fragments.append({'path_id': source['id'], 'segment_index': index, 't0': t0, 't1': t1,
                                       'a': [a[k]+(b[k]-a[k])*t0 for k in (0,1)], 'b': [a[k]+(b[k]-a[k])*t1 for k in (0,1)],

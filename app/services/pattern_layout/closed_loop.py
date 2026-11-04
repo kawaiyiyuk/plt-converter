@@ -19,9 +19,12 @@ def segments(line):
     if line.is_empty:return []
     if line.geom_type in ('LineString','LinearRing'):return [line]
     return [q for g in getattr(line,'geoms',[]) for q in segments(g)]
-def interval_parts(a,b,region,eps):
+def interval_parts(a,b,region,eps,bounds=None):
     line=LineString([a,b]);length=line.length
     if length<=eps:return []
+    if bounds is not None:
+        x0,y0,x1,y1=bounds
+        if max(a[0],b[0])<x0 or min(a[0],b[0])>x1 or max(a[1],b[1])<y0 or min(a[1],b[1])>y1:return []
     result=[]
     for part in segments(line.intersection(region)):
         if part.length<=eps:continue
@@ -91,7 +94,7 @@ def build_geometry(paths,width,height,units):
         p=loop['poly'];fragments=[];issues=[];crossings=[];member_paths={source for lid in member_ids for source in loop_byid[lid]['source_ids']};foreign=[]
         # 内容域覆盖整个近包含家族；仅用原闭环区域并集，不移动点或替换 root 外环。
         # whole_owners、跨片共边及 on_boundary 仍以原 root 为准，扩大内容域不授予外片所有权。
-        content_region=unary_union([loop_byid[lid]['poly'] for lid in sorted(member_ids)])
+        content_region=unary_union([loop_byid[lid]['poly'] for lid in sorted(member_ids)]);content_bounds=content_region.bounds
         added_region=content_region.difference(p)
         contacts=[]
         if not added_region.is_empty:
@@ -108,7 +111,7 @@ def build_geometry(paths,width,height,units):
             for si,(a,b) in enumerate(zip(points,points[1:])):
                 segment=LineString([a,b]);length=segment.length;style=source['segment_styles'][si] if si<len(source['segment_styles']) else None
                 if length<=eps:continue
-                inside=interval_parts(a,b,content_region,eps)
+                inside=interval_parts(a,b,content_region,eps,content_bounds)
                 if sid in frame_ids and status!='suspected_layout_frame':
                     if inside:foreign.append({'path_id':sid,'segment_index':si,'reason':'suspected_frame_kept_separately','inside_intervals':inside})
                     distance+=length;continue
