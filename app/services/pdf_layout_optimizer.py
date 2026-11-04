@@ -206,10 +206,7 @@ def choose_best_layout(
         # A correct grid can score poorly while every blank is still at the end. Refine
         # every legal grid/order before comparing them so internal blank rows or columns
         # are not discarded by the coarse arrangement.
-        optimized = [
-            _optimize_blank_positions(candidate, signatures, page_count, score_cache)
-            for candidate in candidates
-        ]
+        optimized = _optimize_candidates(candidates, signatures, page_count, score_cache)
         candidates = optimized + candidates
 
     best = max(candidates, key=_rank_result)
@@ -424,6 +421,68 @@ def _candidate_grids(page_count, maximum_blank_cells):
                 yield key
 
 
+def _minimum_relevant_total(best_total, page_count):
+    """Lowest seam total that can still win or compete after evidence and rounding slack."""
+    return 0.9 * best_total - 0.01805 * 2 * page_count - 0.0002
+
+
+def _blank_search_upper_bound(candidate, signatures, page_count, score_cache):
+    """Bound every order-preserving blank placement of this grid by its possible neighbours."""
+    rows = candidate['rows']
+    columns = candidate['columns']
+    order = candidate['order']
+    blank_count = rows * columns - page_count
+    if order == 'row':
+        sequence_side = ('right', 'left')
+        cross_side = ('bottom', 'top')
+        span = columns
+    else:
+        sequence_side = ('bottom', 'top')
+        cross_side = ('right', 'left')
+        span = rows
+    total = 0.0
+    for page in range(page_count):
+        # The next page in ascending order is the only possible sequence neighbour.
+        if page + 1 < page_count:
+            score = _seam_score(
+                page, page + 1, sequence_side[0], sequence_side[1],
+                signatures, score_cache,
+            )
+            if score is not None:
+                total += score
+        # Any page skipping the blank run lies within one grid span of the current page.
+        first_possible = max(page + 1, page + span - blank_count)
+        last_possible = min(page_count - 1, page + span)
+        best = 0.0
+        for adjacent in range(first_possible, last_possible + 1):
+            score = _seam_score(
+                page, adjacent, cross_side[0], cross_side[1],
+                signatures, score_cache,
+            )
+            if score is not None and score > best:
+                best = score
+        total += best
+    return total
+
+
+def _optimize_candidates(candidates, signatures, page_count, score_cache):
+    """Run the blank search only for grids that can still win or tie the current best."""
+    best_total = max((_total_score(candidate) for candidate in candidates), default=0.0)
+    optimized = []
+    for candidate in candidates:
+        blank_count = candidate['rows'] * candidate['columns'] - page_count
+        if blank_count > 0 and (
+            _blank_search_upper_bound(candidate, signatures, page_count, score_cache)
+            < _minimum_relevant_total(best_total, page_count)
+        ):
+            optimized.append(candidate)
+            continue
+        result = _optimize_blank_positions(candidate, signatures, page_count, score_cache)
+        optimized.append(result)
+        best_total = max(best_total, _total_score(result))
+    return optimized
+
+
 def _optimize_blank_positions(candidate, signatures, page_count, score_cache=None):
     rows = candidate['rows']
     columns = candidate['columns']
@@ -529,12 +588,13 @@ def _evaluate_layout(rows, columns, order, page_slots, signatures, score_cache=N
     }
 
 
+def _total_score(result):
+    return round(float(result['confidence_score']) * int(result['seam_evidence']), 4)
+
+
 def _rank_result(result):
     blank_count = sum(page is None for page in result['page_slots'])
-    total_score = round(
-        float(result['confidence_score']) * int(result['seam_evidence']),
-        4,
-    )
+    total_score = _total_score(result)
     return (
         total_score,
         result['perfect_seams'],
