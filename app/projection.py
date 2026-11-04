@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 import re
 import time
-from flask import Blueprint, Response, current_app, g, jsonify, request
+from flask import Blueprint, Response, current_app, g, jsonify, request, has_request_context
 import unicodedata
 from .billing import BillingRejected, _json_request as identity_request
 from .projection_proxy import upload_rate_limit_ip
@@ -57,9 +57,14 @@ def identify_user(authorization):
     # cached; the next request revalidates immediately after this flight ends.
     # One process has at most two distinct in-flight identities; overload never
     # waits for a slot or allocates another Future. No lock spans network/wait.
-    if not authorization:
-        return _identify_user(authorization)
-    key = hashlib.sha256(authorization.encode('utf-8')).digest()
+    # Explicit Bearer always takes priority. Never retry an invalid Bearer as
+    # a web layout session; both routes revalidate upstream on every request.
+    layout_token = request.headers.get('X-Layout-Token') if not authorization and has_request_context() else None
+    resolve = (lambda: _identify_layout_user(layout_token)) if layout_token else (lambda: _identify_user(authorization))
+    credential = authorization or ('Layout ' + layout_token if layout_token else '')
+    if not credential:
+        return resolve()
+    key = hashlib.sha256(credential.encode('utf-8')).digest()
     with _identity_flights_lock:
         future = _identity_flights.get(key)
         leader = future is None
@@ -70,7 +75,7 @@ def identify_user(authorization):
     if not leader:
         return future.result()
     try:
-        owner = _identify_user(authorization)
+        owner = resolve()
     except BaseException as error:
         with _identity_flights_lock:
             _identity_flights.pop(key, None)
@@ -83,13 +88,20 @@ def identify_user(authorization):
         return owner
 
 
+def _identify_layout_user(token):
+    return _validate_identity('/api/v1/pattern-layout/identity', {'X-Layout-Token': token}, method='GET')
+
+
 def _identify_user(authorization):
     """Projection identity only: upstream outages never mean document expiry."""
     if not authorization:
         raise BillingRejected('请先登录后再使用投影功能', 401)
+    return _validate_identity('/api/v1/points/conversion/identity', {'Authorization': authorization})
+
+
+def _validate_identity(path, headers, method='POST'):
     try:
-        status, body = identity_request('/api/v1/points/conversion/identity', {},
-                                        {'Authorization': authorization})
+        status, body = identity_request(path, {}, headers, **({'method': method} if method != 'POST' else {}))
         if status in (401, 403):
             raise BillingRejected('登录状态验证失败', status)
         if status != 200 or not isinstance(body, dict):
@@ -190,7 +202,8 @@ def upload_document():
                        {'document_id':document_id,'expires_in':TTL_SECONDS,'rotation_supported':True,
                         'session_summary_supported':True,'source_format':source_format,
                         'page_filter':meta.get('page_filter'),
-                        **({'rendering_warnings':meta.get('rendering_warnings',[])} if is_plt else {})}),201
+                        **({'rendering_warnings':meta.get('rendering_warnings',[])} if is_plt else {}),
+                        **({'source_bounds_mm':meta['source_bounds_mm']} if is_plt and 'source_bounds_mm' in meta else {})}),201
     finally:
         for stream in streams:
             stream.close()
@@ -555,6 +568,7 @@ def session_summary(document_id):
     meta = owned(document_id,owner)
     return jsonify(source_format=meta.get('source_format','pdf'),
                    **({'rendering_warnings':meta.get('rendering_warnings',[])} if meta.get('source_format') == 'plt' else {}),
+                   **({'source_bounds_mm':meta['source_bounds_mm']} if meta.get('source_format') == 'plt' and 'source_bounds_mm' in meta else {}),
                    document_id=document_id,pages=meta['pages'],page_count=meta['page_count'],
                    page_filter=meta.get('page_filter'),analysis=analysis_response(meta.get('analysis') or {}),
                    layout=public_layout(meta['layout']) if meta.get('layout') else None,

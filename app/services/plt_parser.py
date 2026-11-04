@@ -22,8 +22,13 @@ def decode_plt(source):
     return raw.decode('latin1', errors='replace')
 
 
+def curve_approximation_warning(max_chord_error_mm):
+    return (f'圆弧/圆导出使用折线近似，圆弧分段理论弦高不超过{max_chord_error_mm:g}mm；'
+            '不代表投影总误差，需实测。')
+
+
 def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
-              max_chord_error_mm=None, projection=False):
+              max_chord_error_mm=None, projection=False, report_curve_approximation=False):
     projection_semantics = strict or projection
     # Opt-in projection rules must not change the formal converter's parser.
     if not math.isfinite(float(units_per_inch)) or float(units_per_inch) <= 0:
@@ -42,6 +47,9 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
     label_carriage_return = dict(current_position)
     current_line_width = None
     stroke = []
+    stroke_styles = []
+    current_lt_argument = None
+    lt_generation = 0
     shapes = []
     pen_widths = {}
     next_shape_id = 1
@@ -76,15 +84,17 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         return result
 
     def flush_stroke():
-        nonlocal stroke
+        nonlocal stroke, stroke_styles
         if len(stroke) > 1:
             shapes.append(create_shape({
                 'type': 'path',
                 'pen': current_pen,
                 'points': stroke,
+                'source_segment_styles': stroke_styles,
                 'line_width_units': current_line_width,
             }))
         stroke = []
+        stroke_styles = []
 
     def add_point(x, y):
         nonlocal current_position, point_count, label_carriage_return
@@ -108,6 +118,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             if not stroke:
                 stroke.append(start)
             stroke.append(point)
+            stroke_styles.append({'lt_argument': current_lt_argument, 'line_width_units': current_line_width, 'lt_generation': lt_generation})
         return point
 
     def add_absolute_point(point):
@@ -125,6 +136,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             if not stroke:
                 stroke.append(start)
             stroke.append(point)
+            stroke_styles.append({'lt_argument': current_lt_argument, 'line_width_units': current_line_width, 'lt_generation': lt_generation})
         return point
 
     def add_arc(center, angle_degrees, chord_angle_degrees=5):
@@ -153,6 +165,9 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         steps = max(1, math.ceil(abs(angle_degrees) / chord_angle))
         if point_count + steps > maximum_points:
             raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
+        if (report_curve_approximation and max_chord_error_mm is not None
+                and pen_down and (not projection_semantics or current_pen != 0) and angle_degrees != 0):
+            warn(curve_approximation_warning(max_chord_error_mm))
         total_angle = math.radians(angle_degrees)
         for step in range(1, steps + 1):
             theta = start_angle + total_angle * step / steps
@@ -301,6 +316,12 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             if command == 'SP' and numbers and (not numbers[0].is_integer() or numbers[0] < 0):
                 raise ValueError('HPGL 命令 SP 画笔编号必须为非负整数')
 
+        # Capture source style as public metadata without claiming renderer
+        # support: projection keeps its existing LT warning, strict still rejects.
+        if command == 'LT':
+            lt_generation += 1
+            current_lt_argument = argument_text.strip()
+
         if projection and not strict:
             supported = {'IN', 'SP', 'PA', 'PR', 'PU', 'PD', 'CI', 'AA', 'AR', 'PW', 'VS'}
             if command not in supported:
@@ -326,6 +347,8 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             label_carriage_return = dict(current_position)
             current_line_width = None
             pen_widths = {}
+            current_lt_argument = None
+            lt_generation += 1
         elif command == 'SP':
             flush_stroke()
             # HPGL SP without a parameter stores the pen, just like SP0.
@@ -363,11 +386,14 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                 steps = max(4, 4 * math.ceil((2 * math.pi / step_angle) / 4))
                 if point_count + steps + 1 > maximum_points:
                     raise ValueError(f'PLT 坐标点过多，最多支持 {maximum_points} 个')
+                if report_curve_approximation:
+                    warn(curve_approximation_warning(max_chord_error_mm))
                 point_count += steps + 1
                 points = [{'x': current_position['x'] + radius * math.cos(2 * math.pi * i / steps),
                            'y': current_position['y'] + radius * math.sin(2 * math.pi * i / steps)}
                           for i in range(steps + 1)]
                 shapes.append(create_shape({'type': 'path', 'pen': current_pen, 'points': points,
+                                            'source_segment_styles': [{'lt_argument': current_lt_argument, 'line_width_units': current_line_width, 'lt_generation': lt_generation} for _ in points[1:]],
                                             'line_width_units': current_line_width}))
             elif radius > 0:
                 shapes.append(create_shape({

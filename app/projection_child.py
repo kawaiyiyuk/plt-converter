@@ -41,7 +41,7 @@ def execute(spec):
             result = inspect(source)
         elif spec['operation'] == 'plt':
             from .services.plt_parser import parse_plt
-            from .services.pdf_renderer import render_projection_pdf
+            from .services.pdf_renderer import render_projection_pdf, projection_source_bounds_mm
             # Leave headroom under 0.05mm for the PDF writer's 0.001pt rounding.
             document = parse_plt(source, projection=True, max_chord_error_mm=0.049)
             pdf = render_projection_pdf(document)
@@ -55,7 +55,8 @@ def execute(spec):
                 file.flush()
                 __import__('os').fsync(file.fileno())
             result = inspect(pdf)
-            result.update(source_format='plt', rendering_warnings=document.get('warnings', []))
+            result.update(source_format='plt', rendering_warnings=document.get('warnings', []),
+                          source_bounds_mm=projection_source_bounds_mm(document))
         elif spec['operation'] == 'scene':
             from .projection_scene import export_scene_bundle
             p=spec['parameters']

@@ -18,12 +18,12 @@ def _backend_url(path):
     return f'{base_url}{path}'
 
 
-def _json_request(path, payload, headers=None):
+def _json_request(path, payload, headers=None, *, method='POST'):
     request = Request(
         _backend_url(path),
-        data=json.dumps(payload).encode('utf-8'),
+        data=None if method == 'GET' else json.dumps(payload).encode('utf-8'),
         headers={'Content-Type': 'application/json', **(headers or {})},
-        method='POST',
+        method=method,
     )
     try:
         with urlopen(request, timeout=8) as response:

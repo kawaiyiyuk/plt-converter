@@ -1,0 +1,28 @@
+# Separate private service; no published ports and no edits to old converters.
+services:
+  pattern-layout:
+    build:
+      context: .
+      dockerfile: Dockerfile.pattern-layout
+    cpus: 1
+    mem_limit: ${PATTERN_LAYOUT_MEMORY_LIMIT:?explicit operator memory policy required}
+    restart: unless-stopped
+    environment:
+      PATTERN_LAYOUT_BIND_HOST: 0.0.0.0
+      PATTERN_LAYOUT_BIND_PORT: ${PATTERN_LAYOUT_BIND_PORT:?explicit private port required}
+      PATTERN_LAYOUT_SERVICE_KEY: ${PATTERN_LAYOUT_SERVICE_KEY:?explicit private shared key required}
+      PATTERN_LAYOUT_ROOT: ${PATTERN_LAYOUT_CONTAINER_ROOT:?explicit queue root required}
+      PATTERN_LAYOUT_DISK_BUDGET_BYTES: ${PATTERN_LAYOUT_DISK_BUDGET_BYTES:?explicit capacity policy required}
+      PATTERN_LAYOUT_MAX_RESULT_BYTES: ${PATTERN_LAYOUT_MAX_RESULT_BYTES:?explicit per-task capacity policy required}
+      PATTERN_LAYOUT_JOB_RETENTION_SECONDS: 86400 # User-confirmed temporary result retention; never originals/projects.
+      PATTERN_LAYOUT_TASK_WALL_SECONDS: ${PATTERN_LAYOUT_TASK_WALL_SECONDS:?explicit per-task wall budget required}
+      PATTERN_LAYOUT_TASK_MEMORY_BYTES: ${PATTERN_LAYOUT_TASK_MEMORY_BYTES:?explicit per-task memory budget required}
+      PATTERN_LAYOUT_MAX_REQUEST_BYTES: ${PATTERN_LAYOUT_MAX_REQUEST_BYTES:?explicit request capacity policy required}
+    volumes:
+      - ${PATTERN_LAYOUT_STATE_DIRECTORY:?explicit local state directory required}:${PATTERN_LAYOUT_CONTAINER_ROOT:?explicit queue root required}
+    networks:
+      - pattern-layout-private
+networks:
+  pattern-layout-private:
+    name: ${PATTERN_LAYOUT_NETWORK_NAME:?explicit private network name required}
+    internal: true
