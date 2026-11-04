@@ -113,7 +113,7 @@ def _execute_locked(folder_string):
             if client_payload is not None:
                 from .services.pattern_layout_resources import write_archive, write_gzip
                 resources=folder/'resources'
-                used=sum(path.stat().st_size for path in folder.rglob('*') if path.is_file() and path.name not in ('audit.json.gz','archive.zip'))
+                used=sum(path.stat().st_size for path in folder.rglob('*') if path.is_file() and path.name not in ('audit.json.gz','archive.zip','source.plt','client-result.json'))
                 budget={'used':used,'maximum':meta['result_budget_bytes']}
                 write_gzip(resources/'audit.json.gz',client_payload,budget)
                 write_archive(folder,result['source'],budget)

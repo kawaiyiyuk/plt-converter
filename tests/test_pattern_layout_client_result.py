@@ -173,6 +173,43 @@ class ClientResultHttpTests(unittest.TestCase):
                            data={'file':(io.BytesIO(SOURCE),'fixture.plt'),
                                  'result':(io.BytesIO(gzip.compress(json.dumps(payload,ensure_ascii=False).encode())),'result.json.gz')})
 
+    def run_with_budget(self,payload,maximum,key):
+        self.policy['PATTERN_LAYOUT_MAX_RESULT_BYTES']=str(maximum)
+        with patch.dict(os.environ,{**self.policy,'PATTERN_LAYOUT_SERVICE_KEY':'local-test-only'}):
+            app=create_app();client=app.test_client();queue=app.extensions['pattern_layout_queue']
+            try:
+                identifier=self.submit(client,payload,key).json['id']
+                queue.futures[identifier].result(timeout=30)
+                status=client.get('/internal/pattern-layout/jobs/'+identifier,headers=self.headers()).json
+                return status,queue.root/identifier
+            finally:app.extensions['pattern_layout_executor'].shutdown(wait=True,cancel_futures=True)
+
+    def artifact_bytes(self,folder):
+        return sum(path.stat().st_size for path in folder.rglob('*') if path.is_file() and path.name not in ('source.plt','client-result.json'))
+
+    def test_result_budget_ignores_source_and_client_result_bytes(self):
+        result=recognize_with_variants(SOURCE,'fixture.plt');payload=payload_from(result,'fixture.plt')
+        client_result_bytes=len(json.dumps(payload,ensure_ascii=False).encode())
+        loose,folder=self.run_with_budget(payload,32*1024*1024,'loose')
+        self.assertEqual(loose['status'],'done')
+        artifact=self.artifact_bytes(folder)
+        maximum=artifact+(len(SOURCE)+client_result_bytes)//2
+        self.assertLessEqual(artifact,maximum)
+        self.assertLess(maximum,artifact+len(SOURCE)+client_result_bytes)
+        tight,_=self.run_with_budget(payload,maximum,'tight')
+        self.assertEqual(tight['status'],'done')
+
+    def test_result_budget_below_artifacts_still_fails(self):
+        result=recognize_with_variants(SOURCE,'fixture.plt');payload=payload_from(result,'fixture.plt')
+        loose,folder=self.run_with_budget(payload,32*1024*1024,'loose')
+        self.assertEqual(loose['status'],'done')
+        artifact=self.artifact_bytes(folder)
+        maximum=max(4096,artifact//2)
+        self.assertLess(maximum,artifact)
+        tight,_=self.run_with_budget(payload,maximum,'tight')
+        self.assertEqual(tight['status'],'failed')
+        self.assertEqual(tight['error_code'],'result_storage_budget_exceeded')
+
     def test_http_client_result_runs_and_serves_archive_with_raw_client_audit(self):
         result=recognize_with_variants(SOURCE,'fixture.plt');payload=payload_from(result,'fixture.plt')
         with patch.dict(os.environ,{**self.policy,'PATTERN_LAYOUT_SERVICE_KEY':'local-test-only'}):
