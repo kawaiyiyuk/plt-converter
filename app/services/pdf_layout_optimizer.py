@@ -22,6 +22,10 @@ from .pdf_to_plt import (
 EDGE_NAMES = ('left', 'right', 'top', 'bottom')
 BOUNDARY_EPS_PT = 0.15
 BOUNDARY_RANGE_EPS_PT = 0.5
+# Safety margin around the possible crop boundary bands. It must stay larger than
+# both the 1e-4 snapping tolerance in _crossing_coordinate and BOUNDARY_EPS_PT so
+# a segment accepted or rejected near a real boundary is never pre-filtered away.
+BOUNDARY_FILTER_MARGIN_PT = 1.0
 DEDUP_TOLERANCE_PT = 0.8
 MATCH_TOLERANCE_PT = 2.0
 MAX_GRID_SIZE = 24
@@ -107,10 +111,16 @@ def optimize_pdf_layout(source, metadata_mode=None, page_indexes=None):
     signatures_by_crop = {}
     crop_candidates = [dict.fromkeys(EDGE_NAMES, value) for value in crop_values]
     crop_candidates.extend(frame_crops)
+    boundary_segments = _segments_near_crop_boundaries(
+        segments_by_page,
+        width,
+        height,
+        crop_candidates,
+    )
     for margins in crop_candidates:
         crop_mm = tuple(margins[side] for side in EDGE_NAMES)
         signatures = build_edge_signatures(
-            segments_by_page,
+            boundary_segments,
             width,
             height,
             margins,
@@ -196,10 +206,7 @@ def choose_best_layout(
         # A correct grid can score poorly while every blank is still at the end. Refine
         # every legal grid/order before comparing them so internal blank rows or columns
         # are not discarded by the coarse arrangement.
-        optimized = [
-            _optimize_blank_positions(candidate, signatures, page_count, score_cache)
-            for candidate in candidates
-        ]
+        optimized = _optimize_candidates(candidates, signatures, page_count, score_cache)
         candidates = optimized + candidates
 
     best = max(candidates, key=_rank_result)
@@ -362,6 +369,40 @@ def build_edge_signatures(segments_by_page, width, height, crop_mm):
     return signatures
 
 
+def _segments_near_crop_boundaries(segments_by_page, width, height, crop_candidates):
+    """Drop segments that cannot cross any candidate's crop boundary.
+
+    Crop boundaries only move within the min/max margin of each edge, so a
+    segment entirely outside those narrow bands cannot contribute a seam.
+    """
+    if not crop_candidates:
+        return [list(segments) for segments in segments_by_page]
+    margin = BOUNDARY_FILTER_MARGIN_PT
+    left_values = [margins['left'] * MM_TO_PT for margins in crop_candidates]
+    right_values = [width - margins['right'] * MM_TO_PT for margins in crop_candidates]
+    top_values = [margins['top'] * MM_TO_PT for margins in crop_candidates]
+    bottom_values = [height - margins['bottom'] * MM_TO_PT for margins in crop_candidates]
+    x_bands = (
+        (min(left_values) - margin, max(left_values) + margin),
+        (min(right_values) - margin, max(right_values) + margin),
+    )
+    y_bands = (
+        (min(top_values) - margin, max(top_values) + margin),
+        (min(bottom_values) - margin, max(bottom_values) + margin),
+    )
+    filtered = []
+    for segments in segments_by_page:
+        kept = []
+        for start, end in segments:
+            x_min, x_max = (start[0], end[0]) if start[0] <= end[0] else (end[0], start[0])
+            y_min, y_max = (start[1], end[1]) if start[1] <= end[1] else (end[1], start[1])
+            if (any(x_max >= low and x_min <= high for low, high in x_bands)
+                    or any(y_max >= low and y_min <= high for low, high in y_bands)):
+                kept.append((start, end))
+        filtered.append(kept)
+    return filtered
+
+
 def _candidate_grids(page_count, maximum_blank_cells):
     seen = set()
     for rows in range(1, MAX_GRID_SIZE + 1):
@@ -378,6 +419,68 @@ def _candidate_grids(page_count, maximum_blank_cells):
             if key not in seen:
                 seen.add(key)
                 yield key
+
+
+def _minimum_relevant_total(best_total, page_count):
+    """Lowest seam total that can still win or compete after evidence and rounding slack."""
+    return 0.9 * best_total - 0.01805 * 2 * page_count - 0.0002
+
+
+def _blank_search_upper_bound(candidate, signatures, page_count, score_cache):
+    """Bound every order-preserving blank placement of this grid by its possible neighbours."""
+    rows = candidate['rows']
+    columns = candidate['columns']
+    order = candidate['order']
+    blank_count = rows * columns - page_count
+    if order == 'row':
+        sequence_side = ('right', 'left')
+        cross_side = ('bottom', 'top')
+        span = columns
+    else:
+        sequence_side = ('bottom', 'top')
+        cross_side = ('right', 'left')
+        span = rows
+    total = 0.0
+    for page in range(page_count):
+        # The next page in ascending order is the only possible sequence neighbour.
+        if page + 1 < page_count:
+            score = _seam_score(
+                page, page + 1, sequence_side[0], sequence_side[1],
+                signatures, score_cache,
+            )
+            if score is not None:
+                total += score
+        # Any page skipping the blank run lies within one grid span of the current page.
+        first_possible = max(page + 1, page + span - blank_count)
+        last_possible = min(page_count - 1, page + span)
+        best = 0.0
+        for adjacent in range(first_possible, last_possible + 1):
+            score = _seam_score(
+                page, adjacent, cross_side[0], cross_side[1],
+                signatures, score_cache,
+            )
+            if score is not None and score > best:
+                best = score
+        total += best
+    return total
+
+
+def _optimize_candidates(candidates, signatures, page_count, score_cache):
+    """Run the blank search only for grids that can still win or tie the current best."""
+    best_total = max((_total_score(candidate) for candidate in candidates), default=0.0)
+    optimized = []
+    for candidate in candidates:
+        blank_count = candidate['rows'] * candidate['columns'] - page_count
+        if blank_count > 0 and (
+            _blank_search_upper_bound(candidate, signatures, page_count, score_cache)
+            < _minimum_relevant_total(best_total, page_count)
+        ):
+            optimized.append(candidate)
+            continue
+        result = _optimize_blank_positions(candidate, signatures, page_count, score_cache)
+        optimized.append(result)
+        best_total = max(best_total, _total_score(result))
+    return optimized
 
 
 def _optimize_blank_positions(candidate, signatures, page_count, score_cache=None):
@@ -428,6 +531,9 @@ def _layout_adjacencies(rows, columns, order):
     return tuple(pairs)
 
 
+_SCORE_MISSING = object()
+
+
 def _seam_score(first, second, first_side, second_side, signatures, score_cache):
     if score_cache is None:
         return _match_score(signatures[first][first_side], signatures[second][second_side])
@@ -439,16 +545,35 @@ def _seam_score(first, second, first_side, second_side, signatures, score_cache)
 
 def _evaluate_layout(rows, columns, order, page_slots, signatures, score_cache=None):
     scores = []
+    matched_seams = 0
+    perfect_seams = 0
+    zero_seams = 0
     slots = page_slots
     if len(slots) < rows * columns:
         slots = list(slots) + [None] * (rows * columns - len(slots))
     for index, adjacent_index, first_side, second_side in _layout_adjacencies(rows, columns, order):
-        page, adjacent = slots[index], slots[adjacent_index]
-        if page is None or adjacent is None:
+        page = slots[index]
+        if page is None:
             continue
-        score = _seam_score(page, adjacent, first_side, second_side, signatures, score_cache)
-        if score is not None:
-            scores.append(score)
+        adjacent = slots[adjacent_index]
+        if adjacent is None:
+            continue
+        if score_cache is None:
+            score = _seam_score(page, adjacent, first_side, second_side, signatures, score_cache)
+        else:
+            key = (page, adjacent, first_side)
+            score = score_cache.get(key, _SCORE_MISSING)
+            if score is _SCORE_MISSING:
+                score = _seam_score(page, adjacent, first_side, second_side, signatures, score_cache)
+        if score is None:
+            continue
+        scores.append(score)
+        if score > 0:
+            matched_seams += 1
+        if score >= 0.999:
+            perfect_seams += 1
+        if score == 0:
+            zero_seams += 1
     evidence = len(scores)
     return {
         'rows': rows,
@@ -456,19 +581,20 @@ def _evaluate_layout(rows, columns, order, page_slots, signatures, score_cache=N
         'order': order,
         'page_slots': list(page_slots),
         'seam_evidence': evidence,
-        'matched_seams': sum(score > 0 for score in scores),
-        'perfect_seams': sum(score >= 0.999 for score in scores),
-        'zero_seams': sum(score == 0 for score in scores),
+        'matched_seams': matched_seams,
+        'perfect_seams': perfect_seams,
+        'zero_seams': zero_seams,
         'confidence_score': round(sum(scores) / evidence, 4) if evidence else 0.0,
     }
 
 
+def _total_score(result):
+    return round(float(result['confidence_score']) * int(result['seam_evidence']), 4)
+
+
 def _rank_result(result):
     blank_count = sum(page is None for page in result['page_slots'])
-    total_score = round(
-        float(result['confidence_score']) * int(result['seam_evidence']),
-        4,
-    )
+    total_score = _total_score(result)
     return (
         total_score,
         result['perfect_seams'],
