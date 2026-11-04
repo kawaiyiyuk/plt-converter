@@ -22,6 +22,10 @@ from .pdf_to_plt import (
 EDGE_NAMES = ('left', 'right', 'top', 'bottom')
 BOUNDARY_EPS_PT = 0.15
 BOUNDARY_RANGE_EPS_PT = 0.5
+# Safety margin around the possible crop boundary bands. It must stay larger than
+# both the 1e-4 snapping tolerance in _crossing_coordinate and BOUNDARY_EPS_PT so
+# a segment accepted or rejected near a real boundary is never pre-filtered away.
+BOUNDARY_FILTER_MARGIN_PT = 1.0
 DEDUP_TOLERANCE_PT = 0.8
 MATCH_TOLERANCE_PT = 2.0
 MAX_GRID_SIZE = 24
@@ -107,10 +111,16 @@ def optimize_pdf_layout(source, metadata_mode=None, page_indexes=None):
     signatures_by_crop = {}
     crop_candidates = [dict.fromkeys(EDGE_NAMES, value) for value in crop_values]
     crop_candidates.extend(frame_crops)
+    boundary_segments = _segments_near_crop_boundaries(
+        segments_by_page,
+        width,
+        height,
+        crop_candidates,
+    )
     for margins in crop_candidates:
         crop_mm = tuple(margins[side] for side in EDGE_NAMES)
         signatures = build_edge_signatures(
-            segments_by_page,
+            boundary_segments,
             width,
             height,
             margins,
@@ -362,6 +372,40 @@ def build_edge_signatures(segments_by_page, width, height, crop_mm):
     return signatures
 
 
+def _segments_near_crop_boundaries(segments_by_page, width, height, crop_candidates):
+    """Drop segments that cannot cross any candidate's crop boundary.
+
+    Crop boundaries only move within the min/max margin of each edge, so a
+    segment entirely outside those narrow bands cannot contribute a seam.
+    """
+    if not crop_candidates:
+        return [list(segments) for segments in segments_by_page]
+    margin = BOUNDARY_FILTER_MARGIN_PT
+    left_values = [margins['left'] * MM_TO_PT for margins in crop_candidates]
+    right_values = [width - margins['right'] * MM_TO_PT for margins in crop_candidates]
+    top_values = [margins['top'] * MM_TO_PT for margins in crop_candidates]
+    bottom_values = [height - margins['bottom'] * MM_TO_PT for margins in crop_candidates]
+    x_bands = (
+        (min(left_values) - margin, max(left_values) + margin),
+        (min(right_values) - margin, max(right_values) + margin),
+    )
+    y_bands = (
+        (min(top_values) - margin, max(top_values) + margin),
+        (min(bottom_values) - margin, max(bottom_values) + margin),
+    )
+    filtered = []
+    for segments in segments_by_page:
+        kept = []
+        for start, end in segments:
+            x_min, x_max = (start[0], end[0]) if start[0] <= end[0] else (end[0], start[0])
+            y_min, y_max = (start[1], end[1]) if start[1] <= end[1] else (end[1], start[1])
+            if (any(x_max >= low and x_min <= high for low, high in x_bands)
+                    or any(y_max >= low and y_min <= high for low, high in y_bands)):
+                kept.append((start, end))
+        filtered.append(kept)
+    return filtered
+
+
 def _candidate_grids(page_count, maximum_blank_cells):
     seen = set()
     for rows in range(1, MAX_GRID_SIZE + 1):
@@ -428,6 +472,9 @@ def _layout_adjacencies(rows, columns, order):
     return tuple(pairs)
 
 
+_SCORE_MISSING = object()
+
+
 def _seam_score(first, second, first_side, second_side, signatures, score_cache):
     if score_cache is None:
         return _match_score(signatures[first][first_side], signatures[second][second_side])
@@ -439,16 +486,35 @@ def _seam_score(first, second, first_side, second_side, signatures, score_cache)
 
 def _evaluate_layout(rows, columns, order, page_slots, signatures, score_cache=None):
     scores = []
+    matched_seams = 0
+    perfect_seams = 0
+    zero_seams = 0
     slots = page_slots
     if len(slots) < rows * columns:
         slots = list(slots) + [None] * (rows * columns - len(slots))
     for index, adjacent_index, first_side, second_side in _layout_adjacencies(rows, columns, order):
-        page, adjacent = slots[index], slots[adjacent_index]
-        if page is None or adjacent is None:
+        page = slots[index]
+        if page is None:
             continue
-        score = _seam_score(page, adjacent, first_side, second_side, signatures, score_cache)
-        if score is not None:
-            scores.append(score)
+        adjacent = slots[adjacent_index]
+        if adjacent is None:
+            continue
+        if score_cache is None:
+            score = _seam_score(page, adjacent, first_side, second_side, signatures, score_cache)
+        else:
+            key = (page, adjacent, first_side)
+            score = score_cache.get(key, _SCORE_MISSING)
+            if score is _SCORE_MISSING:
+                score = _seam_score(page, adjacent, first_side, second_side, signatures, score_cache)
+        if score is None:
+            continue
+        scores.append(score)
+        if score > 0:
+            matched_seams += 1
+        if score >= 0.999:
+            perfect_seams += 1
+        if score == 0:
+            zero_seams += 1
     evidence = len(scores)
     return {
         'rows': rows,
@@ -456,9 +522,9 @@ def _evaluate_layout(rows, columns, order, page_slots, signatures, score_cache=N
         'order': order,
         'page_slots': list(page_slots),
         'seam_evidence': evidence,
-        'matched_seams': sum(score > 0 for score in scores),
-        'perfect_seams': sum(score >= 0.999 for score in scores),
-        'zero_seams': sum(score == 0 for score in scores),
+        'matched_seams': matched_seams,
+        'perfect_seams': perfect_seams,
+        'zero_seams': zero_seams,
         'confidence_score': round(sum(scores) / evidence, 4) if evidence else 0.0,
     }
 
