@@ -331,18 +331,22 @@ class DiskQueue:
 
 MAX_CLIENT_RESULT_GZIP=8*1024*1024
 MAX_CLIENT_RESULT_JSON=64*1024*1024
+# Keep in sync with wx-server CLIENT_RESULT_MAX_JSON_TOKENS.
+MAX_CLIENT_RESULT_JSON_TOKENS=6_000_000
 
 
 class ClientResultTooLarge(Exception):pass
 
 
 def decompress_client_result(data):
-    output=[];total=0
+    output=[];total=0;tokens=0
     try:
         with gzip.GzipFile(fileobj=io.BytesIO(data),mode='rb') as stream:
             while chunk:=stream.read(1024*1024):
                 total+=len(chunk)
                 if total>MAX_CLIENT_RESULT_JSON:raise ClientResultTooLarge()
+                tokens+=chunk.count(b',')+chunk.count(b'[')+chunk.count(b'{')
+                if tokens>MAX_CLIENT_RESULT_JSON_TOKENS:raise ClientResultTooLarge()
                 output.append(chunk)
     except ClientResultTooLarge:raise
     except Exception as error:raise ValueError('invalid compressed client result') from error

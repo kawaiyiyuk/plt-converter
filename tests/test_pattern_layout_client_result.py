@@ -7,7 +7,7 @@ import os
 import tempfile
 import unittest
 from unittest.mock import patch
-from app.pattern_layout_app import create_app
+from app.pattern_layout_app import ClientResultTooLarge, create_app, decompress_client_result
 from app.services.pattern_layout_api import ENGINE_VERSION
 from app.services.pattern_layout_fingerprint import recognition_code_version
 from app.services.pattern_layout_variants import recognize_with_variants
@@ -143,6 +143,20 @@ class ClientResultVerificationTests(unittest.TestCase):
             self.assertNotEqual(fingerprint.recognition_runtime_version(),before_runtime)
 
 
+class ClientResultTokenLimitTests(unittest.TestCase):
+    def test_decompress_rejects_too_many_json_tokens_before_byte_limit(self):
+        from app import pattern_layout_app
+        compressed=gzip.compress(b'['*10)
+        with patch.object(pattern_layout_app,'MAX_CLIENT_RESULT_JSON_TOKENS',5):
+            with self.assertRaises(ClientResultTooLarge):decompress_client_result(compressed)
+
+    def test_decompress_allows_exact_json_token_limit(self):
+        from app import pattern_layout_app
+        compressed=gzip.compress(b'['*5)
+        with patch.object(pattern_layout_app,'MAX_CLIENT_RESULT_JSON_TOKENS',5):
+            self.assertEqual(decompress_client_result(compressed),b'['*5)
+
+
 class ClientResultHttpTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
@@ -194,6 +208,20 @@ class ClientResultHttpTests(unittest.TestCase):
                                            'result':(io.BytesIO(b'x'*(8*1024*1024+1)),'result.json.gz')})
                 self.assertEqual(response.status_code,413)
                 self.assertEqual(response.json['error_code'],'client_result_too_large')
+            finally:app.extensions['pattern_layout_executor'].shutdown(wait=True,cancel_futures=True)
+
+    def test_http_too_many_json_tokens_is_413_before_json_loads(self):
+        from app import pattern_layout_app
+        with patch.dict(os.environ,{**self.policy,'PATTERN_LAYOUT_SERVICE_KEY':'local-test-only'}):
+            app=create_app();client=app.test_client()
+            try:
+                with patch.object(pattern_layout_app,'MAX_CLIENT_RESULT_JSON_TOKENS',3),patch.object(pattern_layout_app,'json') as app_json:
+                    response=client.post('/internal/pattern-layout/client-results',headers=self.headers(),
+                                         data={'file':(io.BytesIO(SOURCE),'fixture.plt'),
+                                               'result':(io.BytesIO(gzip.compress(b'['*10)),'result.json.gz')})
+                    self.assertEqual(response.status_code,413)
+                    self.assertEqual(response.json['error_code'],'client_result_too_large')
+                    app_json.loads.assert_not_called()
             finally:app.extensions['pattern_layout_executor'].shutdown(wait=True,cancel_futures=True)
 
     def test_http_different_payload_is_not_reused(self):
