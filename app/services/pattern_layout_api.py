@@ -367,6 +367,17 @@ def _fabric_lay_mode(document):
     return lay_mode
 
 
+def _fabric_fold_side(document,schema):
+    fabric=document.get('fabric')
+    if isinstance(fabric,dict) and 'fold_side' in fabric:
+        fold_side=fabric['fold_side']
+    else:
+        if schema==3:_fold_error()
+        fold_side='top'
+    if fold_side not in ('top','bottom'):_fold_error()
+    return fold_side
+
+
 def _placement_cut_mode(placement,lay_mode,schema):
     if schema==1:
         if 'cut_mode' in placement or 'fold_edge' in placement:_fold_error()
@@ -412,7 +423,7 @@ def _fold_export_fragments(candidate,cut_mode,fold):
 def export_project(source_bytes, document):
     """Export only exact referenced intervals; unknown/lossy semantics fail closed."""
     schema=document.get('schema_version')
-    if (isinstance(schema,bool) or schema not in (1,2)
+    if (isinstance(schema,bool) or schema not in (1,2,3)
             or document.get('source_sha256') != hashlib.sha256(source_bytes).hexdigest()):
         raise PatternLayoutExportError('invalid_source_identity')
     placements=document.get('placements', [])
@@ -425,8 +436,11 @@ def export_project(source_bytes, document):
         if any(isinstance(placement,dict) and ('cut_mode' in placement or 'fold_edge' in placement) for placement in placements):
             _fold_error()
         lay_mode=None
+        fold_side=_fabric_fold_side(document,schema)
     else:
         lay_mode=_fabric_lay_mode(document)
+        fold_side=_fabric_fold_side(document,schema)
+        if lay_mode=='folded' and fold_side=='bottom' and schema!=3:_fold_error()
     parsed, paths = source_paths(source_bytes)
     from .plt_parser import curve_approximation_warning
     acknowledged = document.get('acknowledged_source_warnings', [])
@@ -472,16 +486,22 @@ def export_project(source_bytes, document):
             fold=_validate_fold_edge(placement['fold_edge'],candidate,lookup)
         export_fragments=_fold_export_fragments(candidate,cut_mode,fold)
         if cut_mode=='on_fold':
-            # Layout millimetres keep the recognition y-down convention; the
-            # fabric fold is y=0 and the cut piece must stay on y>=0. Other
+            # Layout millimetres keep the recognition y-down convention; top
+            # folds at y=0 with the piece on y>=0, bottom folds at half the
+            # unfolded fabric width with the piece on y<=width_mm/2. Other
             # width/length bounds are intentionally not blocking here.
+            fold_y=0
+            if fold_side=='bottom':
+                fold_y=_fold_number(document['fabric']['width_mm'])/2
             for edge_point in (fold['a'],fold['b']):
-                if abs(layout_point(edge_point)[1])>fold['tol']:_fold_error()
+                if abs(layout_point(edge_point)[1]-fold_y)>fold['tol']:_fold_error()
             for fragment,_chain,reflected in export_fragments:
                 path=lookup.get(fragment['path_id'])
                 for t in (fragment['t0'],fragment['t1']):
-                    if layout_point(_fold_export_point(path,fragment['segment_index'],t,reflected,fold['axis']))[1]<-fold['tol']:
-                        _fold_error()
+                    y=layout_point(_fold_export_point(path,fragment['segment_index'],t,reflected,fold['axis']))[1]
+                    if fold_side=='top':
+                        if y<-fold['tol']:_fold_error()
+                    elif y>fold_y+fold['tol']:_fold_error()
         previous = None
         for fragment,chain,reflected in export_fragments:
             path = lookup.get(fragment['path_id'])
