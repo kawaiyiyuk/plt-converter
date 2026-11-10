@@ -133,6 +133,7 @@ class PatternLayoutExportError(ValueError):
         'label_pose_not_faithful':'设备文字旋转或镜像暂无法保真，请保留草稿并调整该片姿态后再试。',
         'line_type_phase_not_faithful':'该设备线型的截取相位暂无法保真，请保留草稿并反馈原文件。',
         'label_control_not_supported':'原文件文字控制指令暂无法保真导出，请保留草稿并反馈原文件。',
+        'invalid_fold_edge':'折边无效或与当前裁片、布面不一致，请保留草稿并重新确认折边。',
     }
     def __init__(self,code):
         self.code=code
@@ -169,10 +170,263 @@ def hpgl_decimal(value):
     return text.rstrip('0').rstrip('.') if '.' in text else text
 
 
+# Fold endpoints are compared as floating-point source coordinates. This is a
+# numeric equality tolerance, not a claim about physical plotter or cutting
+# accuracy; it is far below any meaningful millimetre measurement.
+FOLD_NUMERIC_TOLERANCE_MM=1e-6
+FOLD_PARAMETER_TOLERANCE=1e-9
+
+
+def _fold_error():
+    raise PatternLayoutExportError('invalid_fold_edge')
+
+
+def _fold_number(value):
+    if isinstance(value,bool) or not isinstance(value,(float,int)) or not math.isfinite(value):
+        _fold_error()
+    return float(value)
+
+
+def _fold_point(value):
+    if not isinstance(value,(list,tuple)) or len(value)!=2:
+        _fold_error()
+    return [_fold_number(value[0]),_fold_number(value[1])]
+
+
+def _fold_tolerance(a,b,values=()):
+    scale=max([1.,abs(a[0]),abs(a[1]),abs(b[0]),abs(b[1])]+[abs(v) for v in values])
+    return max(FOLD_NUMERIC_TOLERANCE_MM,scale*1e-12)
+
+
+def _fold_merge(parts,tolerance=FOLD_PARAMETER_TOLERANCE):
+    merged=[]
+    for start,end in sorted(parts):
+        if merged and start<=merged[-1][1]+tolerance:
+            merged[-1][1]=max(end,merged[-1][1])
+        else:
+            merged.append([start,end])
+    return merged
+
+
+def _fold_covered(parts,start,end):
+    return any(lo<=start+FOLD_PARAMETER_TOLERANCE and hi>=end-FOLD_PARAMETER_TOLERANCE for lo,hi in parts)
+
+
+def _fold_subtract(start,end,parts):
+    """Remove exact source-parameter intervals from one candidate interval."""
+    if not parts:return [(start,end)]
+    remaining=[];cursor=start
+    for lo,hi in parts:
+        if hi<=cursor+FOLD_PARAMETER_TOLERANCE:continue
+        if lo>=end-FOLD_PARAMETER_TOLERANCE:break
+        if lo>cursor:remaining.append((cursor,min(lo,end)))
+        cursor=max(cursor,hi)
+        if cursor>=end-FOLD_PARAMETER_TOLERANCE:break
+    if cursor<end-FOLD_PARAMETER_TOLERANCE:remaining.append((max(cursor,start),end))
+    return [(lo,hi) for lo,hi in remaining if hi-lo>FOLD_PARAMETER_TOLERANCE]
+
+
+def _fold_interval_point(path,index,t):
+    a,b=path['points'][index:index+2]
+    return [a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t]
+
+
+def _fold_reflect(point,axis):
+    origin,direction=axis
+    vx,vy=point[0]-origin[0],point[1]-origin[1]
+    projection=vx*direction[0]+vy*direction[1]
+    # Reflect the offset from the axis origin, then restore that origin:
+    # origin + 2*projection*direction - (point-origin).
+    return [origin[0]+2*projection*direction[0]-vx,
+            origin[1]+2*projection*direction[1]-vy]
+
+
+def _fold_export_point(path,index,t,reflected,axis):
+    point=_fold_interval_point(path,index,t)
+    return _fold_reflect(point,axis) if reflected else point
+
+
+def _fold_candidate_entries(candidate,lookup):
+    entries=[]
+    for fragment in candidate.get('fragments', []):
+        if not isinstance(fragment,dict):raise PatternLayoutExportError('invalid_source_fragment')
+        path=lookup.get(fragment.get('path_id'))
+        index=fragment.get('segment_index')
+        if path is None or isinstance(index,bool) or not isinstance(index,int) or not 0<=index<len(path['points'])-1:
+            raise PatternLayoutExportError('invalid_source_fragment')
+        t0,t1=fragment.get('t0'),fragment.get('t1')
+        if (isinstance(t0,bool) or isinstance(t1,bool) or not isinstance(t0,(int,float)) or not isinstance(t1,(int,float))
+                or not math.isfinite(t0) or not math.isfinite(t1) or not 0<=t0<t1<=1):
+            raise PatternLayoutExportError('invalid_source_fragment')
+        p0,p1=_fold_interval_point(path,index,t0),_fold_interval_point(path,index,t1)
+        entries.append({'path_id':path['id'],'segment_index':index,'t0':float(t0),'t1':float(t1),'a':p0,'b':p1})
+    return entries
+
+
+def _validate_fold_edge(fold_edge,candidate,lookup):
+    """Validate a confirmed source fold edge and return exact skip intervals.
+
+    The edge must be the complete connected straight outer-boundary interval
+    of this candidate, not a middle share of a longer collinear edge. Every
+    declared fragment must be covered by this candidate's own source refs,
+    follow the same axis and cover it without gaps. Coincident support that is
+    not declared is rejected so no residual fold line remains in the output.
+    """
+    if not isinstance(fold_edge,dict):_fold_error()
+    a=_fold_point(fold_edge.get('a'));b=_fold_point(fold_edge.get('b'))
+    length=math.dist(a,b)
+    entries=_fold_candidate_entries(candidate,lookup)
+    tol=_fold_tolerance(a,b,[value for entry in entries for value in entry['a']+entry['b']])
+    if length<=tol:_fold_error()
+    direction=((b[0]-a[0])/length,(b[1]-a[1])/length)
+    def signed(point):return -direction[1]*(point[0]-a[0])+direction[0]*(point[1]-a[1])
+    def along(point):return direction[0]*(point[0]-a[0])+direction[1]*(point[1]-a[1])
+    raw=fold_edge.get('fragments')
+    if not isinstance(raw,list) or not raw:_fold_error()
+    candidate_intervals={}
+    for entry in entries:
+        candidate_intervals.setdefault((entry['path_id'],entry['segment_index']),[]).append((entry['t0'],entry['t1']))
+    candidate_intervals={key:_fold_merge(parts) for key,parts in candidate_intervals.items()}
+    fragments=[];projected=[]
+    for item in raw:
+        if not isinstance(item,dict):_fold_error()
+        path_id=item.get('path_id');index=item.get('segment_index')
+        if not isinstance(path_id,str) or not path_id:_fold_error()
+        path=lookup.get(path_id)
+        if path is None or isinstance(index,bool) or not isinstance(index,int) or not 0<=index<len(path['points'])-1:_fold_error()
+        t0,t1=_fold_number(item.get('t0')),_fold_number(item.get('t1'))
+        if not 0<=t0<t1<=1:_fold_error()
+        p0,p1=_fold_interval_point(path,index,t0),_fold_interval_point(path,index,t1)
+        if math.dist(p0,p1)<=tol:_fold_error()
+        if abs(signed(p0))>tol or abs(signed(p1))>tol:_fold_error()
+        u0,u1=along(p0)/length,along(p1)/length
+        tol_u=tol/length
+        if min(u0,u1)<-tol_u or max(u0,u1)>1+tol_u:_fold_error()
+        if not _fold_covered(candidate_intervals.get((path_id,index),[]),t0,t1):_fold_error()
+        fragments.append({'path_id':path_id,'segment_index':index,'t0':t0,'t1':t1})
+        projected.append((max(0.,min(u0,u1)),min(1.,max(u0,u1))))
+    cursor=0.;tol_u=tol/length
+    for lo,hi in _fold_merge(projected):
+        if lo>cursor+tol_u:_fold_error()
+        cursor=max(cursor,hi)
+    if cursor<1-tol_u:_fold_error()
+    skip={}
+    for fragment in fragments:
+        skip.setdefault((fragment['path_id'],fragment['segment_index']),[]).append((fragment['t0'],fragment['t1']))
+    skip={key:_fold_merge(parts) for key,parts in skip.items()}
+    # Any coincident candidate support inside this axis interval must be part
+    # of the confirmed skip set; otherwise the exported fold line would retain
+    # a residual duplicate or a different source path's edge.
+    for entry in entries:
+        if abs(signed(entry['a']))>tol or abs(signed(entry['b']))>tol:continue
+        dx,dy=entry['b'][0]-entry['a'][0],entry['b'][1]-entry['a'][1]
+        segment_length=math.hypot(dx,dy)
+        if segment_length<=tol:continue
+        s0=((a[0]-entry['a'][0])*dx+(a[1]-entry['a'][1])*dy)/(segment_length*segment_length)
+        s1=((b[0]-entry['a'][0])*dx+(b[1]-entry['a'][1])*dy)/(segment_length*segment_length)
+        lo,hi=max(0.,min(s0,s1)),min(1.,max(s0,s1))
+        if hi-lo<=tol/segment_length:continue
+        start=entry['t0']+(entry['t1']-entry['t0'])*lo
+        end=entry['t0']+(entry['t1']-entry['t0'])*hi
+        if not _fold_covered(skip.get((entry['path_id'],entry['segment_index']),[]),start,end):_fold_error()
+    # The selected edge must be the complete connected collinear boundary
+    # interval of this candidate. Evidence comes from the candidate's own
+    # source refs, so a compact project without private outer geometry works.
+    axis_intervals=[]
+    for entry in entries:
+        if abs(signed(entry['a']))<=tol and abs(signed(entry['b']))<=tol:
+            u0,u1=along(entry['a'])/length,along(entry['b'])/length
+            axis_intervals.append((min(u0,u1),max(u0,u1)))
+    positive=negative=False
+    for entry in entries:
+        for point in (entry['a'],entry['b']):
+            distance=signed(point)
+            if distance>tol:positive=True
+            elif distance<-tol:negative=True
+    if positive and negative:_fold_error()
+    if not positive and not negative:_fold_error()
+    host=None
+    for lo,hi in _fold_merge(axis_intervals,tol_u):
+        if lo<=tol_u and hi>=1-tol_u:
+            host=(lo,hi);break
+    if host is None:_fold_error()
+    if host[0]<-tol_u or host[1]>1+tol_u:_fold_error()
+    return {'a':a,'b':b,'axis':(a,direction),'tol':tol,'skip':skip,'fragments':fragments}
+
+
+def _fabric_lay_mode(document):
+    fabric=document.get('fabric')
+    if not isinstance(fabric,dict):_fold_error()
+    lay_mode=fabric.get('lay_mode')
+    if lay_mode not in ('single','folded'):_fold_error()
+    for name in ('width_mm','length_mm'):
+        value=fabric.get(name)
+        if value is None:_fold_error()
+        value=_fold_number(value)
+        if value<=0:_fold_error()
+    return lay_mode
+
+
+def _placement_cut_mode(placement,lay_mode,schema):
+    if schema==1:
+        if 'cut_mode' in placement or 'fold_edge' in placement:_fold_error()
+        return 'normal'
+    cut_mode=placement.get('cut_mode','normal')
+    if cut_mode not in ('normal','on_fold','unfolded'):_fold_error()
+    if cut_mode=='on_fold':
+        if lay_mode!='folded' or placement.get('fold_edge') is None:_fold_error()
+    elif cut_mode=='unfolded':
+        if lay_mode!='single' or placement.get('fold_edge') is None:_fold_error()
+    return cut_mode
+
+
+def _fold_survivors(fragments,skip):
+    survivors=[]
+    for fragment in fragments:
+        key=(fragment['path_id'],fragment['segment_index'])
+        t0,t1=fragment['t0'],fragment['t1']
+        parts=_fold_subtract(float(t0),float(t1),skip.get(key,[])) if key in skip else [(t0,t1)]
+        for start,end in parts:
+            if start==t0 and end==t1:survivors.append(fragment)
+            else:
+                derived=dict(fragment);derived['t0']=start;derived['t1']=end;survivors.append(derived)
+    return survivors
+
+
+def _fold_export_fragments(candidate,cut_mode,fold):
+    """Return exact fragments plus a chain id and source-reflection flag.
+
+    on_fold keeps one open contour (the fold edge is not cut); unfolded adds
+    the reflected non-fold geometry as the same instance transform. normal
+    never changes the cut line even when it carries a confirmed fold edge.
+    """
+    fragments=candidate.get('fragments', [])
+    if cut_mode=='normal' or fold is None:
+        return [(fragment,0,False) for fragment in fragments]
+    survivors=_fold_survivors(fragments,fold['skip'])
+    export=[(fragment,0,False) for fragment in survivors]
+    if cut_mode=='unfolded':export.extend((fragment,1,True) for fragment in survivors)
+    return export
+
+
 def export_project(source_bytes, document):
     """Export only exact referenced intervals; unknown/lossy semantics fail closed."""
-    if document.get('schema_version') != 1 or document.get('source_sha256') != hashlib.sha256(source_bytes).hexdigest():
+    schema=document.get('schema_version')
+    if (isinstance(schema,bool) or schema not in (1,2)
+            or document.get('source_sha256') != hashlib.sha256(source_bytes).hexdigest()):
         raise PatternLayoutExportError('invalid_source_identity')
+    placements=document.get('placements', [])
+    if schema==1:
+        # Legacy documents keep their exact output, including fabric width and
+        # length metadata. Only v2 fold semantics cannot be silently ignored.
+        fabric=document.get('fabric')
+        if isinstance(fabric,dict) and 'lay_mode' in fabric:
+            _fold_error()
+        if any(isinstance(placement,dict) and ('cut_mode' in placement or 'fold_edge' in placement) for placement in placements):
+            _fold_error()
+        lay_mode=None
+    else:
+        lay_mode=_fabric_lay_mode(document)
     parsed, paths = source_paths(source_bytes)
     from .plt_parser import curve_approximation_warning
     acknowledged = document.get('acknowledged_source_warnings', [])
@@ -195,7 +449,7 @@ def export_project(source_bytes, document):
     expected = []
     expected_text = []
     text_by_id = {s['id']:s for s in parsed['shapes'] if s['type']=='text'}
-    for placement in document.get('placements', []):
+    for placement in placements:
         candidate = candidates.get(placement['piece_id'])
         if candidate is None: raise PatternLayoutExportError('invalid_source_fragment')
         angle = finite(placement.get('rotation_deg',0), 'rotation_deg')
@@ -205,12 +459,31 @@ def export_project(source_bytes, document):
         anchor = placement.get('anchor', {'x':0,'y':0})
         ax,ay = finite(anchor['x'],'anchor.x'),finite(anchor['y'],'anchor.y')
         dx,dy = finite(placement['x'],'x'), finite(placement['y'],'y')
-        def transform(p):
+        def layout_point(p):
             x,y = p[0]-ax,p[1]-ay
             if mirror: x=-x
-            return [(c*x-s*y+dx)*units, -(s*x+c*y+dy)*units]
+            return c*x-s*y+dx, s*x+c*y+dy
+        def transform(p):
+            layout=layout_point(p)
+            return [layout[0]*units, -layout[1]*units]
+        cut_mode=_placement_cut_mode(placement,lay_mode,schema)
+        fold=None
+        if placement.get('fold_edge') is not None:
+            fold=_validate_fold_edge(placement['fold_edge'],candidate,lookup)
+        export_fragments=_fold_export_fragments(candidate,cut_mode,fold)
+        if cut_mode=='on_fold':
+            # Layout millimetres keep the recognition y-down convention; the
+            # fabric fold is y=0 and the cut piece must stay on y>=0. Other
+            # width/length bounds are intentionally not blocking here.
+            for edge_point in (fold['a'],fold['b']):
+                if abs(layout_point(edge_point)[1])>fold['tol']:_fold_error()
+            for fragment,_chain,reflected in export_fragments:
+                path=lookup.get(fragment['path_id'])
+                for t in (fragment['t0'],fragment['t1']):
+                    if layout_point(_fold_export_point(path,fragment['segment_index'],t,reflected,fold['axis']))[1]<-fold['tol']:
+                        _fold_error()
         previous = None
-        for fragment in candidate.get('fragments', []):
+        for fragment,chain,reflected in export_fragments:
             path = lookup.get(fragment['path_id'])
             index = fragment['segment_index']
             if path is None or isinstance(index,bool) or not isinstance(index,int) or not 0<=index<len(path['points'])-1:
@@ -218,11 +491,11 @@ def export_project(source_bytes, document):
             t0,t1 = finite(fragment['t0'],'t0'),finite(fragment['t1'],'t1')
             if not 0<=t0<t1<=1: raise PatternLayoutExportError('invalid_source_fragment')
             a,b = path['points'][index:index+2]
-            pa,pb = transform([a[k]+(b[k]-a[k])*t0 for k in (0,1)]),transform([a[k]+(b[k]-a[k])*t1 for k in (0,1)])
+            pa,pb = transform(_fold_export_point(path,index,t0,reflected,fold['axis'] if fold is not None else None)),transform(_fold_export_point(path,index,t1,reflected,fold['axis'] if fold is not None else None))
             style = path['segment_styles'][index]
             lt = style['lt_argument'] or ''
-            key = (path['id'],index,t1,lt,style.get('lt_generation'),style.get('line_width_units',path.get('line_width_units')))
-            continuous = previous is not None and previous[0]==path['id'] and previous[3]==lt and previous[4]==style.get('lt_generation') and ((previous[1]==index and previous[2]==t0) or (previous[1]+1==index and previous[2]==1 and t0==0))
+            key = (path['id'],index,t1,lt,style.get('lt_generation'),style.get('line_width_units',path.get('line_width_units')),chain)
+            continuous = previous is not None and previous[6]==chain and previous[0]==path['id'] and previous[3]==lt and previous[4]==style.get('lt_generation') and ((previous[1]==index and previous[2]==t0) or (previous[1]+1==index and previous[2]==1 and t0==0))
             if lt:
                 try: lt_values=[float(v) for v in lt.replace(',', ' ').split()]
                 except ValueError: lt_values=[]
@@ -239,8 +512,9 @@ def export_project(source_bytes, document):
                         lo,hi=max(begin,cycle*period),min(end,cycle*period+half)
                         if hi>lo and length>0:
                             u0,u1=(lo-prefix)/length,(hi-prefix)/length
-                            da=transform([a[k]+(b[k]-a[k])*u0 for k in (0,1)])
-                            db=transform([a[k]+(b[k]-a[k])*u1 for k in (0,1)])
+                            axis=fold['axis'] if fold is not None else None
+                            da=transform(_fold_export_point(path,index,u0,reflected,axis))
+                            db=transform(_fold_export_point(path,index,u1,reflected,axis))
                             output.extend(['PU;','IN;','PA;',f'SP{path["pen"]};','LT'+lt+';'])
                             width=style.get('line_width_units',path.get('line_width_units'))
                             if width is not None: output.append('PW'+hpgl_decimal(width)+';')

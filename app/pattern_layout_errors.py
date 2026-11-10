@@ -11,6 +11,7 @@ MESSAGES={
  'label_pose_not_faithful':'设备文字旋转或镜像暂无法保真，请保留草稿并调整该片姿态后再试。',
  'line_type_phase_not_faithful':'该设备线型的截取相位暂无法保真，请保留草稿并反馈原文件。',
  'label_control_not_supported':'原文件文字控制指令暂无法保真导出，请保留草稿并反馈原文件。',
+ 'invalid_fold_edge':'折边无效或与当前裁片、布面不一致，请保留草稿并重新确认折边。',
  'recognition_failed':'原文件暂未能完成识别，请保留原件并重试。',
  'client_result_invalid':'浏览器识别结果格式无效，请保留原件和草稿后重试。',
  'client_result_too_large':'浏览器识别结果超过服务接收预算，请保留原件和草稿后重试。',
