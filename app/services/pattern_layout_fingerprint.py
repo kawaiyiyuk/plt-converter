@@ -58,7 +58,7 @@ def export_runtime_version():
     names={'export_project','source_paths','source_phase_prefixes','finite','hpgl_decimal','PatternLayoutExportError',
            '_fold_error','_fold_number','_fold_point','_fold_tolerance','_fold_merge','_fold_covered','_fold_subtract',
            '_fold_interval_point','_fold_reflect','_fold_export_point','_fold_candidate_entries',
-           '_validate_fold_edge','_fabric_lay_mode','_placement_cut_mode','_fold_survivors','_fold_export_fragments'}
+           '_validate_fold_edge','_fabric_lay_mode','_fabric_fold_side','_placement_cut_mode','_fold_survivors','_fold_export_fragments'}
     parts=function_components(ROOT/'pattern_layout_api.py',names)
     parts.update(constant_components(ROOT/'pattern_layout_api.py',{'FOLD_NUMERIC_TOLERANCE_MM','FOLD_PARAMETER_TOLERANCE'}))
     for name in ('plt_parser.py','number_tokens.py','pattern_layout/parse_source.py','pattern_layout_verify.py'):

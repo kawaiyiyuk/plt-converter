@@ -102,6 +102,66 @@ class FoldExportTests(unittest.TestCase):
         self.assertFalse(any(abs(a[1]) < 1e-9 and abs(b[1]) < 1e-9 for a, b in on_fold))
         self.assertTrue(all(a[1] >= -1e-9 and b[1] >= -1e-9 for a, b in on_fold))
 
+    def test_v3_bottom_fold_skips_the_bottom_edge_and_keeps_a_normal_piece_closed(self):
+        edge = fold_edge([{'path_id': 'shape-1', 'segment_index': 0, 't0': 0, 't1': 1}], a=(0, 10), b=(10, 10))
+        document = {'schema_version': 3, 'source_sha256': hashlib.sha256(self.source).hexdigest(),
+                    'fabric': {'lay_mode': 'folded', 'fold_side': 'bottom', 'width_mm': 20, 'length_mm': 100},
+                    'candidates': [self.candidate], 'placements': [
+                        {'piece_id': self.candidate['id'], 'x': 30, 'y': 0, 'cut_mode': 'on_fold', 'fold_edge': edge},
+                        {'piece_id': self.candidate['id'], 'x': 30, 'y': 40, 'cut_mode': 'normal', 'fold_edge': edge},
+                    ]}
+        actual = segments(export_project(self.source, document))
+        self.assertEqual(len(actual), 7)
+        on_fold = [segment for segment in actual if max(segment[0][1], segment[1][1]) < 20]
+        normal = [segment for segment in actual if min(segment[0][1], segment[1][1]) >= 20]
+        self.assertEqual(len(on_fold), 3)
+        self.assertEqual(len(normal), 4)
+        self.assertFalse(any(abs(a[1] - 10) < 1e-9 and abs(b[1] - 10) < 1e-9 for a, b in on_fold))
+        self.assertTrue(all(a[1] <= 10 + 1e-9 and b[1] <= 10 + 1e-9 for a, b in on_fold))
+
+    def test_v3_top_fold_keeps_the_existing_top_rule(self):
+        document = {'schema_version': 3, 'source_sha256': hashlib.sha256(self.source).hexdigest(),
+                    'fabric': {'lay_mode': 'folded', 'fold_side': 'top', 'width_mm': 20, 'length_mm': 100},
+                    'candidates': [self.candidate], 'placements': [
+                        {'piece_id': self.candidate['id'], 'x': 30, 'y': 0, 'cut_mode': 'on_fold', 'fold_edge': self.edge},
+                    ]}
+        actual = segments(export_project(self.source, document))
+        self.assertEqual(len(actual), 3)
+        self.assertFalse(any(abs(a[1]) < 1e-9 and abs(b[1]) < 1e-9 for a, b in actual))
+        self.assertTrue(all(a[1] >= -1e-9 and b[1] >= -1e-9 for a, b in actual))
+
+    def test_bottom_fold_rejects_a_top_edge_or_a_piece_beyond_the_bottom(self):
+        document = {'schema_version': 3, 'source_sha256': hashlib.sha256(self.source).hexdigest(),
+                    'fabric': {'lay_mode': 'folded', 'fold_side': 'bottom', 'width_mm': 20, 'length_mm': 100},
+                    'candidates': [self.candidate]}
+        top_edge = copy.deepcopy(document)
+        top_edge['placements'] = [{'piece_id': self.candidate['id'], 'x': 30, 'y': 0,
+                                   'cut_mode': 'on_fold', 'fold_edge': self.edge}]
+        self.assert_invalid(self.source, top_edge)
+        outside = copy.deepcopy(document)
+        outside['placements'] = [{'piece_id': self.candidate['id'], 'x': 30, 'y': 10,
+                                  'cut_mode': 'on_fold',
+                                  'fold_edge': fold_edge([{'path_id': 'shape-1', 'segment_index': 2,
+                                                           't0': 0, 't1': 1}])}]
+        self.assert_invalid(self.source, outside)
+
+    def test_bottom_fold_requires_schema_three_and_a_valid_explicit_fold_side(self):
+        edge = fold_edge([{'path_id': 'shape-1', 'segment_index': 0, 't0': 0, 't1': 1}], a=(0, 10), b=(10, 10))
+        base = {'schema_version': 3, 'source_sha256': hashlib.sha256(self.source).hexdigest(),
+                'fabric': {'lay_mode': 'folded', 'fold_side': 'bottom', 'width_mm': 20, 'length_mm': 100},
+                'candidates': [self.candidate],
+                'placements': [{'piece_id': self.candidate['id'], 'x': 30, 'y': 0,
+                                'cut_mode': 'on_fold', 'fold_edge': edge}]}
+        legacy = copy.deepcopy(base)
+        legacy['schema_version'] = 2
+        self.assert_invalid(self.source, legacy)
+        missing = copy.deepcopy(base)
+        missing['fabric'].pop('fold_side')
+        self.assert_invalid(self.source, missing)
+        invalid = copy.deepcopy(base)
+        invalid['fabric']['fold_side'] = 'middle'
+        self.assert_invalid(self.source, invalid)
+
     def test_unfolded_reflects_non_fold_geometry_once_and_keeps_native_label_once(self):
         source = half_piece_source(label=True)
         _result, candidate = source_candidate(source)
