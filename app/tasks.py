@@ -7,6 +7,7 @@ from rq.job import Callback
 from rq.timeouts import JobTimeoutException
 
 from .job_queue import (
+    LONG_CONVERSION_JOB_TYPES,
     QueueRejected,
     acquire_job_lock,
     conversion_queue,
@@ -26,12 +27,13 @@ from .services.pdf_to_plt import (
     read_pdf_layout_metadata,
 )
 from .services.pdf_to_pdf import convert_pdf_to_pdf
+from .services.pattern_pdf_to_plt import convert_pattern_pdf_to_plt
 from .services.plt_parser import parse_plt
 
 
 def _requires_conversion_billing(record):
     return bool(record and (
-        record.get('job_type') == 'pdf_to_pdf'
+        record.get('job_type') in {'pdf_to_pdf', 'pattern_pdf_to_plt'}
         or record.get('billing_access_method') in {'ad', 'free'}
     ))
 
@@ -377,7 +379,7 @@ def enqueue_retry(task_id, connection, retries):
     record = load_job(task_id, connection)
     timeout_environment = (
         'PDF_TO_PDF_JOB_TIMEOUT_SECONDS'
-        if record and record.get('job_type') == 'pdf_to_pdf'
+        if record and record.get('job_type') in LONG_CONVERSION_JOB_TYPES
         else 'PLT_JOB_TIMEOUT_SECONDS'
     )
     default_timeout = '210' if timeout_environment == 'PDF_TO_PDF_JOB_TIMEOUT_SECONDS' else '90'
@@ -585,6 +587,18 @@ def _execute(record, connection):
             'filename': output_path.name,
             **conversion,
             'mime_type': 'application/pdf',
+        }
+
+    if job_type == 'pattern_pdf_to_plt':
+        _update_job_progress(job_id, connection, progress=25)
+        plt, result = convert_pattern_pdf_to_plt(source, options)
+        output_path = job_root / f"{Path(record['filename']).stem}.plt"
+        output_path.write_bytes(plt)
+        return {
+            'result_path': str(output_path),
+            'filename': output_path.name,
+            'mime_type': 'application/octet-stream',
+            **result,
         }
 
     if job_type == 'pdf_preview':

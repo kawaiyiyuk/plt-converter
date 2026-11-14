@@ -20,8 +20,10 @@ JOB_OUTPUT_VERSIONS = {
     'plt_to_pdf': '4-single-page-selection',
     'pdf_to_plt': '4-metric-pen-width',
     'pdf_to_pdf': '2-skip-leading-cover',
+    'pattern_pdf_to_plt': '2-whole-sheet',
     'pdf_preview': '5-cover-suggestion',
 }
+LONG_CONVERSION_JOB_TYPES = {'pdf_to_pdf', 'pattern_pdf_to_plt'}
 
 
 def redis_connection(blocking=False):
@@ -112,7 +114,7 @@ def job_record_ttl(record=None):
         queue_capacity = max(1, int(os.getenv('PLT_QUEUE_MAX_PENDING', '20')))
         timeout_environment = (
             'PDF_TO_PDF_JOB_TIMEOUT_SECONDS'
-            if (record or {}).get('job_type') == 'pdf_to_pdf'
+            if (record or {}).get('job_type') in LONG_CONVERSION_JOB_TYPES
             else 'PLT_JOB_TIMEOUT_SECONDS'
         )
         default_timeout = '210' if timeout_environment == 'PDF_TO_PDF_JOB_TIMEOUT_SECONDS' else '90'
@@ -458,10 +460,12 @@ def submit_job(
         try:
             timeout_environment = (
                 'PDF_TO_PDF_JOB_TIMEOUT_SECONDS'
-                if job_type == 'pdf_to_pdf'
+                if job_type in LONG_CONVERSION_JOB_TYPES
                 else 'PLT_JOB_TIMEOUT_SECONDS'
             )
-            default_timeout = '210' if job_type == 'pdf_to_pdf' else '90'
+            default_timeout = (
+                '210' if job_type in LONG_CONVERSION_JOB_TYPES else '90'
+            )
             queue.enqueue_call(
                 'app.tasks.execute_job',
                 args=(job_id,),

@@ -61,6 +61,50 @@ def authorize_conversion(authorization, request_id, conversion_type, allow_charg
     return data
 
 
+def authorize_pattern_pdf(authorization, layout_token, request_id, allow_charge=False):
+    if not authorization and not layout_token:
+        raise BillingRejected('请先登录后再使用转换功能', 401)
+    if not request_id or len(request_id) > 64:
+        raise BillingRejected('转换请求编号无效', 400)
+
+    headers = (
+        {'Authorization': authorization}
+        if authorization
+        else {'X-Layout-Token': layout_token}
+    )
+    status, body = _json_request(
+        '/api/v1/points/conversion/pattern-pdf/authorize',
+        {
+            'request_id': request_id,
+            'allow_charge': bool(allow_charge),
+        },
+        headers,
+    )
+    if status != 200:
+        raise BillingRejected(body.get('message') or '转换额度确认失败', status, body.get('data'))
+    data = body.get('data') or {}
+    if not data.get('user_id'):
+        raise BillingRejected('转换计费服务返回无效用户', 503)
+    return data
+
+
+def identify_layout_user(token):
+    if not token:
+        raise BillingRejected('请先登录后再使用转换功能', 401)
+    status, body = _json_request(
+        '/api/v1/pattern-layout/identity',
+        {},
+        {'X-Layout-Token': token},
+        method='GET',
+    )
+    if status != 200:
+        raise BillingRejected(body.get('message') or '登录状态验证失败', status)
+    user_id = (body.get('data') or {}).get('user_id')
+    if not user_id:
+        raise BillingRejected('登录状态验证失败', 401)
+    return f'user:{user_id}'
+
+
 def identify_user(authorization):
     if not authorization:
         raise BillingRejected('请先登录后再使用转换功能', 401)
