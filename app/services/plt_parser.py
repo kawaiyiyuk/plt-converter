@@ -27,9 +27,97 @@ def curve_approximation_warning(max_chord_error_mm):
             '不代表投影总误差，需实测。')
 
 
+
+_HPGL_NUMBER = re.compile(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?')
+# 大写指令连写只在已知指令键和完整参数之间拆分。PG 不属于这组连写边界。
+_COMPACT_NEXT_COMMANDS = frozenset(
+    'AA AR CA CI CO CP CS DC DF DI DP DR DT EA ER FF FL FT IM IN IP IW LB LT '
+    'OA OC OD OE OF OH OI OO OP OS PA PD PR PS PT PU RA RO RR '
+    'SA SC SI SL SM SP SR SS TL UC VS WG XT YT'.split()
+)
+_COMPACT_NEXT_COMMANDS_V2 = _COMPACT_NEXT_COMMANDS | {'PW'}
+_LINE_START_COMMANDS = _COMPACT_NEXT_COMMANDS | {'PG', 'PW'}
+_COORDINATE_PAIR_COMMANDS = {'PA', 'PR', 'PU', 'PD'}
+_COMPACT_ARGUMENT_COUNTS = {
+    'IN': {0}, 'DF': {0}, 'SP': {0, 1}, 'CI': {1, 2}, 'AA': {3, 4}, 'AR': {3, 4},
+    'PW': {0, 1, 2}, 'VS': {0, 1, 2}, 'LT': {0, 1, 2, 3},
+    'PG': {0, 1}, 'FL': {1}, 'FF': {0}, 'DI': {0, 2}, 'SI': {0, 2},
+}
+_ARGUMENT_BOUNDARIES = r';|[\r\n][ \t\r\n]*|(?=(?P<opcode>[A-Z]{2}))'
+_LAYOUT_ARGUMENT_TOKENS = re.compile(r'"[^"]*"|' + _ARGUMENT_BOUNDARIES)
+_LAYOUT_DT_TOKENS = re.compile(_ARGUMENT_BOUNDARIES)
+
+
+def _explicit_label_terminator(argument):
+    token = argument.strip(' \t\r\n')
+    if len(token) == 1 and (token == '\x03' or '!' <= token <= '~'):
+        return token
+    return None
+
+
+def _complete_compact_arguments(command, argument):
+    if command == 'DT':
+        return _explicit_label_terminator(argument) is not None
+    count = 0
+    for token in iter_number_tokens(argument):
+        if _HPGL_NUMBER.fullmatch(token) is None:
+            return False
+        count += 1
+    if command in _COORDINATE_PAIR_COMMANDS:
+        return count % 2 == 0
+    return count in _COMPACT_ARGUMENT_COUNTS[command]
+
+
+def _line_starts_command(text, start, compact_commands):
+    word = text[start:start + 2]
+    if len(word) != 2 or not word.isascii():
+        return False
+    command = word.upper()
+    if command not in _LINE_START_COMMANDS:
+        return False
+    if command in {'LB', 'DT'}:
+        return True
+    following = text[start + 2:start + 4]
+    # 换行后的坐标值属于原参数。字母长串也不能只凭前两个字符当成指令。
+    return not following or not following[0].isalpha() or following in compact_commands
+
+
+def _layout_argument_boundary(text, start, command, compact_commands):
+    """返回参数结束位置、下一条命令起点，以及是否使用了扩展边界。"""
+    tokens = _LAYOUT_DT_TOKENS if command == 'DT' else _LAYOUT_ARGUMENT_TOKENS
+    compact = command in _COORDINATE_PAIR_COMMANDS or command in _COMPACT_ARGUMENT_COUNTS or command == 'DT'
+    quoted_semicolon = False
+    for match in tokens.finditer(text, start):
+        at = match.start()
+        opcode = match.group('opcode')
+        if opcode is not None:
+            if compact and opcode in compact_commands:
+                argument = text[start:at]
+                # DT 的第一个字符可以恰好也是下一对字母的一部分。
+                if command == 'DT' and not argument.strip():
+                    continue
+                if _complete_compact_arguments(command, argument):
+                    return at, at, True
+                compact = False
+            continue
+        if text[at] == ';':
+            return at, match.end(), quoted_semicolon
+        if text[at] == '"':
+            quoted_semicolon = quoted_semicolon or text.find(';', at + 1, match.end() - 1) >= 0
+        elif _line_starts_command(text, match.end(), compact_commands):
+            return at, match.end(), True
+    return len(text), len(text), quoted_semicolon
+
+
 def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
-              max_chord_error_mm=None, projection=False, report_curve_approximation=False):
+              max_chord_error_mm=None, projection=False, report_curve_approximation=False,
+              apply_page_offsets=False, apply_command_boundaries=False, command_boundaries_version=2):
     projection_semantics = strict or projection
+    page_offsets_enabled = apply_page_offsets and projection and not strict
+    layout_boundaries_enabled = apply_command_boundaries and projection and not strict
+    # 旧工程继续按首次识别时的指令分隔和文字状态解释原线编号。
+    boundary_v2 = layout_boundaries_enabled and command_boundaries_version == 2
+    compact_commands = _COMPACT_NEXT_COMMANDS_V2 if boundary_v2 else _COMPACT_NEXT_COMMANDS
     # Opt-in projection rules must not change the formal converter's parser.
     if not math.isfinite(float(units_per_inch)) or float(units_per_inch) <= 0:
         raise ValueError('PLT 单位必须为正有限数值')
@@ -44,6 +132,12 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
     pen_down = False
     current_pen = 1
     current_position = {'x': 0.0, 'y': 0.0}
+    page_offset_x = 0.0
+    feed_step_x = 0.0
+    page_x_offsets_applied = False
+    layout_command_boundaries_applied = False
+    label_terminator = '\x03'
+    explicit_label_terminator = False
     label_carriage_return = dict(current_position)
     current_line_width = None
     stroke = []
@@ -108,7 +202,7 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                 'y': current_position['y'] + y,
             }
         else:
-            point = {'x': x, 'y': y}
+            point = {'x': x + page_offset_x if page_offset_x else x, 'y': y}
         if projection_semantics and not all(math.isfinite(value) for value in point.values()):
             raise ValueError('PLT 累计坐标超出有限数值范围')
         current_position = point
@@ -258,8 +352,13 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             if projection_semantics:
                 flush_stroke()
             text_start = index
-            while index < len(text) and text[index] not in '\x03;':
-                index += 1
+            if boundary_v2 and explicit_label_terminator:
+                index = text.find(label_terminator, index)
+                if index < 0:
+                    raise ValueError('PLT 文字标注缺少 DT 指定的结束符')
+            else:
+                while index < len(text) and text[index] not in (label_terminator, ';'):
+                    index += 1
             label = text[text_start:index]
             if label:
                 text_char_count += len(label)
@@ -282,17 +381,29 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
             raise ValueError(f'投影暂不支持 HPGL 命令 {command}，无法保证图形完整')
 
         argument_start = index
-        while index < len(text) and text[index] != ';':
-            index += 1
-        argument_text = text[argument_start:index]
-        if index < len(text):
-            index += 1
+        if layout_boundaries_enabled:
+            argument_end, index, compatible_boundary = _layout_argument_boundary(text, index, command, compact_commands)
+            layout_command_boundaries_applied |= compatible_boundary
+        else:
+            while index < len(text) and text[index] != ';':
+                index += 1
+            argument_end = index
+            if index < len(text):
+                index += 1
+        argument_text = text[argument_start:argument_end]
+        if layout_boundaries_enabled and command == 'DT':
+            terminator = _explicit_label_terminator(argument_text)
+            if terminator is not None:
+                label_terminator = terminator
+                explicit_label_terminator = True
+                layout_command_boundaries_applied = True
+                continue
         if strict:
             # Use exactly the legacy tokenizer's comma/whitespace boundaries.
             # Validate whole tokens before parse_numbers can skip an invalid one;
             # e.g. 100-200 is one malformed token, never two coordinates.
             for token in iter_number_tokens(argument_text):
-                if not re.fullmatch(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?', token):
+                if not _HPGL_NUMBER.fullmatch(token):
                     raise ValueError(f'HPGL 命令 {command} 参数格式无效')
                 if not math.isfinite(float(token)):
                     raise ValueError(f'HPGL 命令 {command} 坐标必须有限')
@@ -307,6 +418,20 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         remaining_values = max((maximum_points - point_count) * 2, 0)
         value_limit = remaining_values if command in {'PA', 'PR', 'PU', 'PD'} else 10000
         numbers = parse_numbers(argument_text, maximum_values=value_limit)
+
+        if page_offsets_enabled and command in {'PG', 'FL', 'FF'}:
+            argument = argument_text.strip()
+            integer_argument = (command in {'PG', 'FL'} and len(numbers) == 1
+                                and re.fullmatch(r'[+-]?[0-9]+', argument) is not None)
+            if integer_argument or (command == 'FF' and not argument):
+                if command == 'FL':
+                    feed_step_x = numbers[0]
+                else:
+                    page_offset_x += feed_step_x if command == 'FF' else numbers[0]
+                    if not math.isfinite(page_offset_x):
+                        raise ValueError('PLT 累计坐标超出有限数值范围')
+                page_x_offsets_applied = True
+                continue
 
         if strict:
             lengths = {'IN': {0}, 'SP': {0, 1}, 'CI': {1, 2}, 'AA': {3, 4}, 'AR': {3, 4}, 'PW': {1, 2}, 'VS': {1, 2}}
@@ -340,6 +465,11 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
 
         if command == 'IN':
             flush_stroke()
+            # 复位累计横移，步长由 FL 单独设置。
+            page_offset_x = 0.0
+            if boundary_v2:
+                label_terminator = '\x03'
+                explicit_label_terminator = False
             mode = 'absolute'
             pen_down = False
             current_pen = 1
@@ -404,7 +534,8 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
                     'line_width_units': current_line_width,
                 }))
         elif command == 'AA' and len(numbers) >= 3:
-            add_arc({'x': numbers[0], 'y': numbers[1]}, numbers[2], numbers[3] if len(numbers) > 3 else 5)
+            center_x = numbers[0] + page_offset_x if page_offset_x else numbers[0]
+            add_arc({'x': center_x, 'y': numbers[1]}, numbers[2], numbers[3] if len(numbers) > 3 else 5)
         elif command == 'AR' and len(numbers) >= 3:
             add_arc({
                 'x': current_position['x'] + numbers[0],
@@ -435,6 +566,9 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
         'shapes': shapes,
         'metrics': metrics,
         **({'warnings': warnings} if projection_semantics else {}),
+        **({'page_x_offsets_applied': True} if page_x_offsets_applied else {}),
+        **({'layout_command_boundaries_applied': True} if layout_command_boundaries_applied else {}),
+        **({'layout_command_boundaries_version': 2} if boundary_v2 and layout_command_boundaries_applied else {}),
     }
 
 

@@ -1,6 +1,7 @@
 """保留原子面，用原线独立支持提案；有界/借边本身不等于真实裁片。"""
 import math
-from shapely.geometry import LineString,Polygon,Point,GeometryCollection
+from shapely import STRtree, prepare
+from shapely.geometry import LineString,Polygon,Point,GeometryCollection,box
 from shapely.ops import unary_union,polygonize_full
 
 def polygon_parts(g):return [p for p in getattr(g,'geoms',[g]) if p.geom_type=='Polygon' and not p.is_empty]
@@ -31,17 +32,43 @@ def support_refs(poly,paths,eps):
             dist+=length
     return refs
 
-def discover(paths,original,frame_ids,params,eps):
+def report_progress(callback, phase, completed, total):
+    """只报告已完成的工作量；展示回调失败不影响几何结果或原有异常。"""
+    if callback is not None:
+        try:
+            callback(phase, completed, total)
+        except Exception:
+            pass
+
+
+def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=True,on_progress=None):
+    report_progress(on_progress, 'outlines', 0, len(paths) + 1)
     lines={p['id']:LineString(p['points']) for p in paths if len(p['points'])>=2};available={id:l for id,l in lines.items() if id not in frame_ids};known=list(original);records=[];alternatives=[];nextid=max([int(l['id'][1:]) for l in original]+[0])+1
+    records_by_bounds = {}
+    def append_record(record, bounds):
+        records.append(record)
+        records_by_bounds.setdefault(bounds, []).append(record)
+
     def add(poly,kind,proof,source_ids=None):
         nonlocal nextid
         if poly.is_empty or not poly.is_valid or poly.area<=eps**2:return
-        same=next((r for r in records if r['poly'].equals(poly)),None)
-        if same:same['proofs'].append(proof);return same
-        r={'poly':poly,'source_ids':source_ids or [],'kind':kind,'id':f'L{nextid:04d}','proofs':[proof]};nextid+=1;records.append(r);return r
-    for l in original:records.append({**l,'proofs':[{'kind':'original_closed_path_identity','source_path_ids':l['source_ids']} ]})
+        # 空间相等的有效面必有相同包围盒，桶内仍按原顺序精确判等。
+        bounds = poly.bounds
+        same = next((r for r in records_by_bounds.get(bounds, ()) if r['poly'].equals(poly)), None)
+        if same:
+            same['proofs'].append(proof)
+            return same
+        record = {'poly':poly,'source_ids':source_ids or [],'kind':kind,'id':f'L{nextid:04d}','proofs':[proof]}
+        nextid += 1
+        append_record(record, bounds)
+        return record
+
+    for loop in original:
+        record = {**loop,'proofs':[{'kind':'original_closed_path_identity','source_path_ids':loop['source_ids']}]}
+        append_record(record, loop['poly'].bounds)
     # 原path中明确返回同一原顶点的闭合子链也保留，不能因path还带内部笔画而漏掉。
-    for source in paths:
+    for source_index, source in enumerate(paths):
+        report_progress(on_progress, 'outlines', source_index, len(paths) + 1)
         if source['id'] in frame_ids:continue
         seen={}
         for j,pt in enumerate(source['points']):
@@ -52,30 +79,68 @@ def discover(paths,original,frame_ids,params,eps):
                     poly=Polygon(line)
                     add(poly,'source_subpath_closed_cycle',{'kind':'original_vertex_return_cycle','path_id':source['id'],'source_segment_indices':list(range(i,j))})
             seen[key]=j
+    report_progress(on_progress, 'outlines', len(paths), len(paths) + 1)
     original_roots=[r for r in records if not any(nearby_contains(s['poly'],r['poly'],params) for s in records if s is not r)]
     root_anchor_ids={id for r in original_roots for id in r['source_ids']}
     net=unary_union(list(available.values()));faces,cuts,dangles,invalid=polygonize_full(net);atomic=[]
     # EPS不变：缓存每条真实原path的buffer，再union；不buffer noded union来决定源支持。
     path_covers={pid:line.buffer(eps) for pid,line in available.items()};path_bounds={pid:line.bounds for pid,line in available.items()};path_lengths={pid:line.length for pid,line in available.items()};coverage_audit=[]
     # 这项独立链证书要求所有周边由完整的非借用原path支持；没有面积门槛。
+    path_ids = tuple(available)
+    path_tree = STRtree(list(available.values()))
+
     def complete_path_support(poly,exclude=frozenset()):
-        band=poly.boundary.buffer(eps);bx0,by0,bx1,by1=band.bounds
-        ids=[id for id,l in available.items() if id not in exclude and path_lengths[id]>eps and path_bounds[id][0]>=bx0-eps and path_bounds[id][1]>=by0-eps and path_bounds[id][2]<=bx1+eps and path_bounds[id][3]<=by1+eps and l.difference(band).length<=eps]
-        cover=unary_union([path_covers[id] for id in ids]);missing=poly.boundary.difference(cover).length
+        boundary = poly.boundary
+        band = boundary.buffer(eps)
+        bx0, by0, bx1, by1 = band.bounds
+        xmin, ymin, xmax, ymax = bx0-eps, by0-eps, bx1+eps, by1+eps
+        ids = []
+        # 索引只筛掉包围盒不相交的路径，后续条件和原路径顺序保持一致。
+        for index in sorted(path_tree.query(box(xmin, ymin, xmax, ymax))):
+            pid = path_ids[index]
+            x0, y0, x1, y1 = path_bounds[pid]
+            if (pid not in exclude and path_lengths[pid]>eps
+                    and x0>=xmin and y0>=ymin and x1<=xmax and y1<=ymax
+                    and available[pid].difference(band).length<=eps):
+                ids.append(pid)
+        cover = unary_union([path_covers[pid] for pid in ids])
+        missing = boundary.difference(cover).length
         return missing<=eps,ids,missing
     for index,f in enumerate(faces.geoms):
         poly=Polygon(f.exterior);valid,ids,missing=complete_path_support(poly);entry={'face_index':index,'poly':poly,'independent_complete_paths':valid,'complete_boundary_source_path_ids':ids,'unsupported_by_complete_paths_length_mm':missing};atomic.append(entry)
         if valid:add(poly,'multi_path_polygonized_shell',{'kind':'complete_original_paths_close_boundary','source_path_ids':ids,'atomic_face_index':index})
     # 不先把mixed整体搁置：逐个已知outer来源排除，仅在本地副本重建原闭壳。
     scenarios=[('all_source',frozenset()),('exclude_all_known_outers',frozenset(root_anchor_ids))]+[(f'exclude_{r["id"]}',frozenset(r['source_ids'])) for r in original_roots if r['source_ids']]
+    report_progress(on_progress, 'outlines', len(paths) + 1, len(paths) + 1)
     scenario_audit=[]
-    for name,excluded in scenarios:
-        work={id:l for id,l in available.items() if id not in excluded};n=unary_union(list(work.values()));pg,_,_,bad=polygonize_full(n);filled=unary_union([Polygon(f.exterior) for f in pg.geoms]);count=0
-        # 每scenario仅建一次覆盖几何；原线polygonize仍未经buffer，不能造闭合。
-        source_cover=unary_union([path_covers[id] for id in work]);legacy_cover=n.buffer(eps)
+    report_progress(on_progress, 'scenarios', 0, len(scenarios))
+    for scenario_index, (name,excluded) in enumerate(scenarios):
+        if excluded:
+            work = {pid:line for pid,line in available.items() if pid not in excluded}
+            n = unary_union(list(work.values()))
+            pg, _, _, bad = polygonize_full(n)
+        else:
+            work, n, pg, bad = available, net, faces, invalid
+        filled = unary_union([Polygon(f.exterior) for f in pg.geoms])
+        count = 0
+        # 每个场景构建一次覆盖几何，完全覆盖时无需做差集；其余情况用原操作数。
+        source_cover = unary_union([path_covers[pid] for pid in work])
+        # 旧覆盖对照和全网路径清单用于调试，不参与闭壳判定。
+        legacy_cover = n.buffer(eps) if include_full_support_audit else None
+        prepare(source_cover)
+        if legacy_cover is not None:
+            prepare(legacy_cover)
         for poly in polygon_parts(filled):
-            support_gap=poly.boundary.difference(source_cover).length;legacy_gap=poly.boundary.difference(legacy_cover).length
-            support_record={'scenario':name,'epsilon_mm':eps,'method':'per_original_path_buffer_then_union','source_path_count':len(work),'boundary_length_mm':poly.length,'supported_missing_length_mm':support_gap,'legacy_union_then_buffer_missing_length_mm':legacy_gap,'raw_polygonization_closed':True,'source_points_modified':False,'buffer_used_to_create_shell':False};coverage_audit.append(support_record)
+            boundary = poly.boundary
+            support_gap = 0.0 if source_cover.covers(boundary) else boundary.difference(source_cover).length
+            support_record = {'scenario':name,'epsilon_mm':eps,'method':'per_original_path_buffer_then_union',
+                              'source_path_count':len(work),'boundary_length_mm':poly.length,
+                              'supported_missing_length_mm':support_gap}
+            if legacy_cover is not None:
+                legacy_gap = 0.0 if legacy_cover.covers(boundary) else boundary.difference(legacy_cover).length
+                support_record['legacy_union_then_buffer_missing_length_mm'] = legacy_gap
+            support_record.update(raw_polygonization_closed=True,source_points_modified=False,buffer_used_to_create_shell=False)
+            coverage_audit.append(support_record)
             if support_gap>eps:continue
             valid,ids,missing=complete_path_support(poly,excluded)
             # 未排除任何锚时只放行完整原path链支持的壳；其他只作混合观察。
@@ -83,8 +148,15 @@ def discover(paths,original,frame_ids,params,eps):
             # 剩余壳若仍借多个现有独立outer作外围，不因换场景就整体放行。
             contributing=[r for r in original_roots if not (set(r['source_ids'])&set(excluded)) and r['poly'].boundary.intersection(poly.boundary).length>eps and not poly.equals(r['poly'])]
             if contributing:continue
-            add(poly,'multi_path_polygonized_shell',{'kind':'independent_network_after_anchor_exclusion' if excluded else 'complete_original_paths_close_boundary','excluded_source_path_ids':sorted(excluded),'source_network_path_ids':sorted(work),'boundary_source_supported':True,'source_support_audit':support_record,'no_new_connecting_edge':True});count+=1
+            proof = {'kind':'independent_network_after_anchor_exclusion' if excluded else 'complete_original_paths_close_boundary',
+                     'excluded_source_path_ids':sorted(excluded)}
+            if include_full_support_audit:
+                proof['source_network_path_ids'] = sorted(work)
+            proof.update(boundary_source_supported=True,source_support_audit=support_record,no_new_connecting_edge=True)
+            add(poly,'multi_path_polygonized_shell',proof)
+            count += 1
         scenario_audit.append({'scenario':name,'excluded_source_path_ids':sorted(excluded),'proposed_shells':count,'invalid_rings':len(bad.geoms)})
+        report_progress(on_progress, 'scenarios', scenario_index + 1, len(scenarios))
     # 若一个外围实际上是多个已独立闭壳的组合，保备用而非吞并；内环完全内含不算这种证据。
     independent=list(records);active=[]
     for r in independent:

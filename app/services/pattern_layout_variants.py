@@ -4,6 +4,7 @@ from shapely.geometry import LineString, Polygon
 from shapely import make_valid
 from shapely.ops import unary_union
 from .pattern_layout.closed_loop import PARAMS
+from .pattern_layout.independent_shells import report_progress
 
 
 PARAMETERS={'numeric_epsilon_plotter_units':1e-7,'one_rectangle_per_alternative':True}
@@ -87,6 +88,10 @@ def add_rectangle_alternatives(result):
 def face_outer(polygon):return [list(p) for p in polygon.exterior.coords]
 
 
-def recognize_with_variants(raw,name='source.plt'):
+def recognize_with_variants(raw,name='source.plt',*,include_full_support_audit=True,on_progress=None,recognition_mode='strict'):
     from .pattern_layout_api import recognize_source
-    return add_rectangle_alternatives(recognize_source(raw,name))
+    result = recognize_source(raw,name,include_full_support_audit=include_full_support_audit,on_progress=on_progress,recognition_mode=recognition_mode)
+    report_progress(on_progress, 'variants', 0, 1)
+    result = add_rectangle_alternatives(result)
+    report_progress(on_progress, 'variants', 1, 1)
+    return result

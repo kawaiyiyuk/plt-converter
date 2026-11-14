@@ -12,6 +12,7 @@ from shapely import make_valid
 from shapely.geometry import Point, Polygon
 from .pattern_layout.closed_loop import PARAMS, bounds_of_points
 from .pattern_layout_api import ENGINE_VERSION, source_paths
+from .pattern_layout.parse_source import layout_parse_flags
 from .pattern_layout_fingerprint import recognition_code_version
 
 FORMAT='pattern-layout-client-result'
@@ -157,7 +158,7 @@ def verify_client_result(raw_plt,payload):
     count=unassigned.get('count');length=unassigned.get('length_mm')
     count=count if is_integer(count) else None
     length=length if finite_number(length) else None
-    return {'schema_version':1,'pieces':verified_pieces,'auxiliary':verified_auxiliary,'issues':[],
+    result = {'schema_version':1,'pieces':verified_pieces,'auxiliary':verified_auxiliary,'issues':[],
             'unassigned':{'count':count,'length_mm':length},'paths':paths,'non_path_shapes':non_path_shapes,
             'source':{'sha256':source_sha,'name':name,'width_mm':width,'height_mm':height,'units_per_mm':units,
                       'raw_bounds':[metrics['min_x'],metrics['min_y'],metrics['max_x'],metrics['max_y']],
@@ -165,3 +166,5 @@ def verify_client_result(raw_plt,payload):
                       'engine_version':ENGINE_VERSION,'runtime_version':runtime_version_value,
                       'recognition_origin':'browser','server_verification':'structure_only',
                       'client_runtime':{key:client_runtime[key] for key in RUNTIME_FIELDS},'code_version':code_version}}
+    result['source'].update(layout_parse_flags(parsed))
+    return result
