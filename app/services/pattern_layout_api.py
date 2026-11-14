@@ -9,8 +9,11 @@ import math
 from shapely.geometry import LineString, Polygon, Point
 from shapely import make_valid
 from shapely.ops import unary_union
-from .pattern_layout.parse_source import parse
+from .pattern_layout.parse_source import layout_parse_flags, parse
 from .pattern_layout.closed_loop import build_geometry, interval_parts, bounds_of_points, PARAMS
+from .pattern_layout.independent_shells import report_progress
+from .pattern_layout.near_closed_strokes import discover_multi_stroke_alternatives, source_contour_fragments
+from .pattern_layout.short_stroke_tips import short_tip_outline
 from .pattern_layout.layout_marker_v5 import classify_layout_markers
 
 ENGINE_VERSION='v6b-program-only-experimental-with-source-contour-alternatives'
@@ -21,8 +24,9 @@ def runtime_version():
     return recognition_runtime_version()
 
 
-def source_paths(raw):
-    parsed = parse(raw)
+def source_paths(raw, *, apply_page_offsets=True, apply_command_boundaries=True, command_boundaries_version=2):
+    parsed = parse(raw, apply_page_offsets=apply_page_offsets, apply_command_boundaries=apply_command_boundaries,
+                   command_boundaries_version=command_boundaries_version)
     metrics = parsed['metrics']
     units = metrics['units_per_inch'] / 25.4
     paths = []
@@ -36,11 +40,16 @@ def source_paths(raw):
     return parsed, paths
 
 
-def recognize_source(raw, name='source.plt'):
+def recognize_source(raw, name='source.plt', *, include_full_support_audit=True, on_progress=None, recognition_mode='strict'):
+    if recognition_mode not in ('strict', 'relaxed'):
+        raise ValueError('未知识别模式')
+    report_progress(on_progress, 'parsing', 0, 1)
     parsed, paths = source_paths(raw)
+    report_progress(on_progress, 'parsing', 1, 1)
     m = parsed['metrics']
     units = m['units_per_inch']/25.4
-    result = build_geometry(paths, m['width_mm'], m['height_mm'], units)
+    result = build_geometry(paths, m['width_mm'], m['height_mm'], units,
+                            include_full_support_audit=include_full_support_audit,on_progress=on_progress)
     result['v5_layout_marker_audit'] = classify_layout_markers(result, paths, numeric_epsilon_mm=PARAMS['numeric_epsilon_plotter_units']/units,
                                                             min_span_to_symbol_ratio=PARAMS['layout_marker_min_span_to_symbol_ratio'], apply=True)
     # Keep the original experimental grouping intact for inspect/restore. A nested
@@ -50,7 +59,9 @@ def recognize_source(raw, name='source.plt'):
     eps = PARAMS['numeric_epsilon_plotter_units']/units
     alternatives = []
     alternative_polys = {}
-    for path in paths:
+    report_progress(on_progress, 'alternatives', 0, len(paths))
+    for path_index, path in enumerate(paths):
+        report_progress(on_progress, 'alternatives', path_index, len(paths))
         line = LineString(path['points'])
         if len(path['points'])<4 or math.dist(path['points'][0],path['points'][-1])>PARAMS['near_closed_tolerance_mm']:
             continue
@@ -110,15 +121,65 @@ def recognize_source(raw, name='source.plt'):
     result['source_contour_frame_audit'] = {'frame_candidate_ids': [candidate['id'] for candidate, _ in frame_candidates],
                                             'min_envelope_fill': PARAMS['frame_min_envelope_fill'], 'boundary_fraction': PARAMS['frame_boundary_fraction'],
                                             'witness_area_mm2': PARAMS['frame_body_witness_area_mm2']}
+    # 多笔备选独立追加；不重排、合并或替换既有候选和原路径。
+    excluded = {path_id for candidate in alternatives for path_id in candidate.get('source_closed_path_ids', [])}
+    strict_params = {**PARAMS, 'multi_stroke_join_tolerance_mm': .1}
+    joined = discover_multi_stroke_alternatives(paths, excluded, eps, strict_params)
+    if recognition_mode == 'relaxed':
+        members = {frozenset(candidate['source_closed_path_ids']) for candidate, _ in joined}
+        relaxed_params = {**PARAMS, 'multi_stroke_join_tolerance_mm': .5}
+        for candidate, poly in discover_multi_stroke_alternatives(paths, excluded, eps, relaxed_params):
+            identity = frozenset(candidate['source_closed_path_ids'])
+            if identity in members:
+                continue
+            # 宽松新增轮廓使用独立身份，不覆盖严格模式中的同名裁片。
+            candidate['id'] = candidate['id'].replace('SJ-', 'SJW-', 1)
+            candidate['issues'].insert(0, {'code': 'relaxed_stroke_join_needs_review', 'tolerance_mm': .5})
+            joined.append((candidate, poly))
+            members.add(identity)
+    result['pieces'].extend(candidate for candidate, _ in joined)
+    # 兼容短端线作为新增备选追加，已有候选的分类、顺序与原段保持。
+    def add_source_alternative(path, poly, outer, contour_issues):
+        fragments = source_contour_fragments(paths, {path['id']}, poly, eps)
+        candidate_id = 'S-' + path['id']
+        alternatives.append({'id': candidate_id, 'status': 'independent_source_contour_needs_review',
+                             'bounds': bounds_of_points(path['points']), 'outer': outer, 'fragments': fragments,
+                             'source_closed_path_ids': [path['id']], 'semantic_piece_verified': False,
+                             'content_complete_for_region': True,
+                             'issues': contour_issues + [{'code': 'interior_geometry_may_include_other_real_pieces_or_sizes'},
+                                        {'code': 'not_semantic_piece_truth_no_exclusive_owner_assumed'}]})
+        alternative_polys[candidate_id] = poly
+
+    previous_alternative_count = len(alternatives)
+    covered_paths = {
+        path_id
+        for candidate in result['pieces'] + result['auxiliary'] + alternatives
+        for path_id in candidate.get('source_closed_path_ids', ())
+    }
+    for path in paths:
+        if path['id'] in covered_paths:
+            continue
+        recognized = short_tip_outline(path['points'], units, eps, PARAMS)
+        if recognized is None:
+            continue
+        poly, gap, tip_sides = recognized
+        add_source_alternative(path, poly, [list(point) for point in poly.exterior.coords], [{
+            'code': 'source_short_tip_separated_for_recognition', 'sides': tip_sides, 'gap_mm': gap,
+        }])
+    result['pieces'].extend(alternatives[previous_alternative_count:])
     result.update(schema_version=1, paths=paths,
                   source={'sha256': hashlib.sha256(raw).hexdigest(), 'name': name, 'width_mm': m['width_mm'], 'height_mm': m['height_mm'],
                           'units_per_mm': units, 'raw_bounds': [m['min_x'],m['min_y'],m['max_x'],m['max_y']], 'warnings': parsed['warnings'],
                           'engine_version': ENGINE_VERSION,
-                          'algorithm_parameters': PARAMS, 'semantic_verified': False, 'runtime_version': runtime_version()},
+                          'algorithm_parameters': PARAMS, 'semantic_verified': False, 'runtime_version': runtime_version(),
+                          'recognition_mode': recognition_mode,
+                          'multi_stroke_join_tolerance_mm': .5 if recognition_mode == 'relaxed' else .1},
                   non_path_shapes=[s for s in parsed['shapes'] if 'points' not in s])
+    result['source'].update(layout_parse_flags(parsed))
     for candidate in result['pieces']:
         poly = make_valid(Polygon(candidate['outer']))
         candidate['text_ids'] = [s['id'] for s in result['non_path_shapes'] if s['type']=='text' and poly.covers(Point((s['point']['x']-m['min_x'])/units, (m['max_y']-s['point']['y'])/units))]
+    report_progress(on_progress, 'alternatives', len(paths), len(paths))
     return result
 
 
@@ -132,7 +193,7 @@ class PatternLayoutExportError(ValueError):
         'no_selected_fragments':'请先选择并放置至少一片裁片。',
         'label_pose_not_faithful':'设备文字旋转或镜像暂无法保真，请保留草稿并调整该片姿态后再试。',
         'line_type_phase_not_faithful':'该设备线型的截取相位暂无法保真，请保留草稿并反馈原文件。',
-        'label_control_not_supported':'原文件文字控制指令暂无法保真导出，请保留草稿并反馈原文件。',
+        'label_control_not_supported':'原件标注含分号或不支持的控制字符，无法保真导出。请保留原件和排版草稿。',
         'invalid_fold_edge':'折边无效或与当前裁片、布面不一致，请保留草稿并重新确认折边。',
     }
     def __init__(self,code):
@@ -441,7 +502,13 @@ def export_project(source_bytes, document):
         lay_mode=_fabric_lay_mode(document)
         fold_side=_fabric_fold_side(document,schema)
         if lay_mode=='folded' and fold_side=='bottom' and schema!=3:_fold_error()
-    parsed, paths = source_paths(source_bytes)
+    # 旧工程按保存时的指令边界和坐标解释重建源线。
+    flags = layout_parse_flags(document.get('source_metadata'))
+    flags.update(layout_parse_flags(document))
+    parsed, paths = source_paths(source_bytes,
+                                 apply_page_offsets=flags.get('page_x_offsets_applied', False),
+                                 apply_command_boundaries=flags.get('layout_command_boundaries_applied', False),
+                                 command_boundaries_version=flags.get('layout_command_boundaries_version', 1))
     from .plt_parser import curve_approximation_warning
     acknowledged = document.get('acknowledged_source_warnings', [])
     unconfirmed=[];unsupported=[]

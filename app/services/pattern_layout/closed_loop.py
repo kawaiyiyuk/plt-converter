@@ -4,11 +4,11 @@ import json,math,hashlib,argparse,collections
 from shapely.geometry import LineString,Polygon,box,GeometryCollection,mapping
 from shapely.ops import unary_union,polygonize_full
 from .quality_guards import apply_quality_guards
-from .independent_shells import discover,whole_path_owners,support_refs
+from .independent_shells import discover,whole_path_owners,support_refs,report_progress
 from .layout_marker_v5 import classify_layout_markers
 # AI 实验假设：仅扩大疑框边界和近包含关系容差；不证明裁片语义。
 # 原点、完整源环、内线与待核观察记录仍按冻结 V5 逻辑保留。
-PARAMS={'numeric_epsilon_plotter_units':1e-7,'near_containment_outside_mm2':10.,'near_containment_relative':.0002,'frame_body_witness_area_mm2':1000.,'frame_boundary_fraction':.05,'frame_min_envelope_fill':.9,'circle_arc_chord_error_mm':.05,'whole_path_near_band_plotter_units':2.,'structural_shell_area_epsilon_mm2':1e-6,'layout_marker_min_span_to_symbol_ratio':20.0,'min_candidate_area_mm2':100.,'near_closed_tolerance_mm':1.}
+PARAMS={'numeric_epsilon_plotter_units':1e-7,'near_containment_outside_mm2':10.,'near_containment_relative':.0002,'frame_body_witness_area_mm2':1000.,'frame_boundary_fraction':.05,'frame_min_envelope_fill':.9,'circle_arc_chord_error_mm':.05,'whole_path_near_band_plotter_units':2.,'structural_shell_area_epsilon_mm2':1e-6,'layout_marker_min_span_to_symbol_ratio':20.0,'min_candidate_area_mm2':100.,'near_closed_tolerance_mm':1.,'multi_stroke_join_tolerance_mm':.1,'short_tip_max_plotter_units':400.,'short_tip_min_angle_deg':70.,'short_tip_max_angle_deg':110.}
 ROOT=Path(__file__).resolve().parents[1]
 def digest(v):return hashlib.sha256(json.dumps(v,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
 def bounds_of_points(pts):
@@ -43,7 +43,7 @@ def complement(parts):
         cursor=max(cursor,b)
     if cursor<1-1e-12:out.append((cursor,1.))
     return out
-def build_geometry(paths,width,height,units):
+def build_geometry(paths,width,height,units,*,include_full_support_audit=True,on_progress=None):
     eps=PARAMS['numeric_epsilon_plotter_units']/units;lines={p['id']:LineString(p['points']) for p in paths if len(p['points'])>=2};byid={p['id']:p for p in paths};loops=[]
     for pid,line in lines.items():
         if line.is_ring and line.is_valid:
@@ -62,7 +62,8 @@ def build_geometry(paths,width,height,units):
         if p.equals(p.envelope) and near and independent and no_shared:frames.append(l)
     frame_ids={id for l in frames for id in l['source_ids']}
     original=[l for l in loops if l not in frames]
-    usable,alternatives,discovery=discover(paths,original,frame_ids,PARAMS,eps)
+    usable,alternatives,discovery=discover(paths,original,frame_ids,PARAMS,eps,
+                                          include_full_support_audit=include_full_support_audit,on_progress=on_progress)
     min_candidate_area=PARAMS['min_candidate_area_mm2']
     ignored_closed=[l for l in usable if l['poly'].area<min_candidate_area];usable=[l for l in usable if l['poly'].area>=min_candidate_area]
     ignored_alternatives=[l for l in alternatives if l['poly'].area<min_candidate_area];alternatives=[l for l in alternatives if l['poly'].area>=min_candidate_area]
@@ -88,6 +89,9 @@ def build_geometry(paths,width,height,units):
     for rid,ids in families.items():
         for lid in ids:
             for pid in loop_byid[lid]['source_ids']:path_families[pid].add(rid)
+    piece_work_total = len(roots) + len(frames) + len(alternatives) + 1
+    piece_work_done = 0
+    report_progress(on_progress, 'pieces', 0, piece_work_total)
     whole_owners,ownership_audit=whole_path_owners(paths,roots,families,loop_byid,units,eps,PARAMS)
     selected=collections.defaultdict(list);pieces=[];auxiliary=[];outside_records=[];source_total=0.
     def make_piece(loop,pid,status,member_ids):
@@ -137,9 +141,14 @@ def build_geometry(paths,width,height,units):
         if foreign:issues.append({'code':'foreign_closed_contour_or_frame_intersections_not_borrowed','count':len(foreign),'detail':foreign})
         content_audit['selected_outside_root_length_mm']=sum(LineString([f['a'],f['b']]).difference(p).length for f in fragments)
         points=[point for f in fragments for point in (f['a'],f['b'])];b=bounds_of_points(points) or bounds_of_points(polygon_coords(p));return {'id':pid,'status':status,'bounds':b,'outer':polygon_coords(p),'fragments':fragments,'issues':issues,'loop_id':loop['id'],'loop_kind':loop['kind'],'source_evidence':loop.get('proofs',[]),'content_region_audit':content_audit,'area_mm2':p.area,'family_loop_ids':sorted(member_ids),'source_closed_path_ids':sorted(member_paths),'semantic_piece_verified':False}
-    for i,l in enumerate(roots):pieces.append(make_piece(l,f'P{i+1:03d}','closed_shell' if l['kind']=='original_closed_path' else 'multi_path_closed_shell_needs_review',families[l['id']]))
+    for i,l in enumerate(roots):
+        pieces.append(make_piece(l,f'P{i+1:03d}','closed_shell' if l['kind']=='original_closed_path' else 'multi_path_closed_shell_needs_review',families[l['id']]))
+        piece_work_done += 1
+        report_progress(on_progress, 'pieces', piece_work_done, piece_work_total)
     for i,l in enumerate(frames):
         loop_byid[l['id']]=l;auxiliary.append(make_piece(l,f'A{i+1:03d}','suspected_layout_frame',{l['id']}))
+        piece_work_done += 1
+        report_progress(on_progress, 'pieces', piece_work_done, piece_work_total)
     def original_path_fragments(ids):
         result=[]
         for sid in ids:
@@ -153,7 +162,10 @@ def build_geometry(paths,width,height,units):
         if l in roots:continue
         # 内部闭环全部入观察账；片内容已由外壳选择，不把它们静默删掉。
         auxiliary.append({'id':f'A{len(auxiliary)+1:03d}','status':'nested_content_loop','bounds':bounds_of_points(polygon_coords(l['poly'])),'outer':polygon_coords(l['poly']),'fragments':original_path_fragments(l['source_ids']),'issues':[{'code':'nested_loop_included_in_outer_content_not_separate_semantic_piece'}],'loop_id':l['id'],'source_closed_path_ids':l['source_ids'],'area_mm2':l['poly'].area,'parent_loop_ids':parents[l['id']]})
-    for l in alternatives:auxiliary.append({'id':f'A{len(auxiliary)+1:03d}','status':l['kind'],'proof_level':l.get('proof_level'),'bounds':bounds_of_points(polygon_coords(l['poly'])),'outer':polygon_coords(l['poly']),'fragments':support_refs(l['poly'],paths,eps),'issues':[{'code':l.get('reason','source_support_dependency')}],'source_evidence':l.get('proofs',[])})
+    for l in alternatives:
+        auxiliary.append({'id':f'A{len(auxiliary)+1:03d}','status':l['kind'],'proof_level':l.get('proof_level'),'bounds':bounds_of_points(polygon_coords(l['poly'])),'outer':polygon_coords(l['poly']),'fragments':support_refs(l['poly'],paths,eps),'issues':[{'code':l.get('reason','source_support_dependency')}],'source_evidence':l.get('proofs',[])})
+        piece_work_done += 1
+        report_progress(on_progress, 'pieces', piece_work_done, piece_work_total)
     shared=[];multi=[];unassigned=[];zero=[]
     for source in paths:
         distance=0.
@@ -168,4 +180,6 @@ def build_geometry(paths,width,height,units):
                 if len(owners)>1:(shared if all(r['on_boundary'] for r in owners) else multi).append({'path_id':source['id'],'segment_index':si,'t0':t0,'t1':t1,'piece_ids':sorted({r['piece_id'] for r in owners}),'length_mm':(t1-t0)*length})
             distance+=length
     result={'pieces':pieces,'auxiliary':auxiliary,'issues':[{'code':'geometry_only_not_semantic_piece_truth'},{'code':'cross_piece_interior_intervals','count':len(multi)}],'unassigned':{'count':len(unassigned),'length_mm':sum(math.dist(f['a'],f['b']) for f in unassigned),'fragments':unassigned,'zero_length_segments':zero},'ownership_audit':ownership_audit,'source_discovery_audit':discovery,'boundary_audit':{'definitions':{'shared_segments':'原segment参数区间同时在多个owner的完整边界上；可同源双引用','multi_owner_interiors':'原segment参数区间同时选入>=2 owner且至少一方并非完整边界；不是裁片数/准确率'},'shared_interval_count':len(shared),'multi_owner_interval_count':len(multi),'multi_owner_distinct_source_segment_count':len({(f['path_id'],f['segment_index']) for f in multi}),'multi_owner_total_interval_length_mm':sum(f['length_mm'] for f in multi),'shared_segments':shared,'multi_owner_interiors':multi,'near_containment_relations':near_relations},'geometry_audit':{'original_closed_path_count':len([l for l in loops if l['kind']=='original_closed_path']),'polygonized_face_count':len(faces.geoms),'cut_count':len(cuts.geoms),'dangle_count':len(dangles.geoms),'invalid_ring_count':len(invalid.geoms),'source_total_line_length_mm':source_total,'frame_path_ids':sorted(frame_ids),'loop_registry':[{'id':l['id'],'kind':l['kind'],'source_path_ids':l['source_ids'],'outer':polygon_coords(l['poly']),'area_mm2':l['poly'].area} for l in loops],'source_points_moved':False,'gap_filling':False,'coordinate_snapping':False},'small_candidate_filter':{'threshold_mm2':min_candidate_area,'ignored_closed_loop_count':len(ignored_closed),'ignored_face_alternative_count':len(ignored_alternatives),'ignored_source_contour_count':0,'ignored_count':len(ignored_closed)+len(ignored_alternatives)}}
-    return apply_quality_guards(result,paths,units,eps,PARAMS)
+    guarded = apply_quality_guards(result,paths,units,eps,PARAMS)
+    report_progress(on_progress, 'pieces', piece_work_total, piece_work_total)
+    return guarded
