@@ -860,6 +860,12 @@ def download_plt(job_id):
 
 @pdf_bp.post('/attachment/jobs')
 def create_pattern_pdf_job():
+    # 产品决定暂时关闭纸样附件 PDF 自动转换：在读取文件、计费与入队前直接拒绝，
+    # 保护仍会调用旧接口的客户端。独立工具转换接口不受影响。
+    return jsonify({
+        'error': '纸样附件 PDF 自动转换已暂停，请先将文件转为 PLT 后再上传',
+        'status': 'disabled',
+    }), 410
     uploaded = request.files.get('file')
     validation_error = validate_pdf_upload(uploaded)
     if validation_error:

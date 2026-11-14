@@ -134,6 +134,7 @@ class PatternPdfRoutesTest(unittest.TestCase):
         save_job(record, self.redis)
         return record
 
+    @unittest.skip('纸样附件 PDF 自动转换已关闭，历史用例暂保留')
     def test_bearer_and_layout_token_can_submit_query_and_download(self):
         for headers in (
             {'Authorization': 'Bearer good'},
@@ -241,6 +242,7 @@ class PatternPdfRoutesTest(unittest.TestCase):
         self.assertEqual(response.get_json()['status'], 'billing_rejected')
         layout_identity.assert_not_called()
 
+    @unittest.skip('纸样附件 PDF 自动转换已关闭，历史用例暂保留')
     def test_billing_rejection_is_forwarded_and_nothing_is_queued(self):
         rejection = BillingRejected('需要确认扣费', 402, {
             'points_required': 50,
@@ -262,6 +264,7 @@ class PatternPdfRoutesTest(unittest.TestCase):
         self.assertIs(payload['insufficient_points'], False)
         self.assertEqual(self.redis.llen('rq:queue:conversions'), 0)
 
+    @unittest.skip('纸样附件 PDF 自动转换已关闭，历史用例暂保留')
     def test_allow_charge_header_is_passed_to_authorization(self):
         with patch(
             'app.routes.authorize_pattern_pdf', return_value=self.authorize(True)
