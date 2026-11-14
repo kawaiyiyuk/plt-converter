@@ -862,8 +862,13 @@ def download_plt(job_id):
 def create_pattern_pdf_job():
     # 产品决定暂时关闭纸样附件 PDF 自动转换：在读取文件、计费与入队前直接拒绝，
     # 保护仍会调用旧接口的客户端。独立工具转换接口不受影响。
+    # 旧网页在替换确认前会清空“来自 PDF 自动转换，请核对裁片”来源提示，而收到 410
+    # 后画布/候选保留，故补一条条件性核对提醒；它不改变支持的格式、额度或 HTTP status。
     return jsonify({
-        'error': '纸样附件 PDF 自动转换已暂停，请先将文件转为 PLT 后再上传',
+        'error': (
+            '纸样附件 PDF 自动转换已暂停，请先将文件转为 PLT 后再上传；'
+            '若当前裁片来自 PDF，请重新核对裁片。'
+        ),
         'status': 'disabled',
     }), 410
     uploaded = request.files.get('file')
