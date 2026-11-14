@@ -70,6 +70,10 @@ POST /api/v1/pdf/repage/inspect
 GET  /api/v1/pdf/repage/jobs/<job_id>
 DELETE /api/v1/pdf/repage/jobs/<job_id>
 GET  /api/v1/pdf/repage/files/<job_id>.pdf
+POST /api/v1/pdf/attachment/jobs
+GET  /api/v1/pdf/attachment/jobs/<job_id>
+DELETE /api/v1/pdf/attachment/jobs/<job_id>
+GET  /api/v1/pdf/attachment/files/<job_id>.plt
 GET  /api/v1/pdf/previews/<preview_id>/<page>.png
 ```
 
@@ -80,6 +84,8 @@ PDF→PLT 生成结果同样受 `PLT_MAX_PATHS`、`PLT_MAX_COMMANDS`、`PLT_MAX_
 `GET /api/v1/pdf/preview/jobs/<job_id>/layout-suggestion` 不在 API 请求线程内直接扫描 PDF。首次调用把分析放入 `pdf-layout-analysis` 队列并返回 HTTP 202 / `analyzing`，客户端继续轮询；完成后同一接口返回缓存建议。正式转换和排版分析分别由独立 RQ Worker 消费，两个队列互不等待；健康检查要求两个队列都存在活跃消费者。
 
 `POST /api/v1/pdf/repage/inspect` 在用户选择 PDF 后立即返回原 PDF 页数和可复用的 `source_id`；临时源文件默认保留 1800 秒。`POST /api/v1/pdf/repage/jobs` 通过同一客户端的 `source_id` 复用文件，不再重复上传，`paper_size` 接受 A0～A4 或 `SINGLE`。`SINGLE` 把完整纸样按 1:1 输出为一页，四边加 10mm 空白；当前 PDF 1.4 结果页单边最多 5080mm（含空白），超出时任务失败并释放额度。成功结果同时返回原 PDF 页数、输出 PDF 页数、`output_width_mm` 和 `output_height_mm`，整张结果文件名使用 `-整张.pdf`。单页源 PDF 按 1×1 处理；多页源 PDF 仅在本服务排版元数据有效，或矢量接缝分析达到中/高可信度时自动转换。证据不足、纯图片多页或版式歧义会明确失败，不猜测拼版。三类转换共用每日 3 次免费额度，仅在成功生成文件后计次；处理中任务暂占名额，失败或完成前取消会释放。免费成功次数未满 3 次但名额均被处理中任务占用时，新请求先等待结果，不提前要求看广告。超额转换需完整观看激励广告，不扣布豆；永久 VIP 免广告且不限次数。广告支持失败或完成前取消后再试 1 次，计费服务暂时无法释放资格时，失败或取消任务会在后续查询中重试。预留有效期默认 150 分钟，覆盖 20 个队列任务、210 秒单次超时及一次重试的最坏生命周期。
+
+`POST /api/v1/pdf/attachment/jobs` 只自动转换可靠的裁片排版附件 PDF：每页都存整张纸样的 PDF（直接取第 1 页全部路径，不拼页）、单页矢量、带本服务完整排版元数据的 PDF，或跨页矢量接缝达到高可信度的多页 PDF 才会放行；扫描件、图片页、证据不足或排版把握不够时明确失败，不猜测拼版。多页矢量转换会尝试裁边校正、删除页框并焊接接缝，结果带 `layout_source`、`layout_confidence`、`skipped_page_indexes`、`seam_repair` 和 `review_required`。接口接受小程序 `Authorization` 或网页 `X-Layout-Token`；额度、免费次数和扣费确认由 wx-server 的 `pattern-pdf/authorize` 决定，402 时按返回的 `insufficient_points` 与 `points_required` 提示或确认后带 `X-Conversion-Allow-Charge: true` 重试。
 
 生成文件后，任务先在内部 `finalizing` 状态确认计次；对外仍显示处理中。若计次服务短暂失联或任务状态写入失败，后续任务查询和转换 Worker 每 5 分钟的清理循环会重试确认，不重新生成文件。确认前会检查结果文件仍存在；若文件丢失，只允许服务间接口携带 `rollback_completed=true` 补偿释放该任务的已确认免费额度。只有状态正式成为 `done`，下载接口才提供结果文件。
 

@@ -132,7 +132,7 @@ def parse_preserve_outer_edges(value=False):
     raise ValueError('preserve_outer_edges 只支持 true 或 false')
 
 
-def convert_pdf_to_plt(source, options=None):
+def convert_pdf_to_plt(source, options=None, path_postprocessor=None):
     """Convert vector PDF paths, or raster page lines as a best-effort fallback, to HPGL."""
     options = options or {}
     fitz = load_fitz()
@@ -230,8 +230,9 @@ def convert_pdf_to_plt(source, options=None):
     output_width = columns * tile_width + max(columns - 1, 0) * gap_units
     output_height = rows * tile_height + max(rows - 1, 0) * gap_units
     window_offsets = {}
+    min_x, min_y = 0, 0
     if preserve_outer_edges:
-        min_x, min_y, max_x, max_y = 0, 0, output_width, output_height
+        max_x, max_y = output_width, output_height
         for slot_index, page_index in placements:
             row, column = page_index_to_cell(slot_index, rows, columns, order)
             expand_left, expand_bottom = extensions[page_index]
@@ -258,6 +259,24 @@ def convert_pdf_to_plt(source, options=None):
 
     if not output_paths:
         raise ValueError('PDF 页面没有可转换的线条内容')
+    if path_postprocessor is not None:
+        seam_x = [index * (tile_width + gap_units) - min_x for index in range(1, columns)]
+        seam_y = [index * (tile_height + gap_units) - min_y for index in range(1, rows)]
+        grid = {
+            'x': seam_x + [
+                -min_x,
+                columns * tile_width + (columns - 1) * gap_units - min_x,
+            ],
+            'y': seam_y + [
+                -min_y,
+                rows * tile_height + (rows - 1) * gap_units - min_y,
+            ],
+            'seam_x': seam_x,
+            'seam_y': seam_y,
+        }
+        output_paths = path_postprocessor(output_paths, grid)
+        if not output_paths:
+            raise ValueError('PDF 页面没有可转换的线条内容')
     embedded_layout_applied = embedded_layout_matches_options(
         embedded_layout,
         rows,

@@ -8,7 +8,15 @@ from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request, send_file, url_for
 
-from .billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
+from .billing import (
+    BillingRejected,
+    authorize_conversion,
+    authorize_pattern_pdf,
+    commit_conversion,
+    identify_layout_user,
+    identify_user,
+    release_conversion,
+)
 from .tasks import finalize_ready_conversion_job
 from .services.plt_metadata import inspect_plt
 from .services.plt_parser import parse_plt
@@ -95,7 +103,7 @@ def settle_terminal_conversion_billing(record):
     if record.get('billing_released') is True:
         return record
     if not record.get('billing_request_id') or not (
-        record.get('job_type') == 'pdf_to_pdf'
+        record.get('job_type') in {'pdf_to_pdf', 'pattern_pdf_to_plt'}
         or record.get('billing_access_method') in {'ad', 'free'}
     ):
         return record
@@ -120,8 +128,18 @@ def authenticated_user_key():
     return identify_user(request.headers.get('Authorization'))
 
 
-def owned_job(job_id, expected_type=None):
-    user_key = authenticated_user_key()
+def attachment_user_key():
+    authorization = request.headers.get('Authorization')
+    if authorization:
+        return identify_user(authorization)
+    layout_token = request.headers.get('X-Layout-Token')
+    if layout_token:
+        return identify_layout_user(layout_token)
+    raise BillingRejected('请先登录后再使用转换功能', 401)
+
+
+def owned_job(job_id, expected_type=None, user_key=None):
+    user_key = user_key or authenticated_user_key()
     record = load_job(job_id)
     if not record or record.get('user_key') != user_key:
         return None
@@ -208,6 +226,7 @@ def job_response(record):
         source_page_count = (record.get('options') or {}).get('source_page_count')
         if source_page_count:
             response['source_page_count'] = int(source_page_count)
+    if record.get('job_type') in {'pdf_to_pdf', 'pattern_pdf_to_plt'}:
         if 'billing_released' in record:
             response['billing_released'] = bool(record.get('billing_released'))
     if record.get('status') == 'done':
@@ -218,6 +237,10 @@ def job_response(record):
             response['pdf_path'] = url_for('pdf.download_repaged_pdf', job_id=record['job_id'])
         elif record.get('job_type') == 'pdf_to_plt':
             response['plt_path'] = url_for('pdf.download_plt', job_id=record['job_id'])
+        elif record.get('job_type') == 'pattern_pdf_to_plt':
+            response['plt_path'] = url_for(
+                'pdf.download_attachment_plt', job_id=record['job_id']
+            )
         elif record.get('job_type') == 'pdf_preview':
             preview_id = record['job_id']
             response['status'] = 'preview_ready'
@@ -833,6 +856,112 @@ def download_plt(job_id):
         return jsonify({'error': 'PLT 文件不存在或已过期'}), 404
     filename = (record.get('result') or {}).get('filename', f'{job_id}.plt') if record else f'{job_id}.plt'
     return send_file(output_path, mimetype='application/octet-stream', as_attachment=True, download_name=filename, max_age=0)
+
+
+@pdf_bp.post('/attachment/jobs')
+def create_pattern_pdf_job():
+    uploaded = request.files.get('file')
+    validation_error = validate_pdf_upload(uploaded)
+    if validation_error:
+        return validation_error
+    billing = None
+    record = None
+    billing_confirmed = False
+    try:
+        source = uploaded.read()
+        pdf_page_count(source)
+        billing = authorize_pattern_pdf(
+            request.headers.get('Authorization'),
+            request.headers.get('X-Layout-Token'),
+            conversion_request_id(),
+            conversion_allow_charge(),
+        )
+        record = submit_job(
+            'pattern_pdf_to_plt',
+            source,
+            safe_uploaded_filename(request.form.get('original_filename') or uploaded.filename),
+            {},
+            f"user:{billing['user_id']}",
+            billing_request_id=billing['request_id'],
+            billing_access_method=billing.get('access_method'),
+        )
+        record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
+        billing_confirmed = True
+    except SubmissionConflict as error:
+        return jsonify({'error': str(error), 'status': 'conflict'}), 409
+    except BillingRejected as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        return billing_error(error)
+    except RedisError as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        return redis_unavailable(error)
+    except QueueRejected as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        return queue_error(error)
+    except ValueError as error:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        return jsonify({'error': str(error)}), 422
+    except Exception:
+        rollback_conversion_submission(billing, record, billing_confirmed)
+        raise
+    return jsonify(job_response(record)), 200
+
+
+@pdf_bp.get('/attachment/jobs/<job_id>')
+def get_pattern_pdf_job(job_id):
+    try:
+        user_key = attachment_user_key()
+        record = owned_job(job_id, 'pattern_pdf_to_plt', user_key)
+        record = settle_terminal_conversion_billing(record)
+    except BillingRejected as error:
+        return billing_error(error)
+    if record:
+        return jsonify(job_response(record))
+    return jsonify({'error': '任务不存在或已过期'}), 404
+
+
+@pdf_bp.delete('/attachment/jobs/<job_id>')
+def cancel_pattern_pdf_job(job_id):
+    try:
+        user_key = attachment_user_key()
+        owned = owned_job(job_id, 'pattern_pdf_to_plt', user_key)
+        if not owned:
+            return jsonify({'error': '任务不存在或已过期'}), 404
+        record = cancel_job(job_id, user_key, expected_type='pattern_pdf_to_plt')
+        record = settle_terminal_conversion_billing(record)
+    except BillingRejected as error:
+        return billing_error(error)
+    except PermissionError as error:
+        return jsonify({'error': str(error)}), 403
+    except QueueRejected as error:
+        return queue_error(error)
+    except RedisError as error:
+        return redis_unavailable(error)
+    if not record:
+        return jsonify({'error': '任务不存在或已过期'}), 404
+    return jsonify(job_response(record))
+
+
+@pdf_bp.get('/attachment/files/<job_id>.plt')
+def download_attachment_plt(job_id):
+    try:
+        user_key = attachment_user_key()
+        record = owned_job(job_id, 'pattern_pdf_to_plt', user_key)
+    except BillingRejected as error:
+        return billing_error(error)
+    if not record or record.get('status') != 'done':
+        return jsonify({'error': 'PLT 文件不存在或已过期'}), 404
+    output_path = Path(record.get('result_path')) if record else None
+    if output_path is None or not output_path.exists():
+        return jsonify({'error': 'PLT 文件不存在或已过期'}), 404
+    filename = (record.get('result') or {}).get('filename', f'{job_id}.plt')
+    return send_file(
+        output_path,
+        mimetype='application/octet-stream',
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
 
 
 @plt_bp.get('/metrics')
