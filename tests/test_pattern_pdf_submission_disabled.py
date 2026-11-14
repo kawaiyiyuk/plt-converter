@@ -127,6 +127,23 @@ class PatternPdfSubmissionDisabledTest(unittest.TestCase):
             '关闭入口时不得写入计费账本',
         )
 
+    def test_disabled_message_reminds_pdf_derived_pattern_pieces_need_recheck(self):
+        # 旧网页在替换确认前就会清空“来自 PDF 自动转换，请核对裁片”来源提示；
+        # 收到真实 410 时画布与候选仍在，因此文案必须补一条条件性核对提醒。
+        response = self.post({'Authorization': 'Bearer good'})
+
+        self.assertEqual(response.status_code, 410, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(
+            payload['error'],
+            '纸样附件 PDF 自动转换已暂停，请先将文件转为 PLT 后再上传；'
+            '若当前裁片来自 PDF，请重新核对裁片。',
+        )
+        self.assertIn('暂停', payload['error'])
+        self.assertIn('PLT', payload['error'])
+        self.assertIn('裁片', payload['error'])
+        self.assertEqual(self.queue.job_ids, [])
+
     def test_disabled_even_with_charge_headers_and_layout_token(self):
         response = self.post({
             'X-Layout-Token': 'layout-good',
