@@ -1,9 +1,13 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.billing import BillingRejected, authorize_conversion, commit_conversion, identify_user, release_conversion
 from app.routes import rollback_conversion_submission
-from app.tasks import commit_successful_conversion_billing, release_failed_conversion_billing
+from app.tasks import (
+    commit_successful_conversion_billing,
+    release_failed_conversion_billing,
+    settle_release_with_conflict_guard,
+)
 
 
 class BillingTest(unittest.TestCase):
@@ -123,6 +127,79 @@ class BillingTest(unittest.TestCase):
             42, 'lost-output', 'job-4', rollback_completed=True,
         ))
         self.assertTrue(request.call_args.args[1]['rollback_completed'])
+
+    @patch.dict('os.environ', {'CONVERSION_SERVICE_TOKEN': 'service-token'})
+    @patch('app.billing._json_request')
+    def test_release_conflict_is_durable_but_other_failures_are_retryable(self, request):
+        request.return_value = (409, {
+            'message': '转换任务编号与计费记录不匹配',
+            'data': {'request_id': 'another-request'},
+        })
+
+        with self.assertRaises(BillingRejected) as raised:
+            release_conversion(42, 'conflicting-request', 'job-5')
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(str(raised.exception), '转换任务编号与计费记录不匹配')
+        self.assertEqual(raised.exception.data['request_id'], 'another-request')
+
+        request.return_value = (500, {'message': '计费服务内部错误'})
+        self.assertFalse(release_conversion(42, 'retryable-request', 'job-6'))
+
+        request.return_value = (401, {'message': '服务令牌失效'})
+        self.assertFalse(release_conversion(42, 'unauthorized-request', 'job-7'))
+
+        request.side_effect = BillingRejected('转换计费服务暂时不可用，请稍后重试', 503)
+        self.assertFalse(release_conversion(42, 'unreachable-request', 'job-8'))
+
+    @patch('app.routes.release_conversion', side_effect=BillingRejected('编号不匹配', 409))
+    @patch('app.routes.cancel_job', return_value={'status': 'cancelled'})
+    def test_submit_rollback_release_conflict_does_not_mask_original_error(self, cancel, release):
+        rollback_conversion_submission(
+            {'user_id': 42, 'request_id': 'conflict-request'},
+            {'job_id': 'job-1'},
+        )
+
+        cancel.assert_called_once_with('job-1', 'user:42')
+        release.assert_called_once_with(42, 'conflict-request', 'job-1')
+
+    @patch('app.tasks.update_job')
+    def test_release_guard_rejects_invalid_identity_without_calling_backend(self, update):
+        connection = object()
+        release = Mock(return_value=True)
+        updated = {'job_id': 'job-1', 'billing_released': False}
+        update.return_value = updated
+        cases = (
+            ('client-42', 'request-1', 'job-1'),
+            ('', 'request-1', 'job-1'),
+            ('user:42', '', 'job-1'),
+            ('user:42', None, 'job-1'),
+            ('user:42', 'request-1', None),
+            ('user:', 'request-1', 'job-1'),
+            ('user:not-a-number', 'request-1', 'job-1'),
+        )
+        for user_key, request_id, job_id in cases:
+            with self.subTest(user_key=user_key, request_id=request_id, job_id=job_id):
+                update.reset_mock()
+                record = {
+                    'user_key': user_key,
+                    'billing_request_id': request_id,
+                    'job_id': job_id,
+                }
+                settled, released = settle_release_with_conflict_guard(
+                    record, connection, release,
+                )
+                self.assertIs(released, False)
+                release.assert_not_called()
+                if job_id:
+                    update.assert_called_once_with(
+                        job_id, connection, billing_released=False,
+                    )
+                    self.assertIs(settled, updated)
+                else:
+                    update.assert_not_called()
+                    self.assertIs(settled, record)
+        release.assert_not_called()
 
 
 if __name__ == '__main__':
