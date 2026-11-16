@@ -17,7 +17,7 @@ from .billing import (
     identify_user,
     release_conversion,
 )
-from .tasks import finalize_ready_conversion_job
+from .tasks import finalize_ready_conversion_job, settle_release_with_conflict_guard
 from .services.plt_metadata import inspect_plt
 from .services.plt_parser import parse_plt
 from .services.pdf_renderer import measure_display_bounds
@@ -88,7 +88,21 @@ def rollback_conversion_submission(billing, record, billing_confirmed=False):
                 return
         except (RedisError, QueueRejected, PermissionError):
             pass
-    release_conversion(billing['user_id'], billing['request_id'], job_id)
+    try:
+        release_conversion(billing['user_id'], billing['request_id'], job_id)
+    except BillingRejected:
+        # A release conflict must not mask the original submission failure.
+        pass
+
+
+def confirm_submitted_job(record, user_key):
+    """Confirm a submitted job without dropping its replay marker."""
+    deduplicated = record.get('deduplicated', False)
+    confirmed = confirm_job_billing(record['job_id'], user_key)
+    if deduplicated and confirmed:
+        # Confirmation reloads the record, so restore response-only replay state.
+        confirmed['deduplicated'] = True
+    return confirmed
 
 
 def settle_terminal_conversion_billing(record):
@@ -100,7 +114,7 @@ def settle_terminal_conversion_billing(record):
             raise BillingRejected('转换结果确认暂时不可用，请稍后重试', 503) from error
     if not record or record.get('status') not in {'failed', 'cancelled'}:
         return record
-    if record.get('billing_released') is True:
+    if record.get('billing_released') is True or record.get('billing_release_conflict') is True:
         return record
     if not record.get('billing_request_id') or not (
         record.get('job_type') in {'pdf_to_pdf', 'pattern_pdf_to_plt'}
@@ -110,16 +124,19 @@ def settle_terminal_conversion_billing(record):
     user_key = str(record.get('user_key') or '')
     if not user_key.startswith('user:'):
         raise BillingRejected('转换任务缺少额度信息', 503)
-    release_options = {'rollback_completed': True} if record.get('billing_release_completed') else {}
-    released = release_conversion(
-        int(user_key.split(':', 1)[1]),
-        record['billing_request_id'],
-        record['job_id'],
-        **release_options,
-    )
-    record = update_job(record['job_id'], billing_released=bool(released))
+    status_label = '取消' if record.get('status') == 'cancelled' else '失败'
+    try:
+        record, released = settle_release_with_conflict_guard(
+            record, None, release_conversion,
+        )
+    except BillingRejected as error:
+        raise BillingRejected(
+            f'任务已{status_label}，额度释放暂未完成，请稍后重试', 503,
+        ) from error
+    if record.get('billing_release_conflict'):
+        # The conflict is now part of the terminal job; stop polling retries.
+        return record
     if not released:
-        status_label = '取消' if record['status'] == 'cancelled' else '失败'
         raise BillingRejected(f'任务已{status_label}，额度释放暂未完成，请稍后重试', 503)
     return record
 
@@ -229,6 +246,9 @@ def job_response(record):
     if record.get('job_type') in {'pdf_to_pdf', 'pattern_pdf_to_plt'}:
         if 'billing_released' in record:
             response['billing_released'] = bool(record.get('billing_released'))
+    if record.get('billing_release_conflict'):
+        response['billing_release_conflict'] = True
+        response['billing_released'] = False
     if record.get('status') == 'done':
         response.update({key: value for key, value in result.items() if key not in {'result_path', 'mime_type'}})
         if record.get('job_type') == 'plt_to_pdf':
@@ -332,10 +352,12 @@ def create_conversion_job():
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
             billing_access_method=billing.get('access_method'),
+            billing_status=billing.get('status'),
+            billing_job_id=billing.get('job_id'),
         )
         commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         billing_confirmed = True
-        record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
+        record = confirm_submitted_job(record, f"user:{billing['user_id']}")
     except SubmissionConflict as error:
         return jsonify({'error': str(error), 'status': 'conflict'}), 409
     except BillingRejected as error:
@@ -492,10 +514,12 @@ def create_pdf_to_plt_job():
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
             billing_access_method=billing.get('access_method'),
+            billing_status=billing.get('status'),
+            billing_job_id=billing.get('job_id'),
         )
         commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
         billing_confirmed = True
-        record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
+        record = confirm_submitted_job(record, f"user:{billing['user_id']}")
     except SubmissionConflict as error:
         return jsonify({'error': str(error), 'status': 'conflict'}), 409
     except BillingRejected as error:
@@ -579,10 +603,12 @@ def create_pdf_to_pdf_job():
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
             billing_access_method=billing.get('access_method'),
+            billing_status=billing.get('status'),
+            billing_job_id=billing.get('job_id'),
         )
         if billing.get('access_method') == 'ad':
             commit_conversion(billing['user_id'], billing['request_id'], record['job_id'])
-        record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
+        record = confirm_submitted_job(record, f"user:{billing['user_id']}")
         billing_confirmed = True
     except SubmissionConflict as error:
         return jsonify({'error': str(error), 'status': 'conflict'}), 409
@@ -860,6 +886,17 @@ def download_plt(job_id):
 
 @pdf_bp.post('/attachment/jobs')
 def create_pattern_pdf_job():
+    # 产品决定暂时关闭纸样附件 PDF 自动转换：在读取文件、计费与入队前直接拒绝，
+    # 保护仍会调用旧接口的客户端。独立工具转换接口不受影响。
+    # 旧网页在替换确认前会清空“来自 PDF 自动转换，请核对裁片”来源提示，而收到 410
+    # 后画布/候选保留，故补一条条件性核对提醒；它不改变支持的格式、额度或 HTTP status。
+    return jsonify({
+        'error': (
+            '纸样附件 PDF 自动转换已暂停，请先将文件转为 PLT 后再上传；'
+            '若当前裁片来自 PDF，请重新核对裁片。'
+        ),
+        'status': 'disabled',
+    }), 410
     uploaded = request.files.get('file')
     validation_error = validate_pdf_upload(uploaded)
     if validation_error:
@@ -884,8 +921,10 @@ def create_pattern_pdf_job():
             f"user:{billing['user_id']}",
             billing_request_id=billing['request_id'],
             billing_access_method=billing.get('access_method'),
+            billing_status=billing.get('status'),
+            billing_job_id=billing.get('job_id'),
         )
-        record = confirm_job_billing(record['job_id'], f"user:{billing['user_id']}")
+        record = confirm_submitted_job(record, f"user:{billing['user_id']}")
         billing_confirmed = True
     except SubmissionConflict as error:
         return jsonify({'error': str(error), 'status': 'conflict'}), 409

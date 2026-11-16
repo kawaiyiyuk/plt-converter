@@ -134,11 +134,21 @@ def release_conversion(user_id, request_id, job_id=None, rollback_completed=Fals
             payload,
             {'X-Conversion-Service-Token': service_token},
         )
+        if status == 409:
+            # The billing record no longer matches this job id. Retrying cannot
+            # succeed, so surface it instead of reporting a temporary failure.
+            raise BillingRejected(
+                body.get('message') or '转换任务编号与计费记录不匹配',
+                409,
+                body.get('data'),
+            )
         if status != 200:
             return False
         data = body.get('data') or {}
         return data.get('released') is True or data.get('idempotent') is True
-    except BillingRejected:
+    except BillingRejected as error:
+        if error.status_code == 409:
+            raise
         return False
 
 

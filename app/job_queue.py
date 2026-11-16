@@ -97,7 +97,8 @@ def job_record_ttl(record=None):
         return max(retention, 150 * 60)
     if (record and record.get('status') in {'failed', 'cancelled'}
             and record.get('billing_request_id')
-            and record.get('billing_released') is False):
+            and record.get('billing_released') is False
+            and not record.get('billing_release_conflict')):
         return max(retention, 150 * 60)
     layout_status = ((record or {}).get('result') or {}).get('layout_suggestion_status')
     layout_active = layout_status in {'queued', 'processing'}
@@ -363,6 +364,7 @@ def matches_billing_submission(record, job_type, source, filename, options, conn
 def submit_job(
     job_type, source, filename, options, user_key, connection=None,
     billing_request_id=None, billing_access_method=None,
+    billing_status=None, billing_job_id=None,
 ):
     connection = connection or redis_connection()
     cleanup_expired_job_files(connection)
@@ -376,20 +378,28 @@ def submit_job(
         billing_key = None
         if billing_request_id:
             billing_key = f'plt-converter:billing-request:{user_key}:{billing_request_id}'
-            billing_job_id = connection.get(billing_key)
-            if isinstance(billing_job_id, bytes):
-                billing_job_id = billing_job_id.decode('utf-8')
-            billing_job = load_job(billing_job_id, connection) if billing_job_id else None
+            cached_job_id = connection.get(billing_key)
+            if isinstance(cached_job_id, bytes):
+                cached_job_id = cached_job_id.decode('utf-8')
+            billing_job = load_job(cached_job_id, connection) if cached_job_id else None
+            if not billing_job and billing_job_id and billing_job_id != cached_job_id:
+                candidate_job = load_job(billing_job_id, connection)
+                if candidate_job and candidate_job.get('user_key') == user_key:
+                    billing_job = candidate_job
             if billing_job and (
                 billing_job.get('status') in ACTIVE_STATUSES
                 or completed_result_available(billing_job)
             ):
                 if not matches_billing_submission(billing_job, job_type, source, filename, options, connection):
                     raise SubmissionConflict('转换请求编号已用于不同文件或参数，请重新提交')
+                if not cached_job_id or billing_job['job_id'] != cached_job_id:
+                    connection.setex(billing_key, job_record_ttl(billing_job), billing_job['job_id'])
                 billing_job['deduplicated'] = True
                 return billing_job
-            if billing_job_id:
+            if cached_job_id:
                 connection.delete(billing_key)
+            if billing_status == 'active':
+                raise SubmissionConflict('原转换任务已过期或结果不可用，请重新发起转换')
 
         existing_id = connection.get(fingerprint_key)
         if isinstance(existing_id, bytes):

@@ -55,16 +55,63 @@ def release_failed_conversion_billing(record):
         return False
 
 
+def settle_release_with_conflict_guard(record, connection, release_fn):
+    """Release one terminal job's usage and persist the authoritative result.
+
+    A backend 409 means the job number no longer matches the billing record, so
+    the conflict is stored once and never retried as a temporary failure.
+    Other failures stay retryable and are re-raised for the caller to decide
+    whether to surface them to a client.
+    """
+    if record.get('billing_released') is True or record.get('billing_release_conflict') is True:
+        return record, bool(record.get('billing_released'))
+    user_key = str(record.get('user_key') or '')
+    request_id = record.get('billing_request_id')
+    job_id = record.get('job_id')
+    if not user_key.startswith('user:') or not request_id or not job_id:
+        if job_id:
+            return update_job(job_id, connection, billing_released=False), False
+        return record, False
+    try:
+        user_id = int(user_key.split(':', 1)[1])
+    except ValueError:
+        return update_job(job_id, connection, billing_released=False), False
+    release_options = {'rollback_completed': True} if record.get('billing_release_completed') else {}
+    try:
+        released = bool(release_fn(
+            user_id, request_id, job_id, **release_options,
+        ))
+    except BillingRejected as error:
+        if error.status_code != 409:
+            update_job(job_id, connection, billing_released=False)
+            raise
+        changes = {
+            'billing_released': False,
+            'billing_release_conflict': True,
+            'billing_release_error': str(error),
+        }
+        if record.get('status') == 'failed' and not record.get('error'):
+            changes['error'] = str(error)
+        return update_job(job_id, connection, **changes), False
+    return update_job(job_id, connection, billing_released=released), released
+
+
 def persist_terminal_conversion_billing_release(record, connection):
     """Release a failed/cancelled free or ad-backed job and persist the result."""
     if not _requires_conversion_billing(record):
         return record
-    billing_released = release_failed_conversion_billing(record)
-    return update_job(
-        record['job_id'],
-        connection,
-        billing_released=bool(billing_released),
-    )
+    try:
+        settled, _released = settle_release_with_conflict_guard(
+            record, connection, release_conversion,
+        )
+    except Exception:
+        # Preserve the original conversion failure. A reserved usage that cannot
+        # be released immediately still expires in the main backend and is
+        # retried when the client polls the terminal job.
+        if record.get('job_id'):
+            return update_job(record['job_id'], connection, billing_released=False)
+        return record
+    return settled
 
 
 def commit_successful_conversion_billing(record):

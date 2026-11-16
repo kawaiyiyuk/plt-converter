@@ -783,6 +783,130 @@ class PdfToPdfTest(unittest.TestCase):
                 self.assertEqual(release.call_count, 2)
                 self.assertTrue(load_job(record['job_id'], self.redis)['billing_released'])
 
+    def test_release_conflict_is_terminal_for_worker_and_later_polls(self):
+        with patch('app.job_queue.redis_connection', return_value=self.redis):
+            record = submit_job(
+                'pdf_to_pdf',
+                b'%PDF-source',
+                'sample.pdf',
+                {'paper_size': 'A4'},
+                'user:7',
+                billing_request_id='pdf-to-pdf-release-conflict',
+            )
+            confirm_job_billing(record['job_id'], 'user:7')
+
+        with patch('app.tasks.redis_connection', return_value=self.redis), \
+                patch('app.tasks.convert_pdf_to_pdf', side_effect=ValueError('无法可靠识别')), \
+                patch('app.tasks.release_conversion', side_effect=BillingRejected(
+                    '转换任务编号与计费记录不匹配', 409,
+                )) as release:
+            with self.assertRaisesRegex(ValueError, '无法可靠识别'):
+                execute_job(record['job_id'])
+
+        failed = load_job(record['job_id'], self.redis)
+        self.assertEqual(failed['status'], 'failed')
+        self.assertEqual(failed['error'], '无法可靠识别')
+        self.assertIs(failed['billing_released'], False)
+        self.assertTrue(failed['billing_release_conflict'])
+        self.assertEqual(failed['billing_release_error'], '转换任务编号与计费记录不匹配')
+        self.assertEqual(release.call_count, 1)
+        self.assertLess(job_record_ttl(failed), 150 * 60)
+
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authenticated_user_key', return_value='user:7'), \
+                patch('app.routes.release_conversion') as polled_release:
+            response = app.test_client().get(
+                f"/api/v1/pdf/repage/jobs/{record['job_id']}"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['status'], 'failed')
+        self.assertTrue(response.get_json()['billing_release_conflict'])
+        self.assertIs(response.get_json()['billing_released'], False)
+        polled_release.assert_not_called()
+
+    def test_cancelled_release_conflict_returns_terminal_response_once(self):
+        with patch('app.job_queue.redis_connection', return_value=self.redis):
+            record = submit_job(
+                'pdf_to_pdf',
+                b'%PDF-source',
+                'sample.pdf',
+                {'paper_size': 'A4'},
+                'user:7',
+                billing_request_id='pdf-to-pdf-cancel-conflict',
+            )
+            confirm_job_billing(record['job_id'], 'user:7')
+
+        app = create_app()
+        url = f"/api/v1/pdf/repage/jobs/{record['job_id']}"
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authenticated_user_key', return_value='user:7'), \
+                patch('app.routes.release_conversion', side_effect=BillingRejected(
+                    '转换任务编号与计费记录不匹配', 409,
+                )) as release:
+            cancelled_response = app.test_client().delete(url)
+            polled = app.test_client().get(url)
+
+        self.assertEqual(cancelled_response.status_code, 200)
+        cancelled_body = cancelled_response.get_json()
+        self.assertEqual(cancelled_body['status'], 'cancelled')
+        self.assertTrue(cancelled_body['billing_release_conflict'])
+        self.assertIs(cancelled_body['billing_released'], False)
+        self.assertEqual(polled.status_code, 200)
+        self.assertEqual(polled.get_json()['status'], 'cancelled')
+        self.assertTrue(polled.get_json()['billing_release_conflict'])
+        self.assertEqual(release.call_count, 1)
+        stored = load_job(record['job_id'], self.redis)
+        self.assertEqual(stored['status'], 'cancelled')
+        self.assertIs(stored['billing_released'], False)
+        self.assertTrue(stored['billing_release_conflict'])
+        self.assertEqual(stored['billing_release_error'], '转换任务编号与计费记录不匹配')
+
+    def test_polling_a_failed_job_persists_a_release_conflict_and_stops_retrying(self):
+        with patch('app.job_queue.redis_connection', return_value=self.redis):
+            record = submit_job(
+                'pdf_to_pdf',
+                b'%PDF-source',
+                'sample.pdf',
+                {'paper_size': 'A4'},
+                'user:7',
+                billing_request_id='pdf-to-pdf-poll-conflict',
+            )
+            confirm_job_billing(record['job_id'], 'user:7')
+            update_job(
+                record['job_id'],
+                self.redis,
+                status='failed',
+                error='转换失败',
+                billing_released=False,
+            )
+
+        app = create_app()
+        url = f"/api/v1/pdf/repage/jobs/{record['job_id']}"
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.authenticated_user_key', return_value='user:7'), \
+                patch('app.routes.release_conversion', side_effect=BillingRejected(
+                    '转换任务编号与计费记录不匹配', 409,
+                )) as release:
+            first = app.test_client().get(url)
+            second = app.test_client().get(url)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.get_json()['status'], 'failed')
+        self.assertTrue(first.get_json()['billing_release_conflict'])
+        self.assertIs(first.get_json()['billing_released'], False)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.get_json()['billing_release_conflict'])
+        self.assertEqual(release.call_count, 1)
+        stored = load_job(record['job_id'], self.redis)
+        self.assertEqual(stored['error'], '转换失败')
+        self.assertTrue(stored['billing_release_conflict'])
+        self.assertIs(stored['billing_released'], False)
+
     def test_cancelled_free_job_releases_its_daily_slot(self):
         with patch('app.job_queue.redis_connection', return_value=self.redis):
             record = submit_job(

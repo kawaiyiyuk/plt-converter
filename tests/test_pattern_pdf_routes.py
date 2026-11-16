@@ -134,6 +134,7 @@ class PatternPdfRoutesTest(unittest.TestCase):
         save_job(record, self.redis)
         return record
 
+    @unittest.skip('纸样附件 PDF 自动转换已关闭，历史用例暂保留')
     def test_bearer_and_layout_token_can_submit_query_and_download(self):
         for headers in (
             {'Authorization': 'Bearer good'},
@@ -241,6 +242,7 @@ class PatternPdfRoutesTest(unittest.TestCase):
         self.assertEqual(response.get_json()['status'], 'billing_rejected')
         layout_identity.assert_not_called()
 
+    @unittest.skip('纸样附件 PDF 自动转换已关闭，历史用例暂保留')
     def test_billing_rejection_is_forwarded_and_nothing_is_queued(self):
         rejection = BillingRejected('需要确认扣费', 402, {
             'points_required': 50,
@@ -262,6 +264,7 @@ class PatternPdfRoutesTest(unittest.TestCase):
         self.assertIs(payload['insufficient_points'], False)
         self.assertEqual(self.redis.llen('rq:queue:conversions'), 0)
 
+    @unittest.skip('纸样附件 PDF 自动转换已关闭，历史用例暂保留')
     def test_allow_charge_header_is_passed_to_authorization(self):
         with patch(
             'app.routes.authorize_pattern_pdf', return_value=self.authorize(True)
@@ -280,6 +283,31 @@ class PatternPdfRoutesTest(unittest.TestCase):
             response.get_json()['job_type'], 'pattern_pdf_to_plt'
         )
 
+    @unittest.skip('纸样附件 PDF 自动转换已关闭，历史用例暂保留')
+    def test_replayed_submission_returns_same_job_marked_deduplicated(self):
+        with patch(
+            'app.routes.authorize_pattern_pdf', return_value=self.authorize()
+        ):
+            first = self.post({'Authorization': 'Bearer good'})
+            self.assertEqual(first.status_code, 200, first.get_json())
+            first_payload = first.get_json()
+            self.assertIs(first_payload['deduplicated'], False)
+
+            replay = self.post({'Authorization': 'Bearer good'})
+            self.assertEqual(replay.status_code, 200, replay.get_json())
+            replay_payload = replay.get_json()
+
+        self.assertIs(replay_payload['deduplicated'], True)
+        self.assertEqual(replay_payload['job_id'], first_payload['job_id'])
+        self.assertEqual(self.queue.count, 1)
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/pdf/attachment/jobs/{first_payload['job_id']}",
+                headers={'Authorization': 'Bearer good'},
+            ).get_json()['deduplicated'],
+            False,
+        )
+
     def test_cancel_uses_the_same_ownership_rules(self):
         record = self.save_record()
         response = self.client.delete(
@@ -289,6 +317,73 @@ class PatternPdfRoutesTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(response.get_json()['status'], 'cancelled')
+
+    @unittest.skip('纸样附件 PDF 自动转换已关闭，历史用例暂保留')
+    def test_replayed_active_request_after_redis_loss_returns_conflict_without_new_job(self):
+        with patch(
+            'app.routes.authorize_pattern_pdf', return_value=self.authorize()
+        ):
+            first = self.post({'Authorization': 'Bearer good'})
+        self.assertEqual(first.status_code, 200, first.get_json())
+        first_job_id = first.get_json()['job_id']
+        self.assertEqual(self.queue.count, 1)
+
+        # 模拟 Redis 重启丢失或超过 1800s TTL 过期后，计费账本仍保留 active 与原 job_id
+        self.redis.flushall()
+        active_auth = {
+            **self.authorize(),
+            'status': 'active',
+            'job_id': first_job_id,
+            'idempotent': True,
+        }
+        with (
+            patch('app.routes.authorize_pattern_pdf', return_value=active_auth),
+            patch('app.routes.release_conversion') as release_mock,
+            patch('app.tasks.commit_conversion') as commit_mock,
+        ):
+            replay = self.post({'Authorization': 'Bearer good'})
+
+        self.assertEqual(replay.status_code, 409, replay.get_json())
+        self.assertEqual(replay.get_json()['status'], 'conflict')
+        self.assertEqual(self.queue.count, 1)
+        release_mock.assert_not_called()
+        commit_mock.assert_not_called()
+
+    @unittest.skip('纸样附件 PDF 自动转换已关闭，历史用例暂保留')
+    def test_replayed_active_request_recovers_existing_job_when_billing_key_missing(self):
+        with patch(
+            'app.routes.authorize_pattern_pdf', return_value=self.authorize()
+        ):
+            first = self.post({'Authorization': 'Bearer good'})
+        self.assertEqual(first.status_code, 200, first.get_json())
+        first_job_id = first.get_json()['job_id']
+
+        result_path = Path(self.directory.name) / 'recovered.plt'
+        result_path.write_bytes(b'IN;PU0,0;PD10,10;')
+        update_job(
+            first_job_id,
+            self.redis,
+            status='done',
+            progress=100,
+            result_path=str(result_path),
+            result={'filename': 'attachment.plt', 'result_path': str(result_path)},
+        )
+        self.redis.delete('plt-converter:billing-request:user:42:request-1')
+
+        active_auth = {
+            **self.authorize(),
+            'status': 'active',
+            'job_id': first_job_id,
+            'idempotent': True,
+        }
+        with patch('app.routes.authorize_pattern_pdf', return_value=active_auth):
+            replay = self.post({'Authorization': 'Bearer good'})
+
+        self.assertEqual(replay.status_code, 200, replay.get_json())
+        payload = replay.get_json()
+        self.assertEqual(payload['job_id'], first_job_id)
+        self.assertIs(payload['deduplicated'], True)
+        self.assertEqual(self.queue.count, 1)
 
 
 if __name__ == '__main__':

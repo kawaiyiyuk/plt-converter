@@ -220,6 +220,50 @@ class SubmissionIdentityTest(unittest.TestCase):
                 commit.assert_not_called()
                 release.assert_not_called()
 
+    def test_replayed_route_submissions_keep_deduplicated_flag(self):
+        def pdf_with_line():
+            document = pymupdf.open()
+            page = document.new_page(width=300, height=300)
+            page.draw_line((20, 40), (280, 40))
+            source = document.tobytes()
+            document.close()
+            return source
+
+        client = create_app().test_client()
+        cases = (
+            ('/api/v1/plt/jobs', 'source.plt', b'IN;PU0,0;PD1016,1016;'),
+            ('/api/v1/pdf/jobs', 'source.pdf', pdf_with_line()),
+            ('/api/v1/pdf/repage/jobs', 'source.pdf', pdf_with_line()),
+        )
+        for index, (route, filename, source) in enumerate(cases):
+            request_id = f'deduplicated-route-{index}'
+            with self.subTest(route=route), \
+                    patch('app.routes.authorize_job', return_value={
+                        'user_id': 42, 'request_id': request_id,
+                    }), patch('app.routes.commit_conversion'), \
+                    patch('app.routes.release_conversion'), \
+                    patch('app.routes.pdf_page_count', return_value=1):
+                first = client.post(
+                    route,
+                    data={'file': (io.BytesIO(source), filename), 'paper_size': 'A4'},
+                )
+                self.assertEqual(first.status_code, 200, first.get_json())
+                self.assertFalse(first.get_json()['deduplicated'])
+
+                repeated = client.post(
+                    route,
+                    data={'file': (io.BytesIO(source), filename), 'paper_size': 'A4'},
+                )
+                self.assertEqual(repeated.status_code, 200, repeated.get_json())
+                self.assertEqual(
+                    repeated.get_json()['job_id'], first.get_json()['job_id'],
+                )
+                self.assertTrue(repeated.get_json()['deduplicated'])
+                self.assertEqual(
+                    load_job(first.get_json()['job_id'], self.redis)['status'],
+                    'queued',
+                )
+
     def test_cancellation_respects_route_type_and_ownership(self):
         client = create_app().test_client()
         routes = {

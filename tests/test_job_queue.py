@@ -16,6 +16,7 @@ from app.routes import parse_pdf_render_options, parse_render_options, parse_uni
 from app.job_queue import (
     JOB_OUTPUT_VERSIONS,
     QueueRejected,
+    SubmissionConflict,
     cleanup_expired_job_files,
     confirm_job_billing,
     enforce_rate_limit,
@@ -321,6 +322,45 @@ class JobQueueTest(unittest.TestCase):
             self.submit(source=b'IN;PU0,0;PD1016,1016;')
             with self.assertRaises(QueueRejected):
                 self.submit(user='user-b', source=b'IN;PU0,0;PD2032,2032;')
+
+    def test_active_billing_without_job_id_cannot_replay_a_lost_job(self):
+        for missing_job_id in (None, ''):
+            with self.subTest(missing_job_id=missing_job_id):
+                with self.assertRaises(SubmissionConflict):
+                    submit_job(
+                        'plt_to_pdf',
+                        b'IN;PU0,0;PD1016,1016;',
+                        'sample.plt',
+                        {'units_per_inch': 1016},
+                        'user:42',
+                        connection=self.redis,
+                        billing_request_id=f'lost-active-{missing_job_id}',
+                        billing_status='active',
+                        billing_job_id=missing_job_id,
+                    )
+                self.assertEqual(self.redis.llen('rq:queue:conversions'), 0)
+                self.assertEqual(self.redis.keys('plt-converter:job:*'), [])
+
+    def test_active_replay_without_job_id_returns_conflict_without_enqueueing(self):
+        app = create_app()
+        with patch('app.routes.redis_connection', return_value=self.redis), \
+                patch('app.job_queue.redis_connection', return_value=self.redis), \
+                patch('app.routes.pdf_page_count', return_value=1), \
+                patch('app.routes.read_pdf_layout_metadata', return_value=None), \
+                patch('app.routes.authorize_job', return_value={
+                    'user_id': 7,
+                    'request_id': 'lost-active-replay',
+                    'status': 'active',
+                }):
+            response = app.test_client().post(
+                '/api/v1/pdf/repage/jobs',
+                data={'paper_size': 'A4', 'file': (io.BytesIO(b'%PDF'), 'sample.pdf')},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()['status'], 'conflict')
+        self.assertEqual(self.redis.llen('rq:queue:conversions'), 0)
+        self.assertEqual(self.redis.keys('plt-converter:job:*'), [])
 
     def test_rate_limit_rejects_excess_submissions(self):
         with patch.dict(os.environ, {'PLT_RATE_LIMIT_PER_MINUTE': '2'}):
