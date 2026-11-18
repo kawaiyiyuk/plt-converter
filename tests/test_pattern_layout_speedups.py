@@ -9,6 +9,19 @@ from app.services.pattern_layout.closed_loop import interval_parts
 from app.services.pattern_layout_api import recognize_source
 
 class PatternLayoutSpeedupTests(unittest.TestCase):
+    def test_known_segment_length_skips_clipping_geometry_outside_piece(self):
+        region = box(0, 0, 10, 10)
+        eps = 1e-9
+        start, end = (-5, 5), (5, 5)
+        length = LineString([start, end]).length
+        expected = interval_parts(start, end, region, eps, region.bounds)
+
+        self.assertEqual(interval_parts(start, end, region, eps, region.bounds, source_length=length), expected)
+        with patch('app.services.pattern_layout.closed_loop.LineString') as line_string:
+            self.assertEqual(interval_parts((-10, 5), (-5, 5), region, eps, region.bounds, source_length=5), [])
+            self.assertEqual(interval_parts((5, 5), (5, 5), region, eps, region.bounds, source_length=0), [])
+            line_string.assert_not_called()
+
     def test_borrowed_edge_checks_reuse_intersections_and_respect_exclusions(self):
         from app.services.pattern_layout.independent_shells import _borrowed_root_edge_check
 
