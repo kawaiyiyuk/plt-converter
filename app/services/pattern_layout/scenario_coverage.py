@@ -1,7 +1,8 @@
 """Reuse source-path coverage when excluding paths cannot affect a boundary."""
 from functools import lru_cache
+from math import ulp
 
-from shapely import STRtree, prepare
+from shapely import STRtree, prepare, total_bounds
 from shapely.errors import GEOSException
 from shapely.ops import unary_union
 
@@ -16,10 +17,18 @@ class ScenarioCoverage:
         self.eps = eps
         path_ids = tuple(path_covers)
         covers = list(path_covers.values())
-        tree = STRtree(covers)
         full_cover = unary_union(covers)
         prepare(full_cover)
         self.full_cover = full_cover
+        self.original_coverage = None
+
+        # A narrow buffer near the precision of large coordinates can collapse
+        # differently when a union is evaluated on a subset of the input.
+        # Keep at least eight bits of rounding headroom for the shortcut.
+        largest_coordinate = max(abs(value) for value in total_bounds(covers))
+        if not eps > 256 * ulp(largest_coordinate):
+            return
+        tree = STRtree(covers)
 
         @lru_cache(maxsize=256)
         def original_coverage(boundary):
@@ -37,7 +46,7 @@ class ScenarioCoverage:
             nonlocal scenario_cover
             if not excluded:
                 return _uncovered_length(boundary, self.full_cover)
-            if scenario_cover is None:
+            if scenario_cover is None and self.original_coverage is not None:
                 try:
                     touching, covered, gap = self.original_coverage(boundary)
                     if excluded.isdisjoint(touching):
@@ -52,6 +61,7 @@ class ScenarioCoverage:
                 except GEOSException:
                     # A failed shortcut leaves the reference operation in charge.
                     pass
+            if scenario_cover is None:
                 scenario_cover = unary_union([self.path_covers[pid] for pid in retained])
                 prepare(scenario_cover)
             return _uncovered_length(boundary, scenario_cover)

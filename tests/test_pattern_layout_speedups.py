@@ -1,6 +1,8 @@
 import unittest
+from unittest.mock import patch
 
-from shapely.geometry import box
+from shapely.geometry import LineString, box
+from shapely.ops import unary_union
 
 from app.services.pattern_layout.closed_loop import interval_parts
 from app.services.pattern_layout_api import recognize_source
@@ -55,7 +57,6 @@ class PatternLayoutSpeedupTests(unittest.TestCase):
         self.assertEqual(uncovered(boundary), 5.0)
 
     def test_partial_gap_near_epsilon_uses_scenario_union(self):
-        from shapely.ops import unary_union
         from app.services.pattern_layout.scenario_coverage import ScenarioCoverage
 
         eps = 0.125
@@ -69,6 +70,39 @@ class PatternLayoutSpeedupTests(unittest.TestCase):
                     self.assertEqual(measure(boundary), gap)
                     self.assertEqual(measure(boundary), gap)
                     merge.assert_called_once_with([partial])
+
+    def test_extreme_coordinates_use_original_coverage(self):
+        from app.services.pattern_layout.scenario_coverage import ScenarioCoverage
+
+        eps = 2.5e-9
+        x = 1000000.0725528472
+        lower_left = (x, x)
+        lower_right = (x + 1, x)
+        upper_right = (x + 1, x + 1)
+        upper_left = (x, x + 1)
+        edges = [
+            (lower_left, lower_right), (lower_right, upper_right),
+            (upper_right, upper_left), (upper_left, lower_left),
+        ]
+        crossing = 0.37538165934952716
+        slope = -4.592725499853601e-09
+        split = 8.445510547777967e-09 / 2
+        detail = [
+            ((x, x + crossing), (x + 1, x + crossing + slope)),
+            ((x + crossing, x), (x + crossing - slope, x + 1)),
+            (lower_left, upper_right),
+            (lower_left, (x + 0.5 - split, x)),
+            ((x + 0.5 + split, x), lower_right),
+        ]
+        covers = {i: LineString(points).buffer(eps) for i, points in enumerate(edges + detail + edges)}
+        excluded = {1, 10, 12}
+        retained = [key for key in covers if key not in excluded]
+        boundary = LineString(edges[0])
+        reference = unary_union([covers[key] for key in retained])
+        expected = 0.0 if reference.covers(boundary) else boundary.difference(reference).length
+
+        measure = ScenarioCoverage(covers, eps).for_paths(retained, excluded)
+        self.assertEqual(measure(boundary), expected)
 
     def test_interval_parts_bounds_matches_full_region(self):
         region=box(0,0,10,10);eps=1e-9;bounds=region.bounds
