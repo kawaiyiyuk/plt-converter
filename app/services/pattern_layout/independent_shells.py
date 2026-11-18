@@ -3,6 +3,7 @@ import math
 from shapely import STRtree, prepare
 from shapely.geometry import LineString,Polygon,Point,GeometryCollection,box
 from shapely.ops import unary_union,polygonize_full
+from .scenario_coverage import ScenarioCoverage
 
 def polygon_parts(g):return [p for p in getattr(g,'geoms',[g]) if p.geom_type=='Polygon' and not p.is_empty]
 def nearby_contains(outer,inner,params):
@@ -114,6 +115,7 @@ def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=Tr
     report_progress(on_progress, 'outlines', len(paths) + 1, len(paths) + 1)
     scenario_audit=[]
     report_progress(on_progress, 'scenarios', 0, len(scenarios))
+    scenario_coverage = ScenarioCoverage(path_covers, eps)
     for scenario_index, (name,excluded) in enumerate(scenarios):
         if excluded:
             work = {pid:line for pid,line in available.items() if pid not in excluded}
@@ -123,16 +125,14 @@ def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=Tr
             work, n, pg, bad = available, net, faces, invalid
         filled = unary_union([Polygon(f.exterior) for f in pg.geoms])
         count = 0
-        # 每个场景构建一次覆盖几何，完全覆盖时无需做差集；其余情况用原操作数。
-        source_cover = unary_union([path_covers[pid] for pid in work])
+        uncovered_length = scenario_coverage.for_paths(work, excluded)
         # 旧覆盖对照和全网路径清单用于调试，不参与闭壳判定。
         legacy_cover = n.buffer(eps) if include_full_support_audit else None
-        prepare(source_cover)
         if legacy_cover is not None:
             prepare(legacy_cover)
         for poly in polygon_parts(filled):
             boundary = poly.boundary
-            support_gap = 0.0 if source_cover.covers(boundary) else boundary.difference(source_cover).length
+            support_gap = uncovered_length(boundary)
             support_record = {'scenario':name,'epsilon_mm':eps,'method':'per_original_path_buffer_then_union',
                               'source_path_count':len(work),'boundary_length_mm':poly.length,
                               'supported_missing_length_mm':support_gap}
