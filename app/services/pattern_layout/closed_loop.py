@@ -19,12 +19,21 @@ def segments(line):
     if line.is_empty:return []
     if line.geom_type in ('LineString','LinearRing'):return [line]
     return [q for g in getattr(line,'geoms',[]) for q in segments(g)]
-def interval_parts(a,b,region,eps,bounds=None):
-    line=LineString([a,b]);length=line.length
+def interval_parts(a,b,region,eps,bounds=None,*,source_length=None):
+    # A cached length comes from the same GEOS line and lets distant segments
+    # skip reconstructing it. Preserve the usual path for all other callers.
+    line = None
+    if source_length is None:
+        line = LineString([a, b])
+        length = line.length
+    else:
+        length = source_length
     if length<=eps:return []
     if bounds is not None:
         x0,y0,x1,y1=bounds
         if max(a[0],b[0])<x0 or min(a[0],b[0])>x1 or max(a[1],b[1])<y0 or min(a[1],b[1])>y1:return []
+    if line is None:
+        line = LineString([a, b])
     result=[]
     for part in segments(line.intersection(region)):
         if part.length<=eps:continue
@@ -94,6 +103,7 @@ def build_geometry(paths,width,height,units,*,include_full_support_audit=True,on
     report_progress(on_progress, 'pieces', 0, piece_work_total)
     whole_owners,ownership_audit=whole_path_owners(paths,roots,families,loop_byid,units,eps,PARAMS)
     selected=collections.defaultdict(list);pieces=[];auxiliary=[];outside_records=[];source_total=0.
+    segment_metadata = {}
     def make_piece(loop,pid,status,member_ids):
         p=loop['poly'];fragments=[];issues=[];crossings=[];member_paths={source for lid in member_ids for source in loop_byid[lid]['source_ids']};foreign=[]
         # 内容域覆盖整个近包含家族；仅用原闭环区域并集，不移动点或替换 root 外环。
@@ -112,10 +122,15 @@ def build_geometry(paths,width,height,units,*,include_full_support_audit=True,on
         for source in paths:
             sid=source['id'];points=source['points'];distance=0.
             if status=='suspected_layout_frame' and sid not in member_paths:continue
-            for si,(a,b) in enumerate(zip(points,points[1:])):
-                segment=LineString([a,b]);length=segment.length;style=source['segment_styles'][si] if si<len(source['segment_styles']) else None
+            metadata = segment_metadata.get(sid)
+            if metadata is None:
+                styles = source['segment_styles']
+                metadata = [(a, b, LineString([a, b]).length, styles[i] if i < len(styles) else None)
+                            for i, (a, b) in enumerate(zip(points, points[1:]))]
+                segment_metadata[sid] = metadata
+            for si, (a, b, length, style) in enumerate(metadata):
                 if length<=eps:continue
-                inside=interval_parts(a,b,content_region,eps,content_bounds)
+                inside=interval_parts(a,b,content_region,eps,content_bounds,source_length=length)
                 if sid in frame_ids and status!='suspected_layout_frame':
                     if inside:foreign.append({'path_id':sid,'segment_index':si,'reason':'suspected_frame_kept_separately','inside_intervals':inside})
                     distance+=length;continue
@@ -125,11 +140,14 @@ def build_geometry(paths,width,height,units,*,include_full_support_audit=True,on
                 if blocked and status!='suspected_layout_frame':
                     possible=[other_owner] if other_owner else sorted(path_families[sid])
                     shared_boundary=unary_union([p.boundary.intersection(loop_byid[rid]['poly'].boundary) for rid in possible if rid in loop_byid])
-                    parts=interval_parts(a,b,shared_boundary,eps)
+                    parts=interval_parts(a,b,shared_boundary,eps,source_length=length)
                     if inside:foreign.append({'path_id':sid,'segment_index':si,'reason':'unique_structural_owner_or_foreign_family_only_shared_boundary_may_be_reused','inside_intervals':inside,'shared_boundary_intervals':parts})
                 else:parts=[(0.,1.)] if own else inside
-                if own and segment.difference(p).length>eps:crossings.append({'path_id':sid,'segment_index':si,'outside_length_mm':segment.difference(p).length,'preserved_complete_family_member':True})
-                elif inside and segment.difference(p).length>eps:crossings.append({'path_id':sid,'segment_index':si,'outside_length_mm':segment.difference(p).length,'preserved_complete_family_member':False})
+                if own or inside:
+                    outside_length = LineString([a, b]).difference(p).length
+                    if outside_length > eps:
+                        crossings.append({'path_id': sid, 'segment_index': si, 'outside_length_mm': outside_length,
+                                          'preserved_complete_family_member': own})
                 for t0,t1 in parts:
                     aa=[a[k]+(b[k]-a[k])*t0 for k in (0,1)];bb=[a[k]+(b[k]-a[k])*t1 for k in (0,1)];on_boundary=LineString([aa,bb]).difference(p.boundary).length<=eps
                     f={'path_id':sid,'segment_index':si,'t0':t0,'t1':t1,'a':aa,'b':bb,'style':style,'distance_from_path_start_mm':distance+t0*length,'on_boundary':on_boundary,'assignment':'original_family_member' if own else ('family_region_inside_or_boundary' if LineString([aa,bb]).difference(p).length>eps else 'polygon_inside_or_boundary')};fragments.append(f)
