@@ -1,5 +1,6 @@
 """保留原子面，用原线独立支持提案；有界/借边本身不等于真实裁片。"""
 import math
+from functools import lru_cache
 from shapely import STRtree, prepare
 from shapely.geometry import LineString,Polygon,Point,GeometryCollection,box
 from shapely.ops import unary_union,polygonize_full
@@ -40,6 +41,49 @@ def report_progress(callback, phase, completed, total):
             callback(phase, completed, total)
         except Exception:
             pass
+
+
+def _borrowed_root_edge_check(roots, eps):
+    root_polygons = [root['poly'] for root in roots]
+    root_boundaries = [polygon.boundary for polygon in root_polygons]
+    root_sources = [frozenset(root['source_ids']) for root in roots]
+    root_tree = STRtree(root_polygons)
+
+    def shares_root_edge(index, polygon, boundary):
+        return (root_boundaries[index].intersection(boundary).length > eps
+                and not polygon.equals(root_polygons[index]))
+
+    @lru_cache(maxsize=256)
+    def boundary_checks(polygon):
+        boundary = polygon.boundary
+        # Bounding boxes only exclude disjoint pairs. Each remaining pair
+        # still uses the original precision check when a scenario needs it.
+        indices = root_tree.query(boundary)
+        # Dense overlaps can have thousands of possible pairs per boundary.
+        # Keep only the boundary in the cache in this case.
+        if indices.size > 256:
+            return boundary, None
+        indices.sort()
+        return boundary, dict.fromkeys(indices)
+
+    def borrows_edge(polygon, excluded):
+        boundary, checks = boundary_checks(polygon)
+        if checks is None:
+            indices = root_tree.query(boundary)
+            indices.sort()
+            return any(root_sources[index].isdisjoint(excluded) and shares_root_edge(index, polygon, boundary)
+                       for index in indices)
+        for index, shares_edge in checks.items():
+            if not root_sources[index].isdisjoint(excluded):
+                continue
+            if shares_edge is None:
+                shares_edge = shares_root_edge(index, polygon, boundary)
+                checks[index] = shares_edge
+            if shares_edge:
+                return True
+        return False
+
+    return borrows_edge
 
 
 def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=True,on_progress=None):
@@ -116,6 +160,7 @@ def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=Tr
     scenario_audit=[]
     report_progress(on_progress, 'scenarios', 0, len(scenarios))
     scenario_coverage = ScenarioCoverage(path_covers, eps)
+    borrows_edge = _borrowed_root_edge_check(original_roots, eps)
     for scenario_index, (name,excluded) in enumerate(scenarios):
         if excluded:
             work = {pid:line for pid,line in available.items() if pid not in excluded}
@@ -146,8 +191,7 @@ def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=Tr
             # 未排除任何锚时只放行完整原path链支持的壳；其他只作混合观察。
             if not excluded and not valid:continue
             # 剩余壳若仍借多个现有独立outer作外围，不因换场景就整体放行。
-            contributing=[r for r in original_roots if not (set(r['source_ids'])&set(excluded)) and r['poly'].boundary.intersection(poly.boundary).length>eps and not poly.equals(r['poly'])]
-            if contributing:continue
+            if borrows_edge(poly, excluded):continue
             proof = {'kind':'independent_network_after_anchor_exclusion' if excluded else 'complete_original_paths_close_boundary',
                      'excluded_source_path_ids':sorted(excluded)}
             if include_full_support_audit:
