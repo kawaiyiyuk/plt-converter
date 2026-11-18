@@ -2,12 +2,53 @@ import unittest
 from unittest.mock import patch
 
 from shapely.geometry import LineString, box
+from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
 from app.services.pattern_layout.closed_loop import interval_parts
 from app.services.pattern_layout_api import recognize_source
 
 class PatternLayoutSpeedupTests(unittest.TestCase):
+    def test_borrowed_edge_checks_reuse_intersections_and_respect_exclusions(self):
+        from app.services.pattern_layout.independent_shells import _borrowed_root_edge_check
+
+        roots = [
+            {'poly': box(50, 0, 60, 10), 'source_ids': ['remote']},
+            {'poly': box(0, 0, 10, 10), 'source_ids': ['same']},
+            {'poly': box(10, 0, 20, 10), 'source_ids': ['edge-a', 'edge-b']},
+            {'poly': box(10, 10, 20, 20), 'source_ids': ['corner']},
+        ]
+        candidate = box(0, 0, 10, 10)
+        check = _borrowed_root_edge_check(roots, 1e-9)
+        original_intersection = BaseGeometry.intersection
+        compared = []
+
+        def count_intersection(left, right, *args, **kwargs):
+            compared.append(left.bounds)
+            return original_intersection(left, right, *args, **kwargs)
+
+        with patch.object(BaseGeometry, 'intersection', count_intersection):
+            self.assertTrue(check(candidate, frozenset()))
+            self.assertFalse(check(candidate, {'edge-b'}))
+            self.assertTrue(check(box(0, 0, 10, 10), {'remote'}))
+            self.assertFalse(check(box(0, 0, 10, 10), {'edge-a'}))
+
+        self.assertEqual(compared, [roots[i]['poly'].bounds for i in (1, 2, 3)])
+
+    def test_dense_borrowed_edge_hits_use_bounded_storage(self):
+        from app.services.pattern_layout.independent_shells import _borrowed_root_edge_check
+
+        roots = [{'poly': box(i / 100, 0, 100 + i / 100, 100), 'source_ids': [i]}
+                 for i in range(300)]
+        candidate = box(0, 0, 20, 20)
+        check = _borrowed_root_edge_check(roots, 1e-9)
+        original_intersection = BaseGeometry.intersection
+
+        with patch.object(BaseGeometry, 'intersection', autospec=True, side_effect=original_intersection) as intersect:
+            self.assertTrue(check(candidate, frozenset()))
+            self.assertTrue(check(candidate, frozenset()))
+        self.assertEqual(intersect.call_count, 2, 'dense hits must not retain a dictionary of every possible pair')
+
     def test_disjoint_scenarios_reuse_original_path_buffer_union(self):
         # Eight independent outlines, each with an interior stroke.
         source = ['IN;']
