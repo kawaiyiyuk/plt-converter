@@ -35,11 +35,20 @@ class TailPaddingProof(unittest.TestCase):
             self.clean + b'\x1a\x00',
         ]
         for raw in cases:
-            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, '无效空字符'):
-                parse(raw)
+            for parser in (parse, lambda source: parse_plt(source, projection=True)):
+                with self.subTest(raw=raw, parser=parser), self.assertRaisesRegex(ValueError, '无效空字符'):
+                    parser(raw)
 
-    def test_other_entrypoints_unchanged(self):
+    def test_formal_conversion_and_projection_ignore_single_tail_padding(self):
         raw = self.clean + b'\x00'
-        self.assertEqual(parse_plt(raw), parse_plt(self.clean))
+        for options in ({}, {'projection': True}):
+            with self.subTest(options=options):
+                self.assertEqual(parse_plt(raw, **options), parse_plt(self.clean, **options))
+
+    def test_strict_parser_still_rejects_null(self):
         with self.assertRaisesRegex(ValueError, '无效空字符'):
-            parse_plt(raw, projection=True)
+            parse_plt(self.clean + b'\x00', strict=True)
+
+    def test_formal_conversion_keeps_legacy_null_handling(self):
+        raw = self.clean.replace(b'2000,0', b'20\x0000,0', 1) + b'\x00\x00'
+        self.assertEqual(parse_plt(raw), parse_plt(self.clean))

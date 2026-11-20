@@ -3,6 +3,7 @@ import math
 from shapely.geometry import Point, Polygon
 from shapely.strtree import STRtree
 from .closed_loop import bounds_of_points, interval_parts, polygon_coords
+from .fragment_index import PathSpatialIndex, collect_region_fragments
 
 JOINED_ISSUE = 'source_strokes_joined_for_recognition'
 
@@ -27,25 +28,76 @@ def _unique_endpoint_pairs(endpoints, tolerance):
         return {}
     tree = STRtree([Point(item['point']) for item in endpoints])
     unique = {}
-    for item in endpoints:
+    for local_i, item in enumerate(endpoints):
         found = None
         ambiguous = False
         for raw_index in tree.query(Point(item['point']), predicate='dwithin', distance=tolerance):
-            index = int(raw_index)
-            if endpoints[index]['path_id'] == item['path_id']:
+            local_j = int(raw_index)
+            if endpoints[local_j]['path_id'] == item['path_id']:
                 continue
             if found is None:
-                found = index
-            elif index != found:
+                found = local_j
+            elif local_j != found:
                 ambiguous = True
                 break
-        unique[item['index']] = None if ambiguous else found
+        unique[local_i] = None if ambiguous else found
     pairs = {}
-    for index, candidate in unique.items():
-        if candidate is not None and unique.get(candidate) == index:
-            pairs[index] = candidate
-            pairs[candidate] = index
+    for local_i, candidate in unique.items():
+        if candidate is not None and unique.get(candidate) == local_i:
+            idx_a = endpoints[local_i]['index']
+            idx_b = endpoints[candidate]['index']
+            pairs[idx_a] = idx_b
+            pairs[idx_b] = idx_a
     return pairs
+
+
+def _tiered_endpoint_pairs(endpoints, tiers, epsilon):
+    """按递增容差逐层锁定唯一跨笔画配对，避免较远相邻轮廓拆散近邻接缝。"""
+    clean_tiers = []
+    for tier in tiers:
+        value = float(tier)
+        if not clean_tiers or value > clean_tiers[-1]:
+            clean_tiers.append(value)
+    if not clean_tiers:
+        return {}
+    if len(clean_tiers) == 1:
+        return _unique_endpoint_pairs(endpoints, clean_tiers[0] + epsilon)
+    pairs = {}
+    remaining = list(endpoints)
+    for tier in clean_tiers:
+        if len(remaining) < 2:
+            break
+        layer_pairs = _unique_endpoint_pairs(remaining, tier + epsilon)
+        if layer_pairs:
+            pairs.update(layer_pairs)
+            matched = set(layer_pairs)
+            remaining = [item for item in remaining if item['index'] not in matched]
+    return pairs
+
+
+def _self_closing_chains(adjacency, endpoints, tolerance):
+    """找出无分叉且首尾在容差内的多笔开链，供宽松模式局部闭合识别。"""
+    seen = set()
+    chains = []
+    for start in sorted(adjacency):
+        if start in seen:
+            continue
+        component = []
+        stack = [start]
+        seen.add(start)
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for neighbour in adjacency[node]:
+                if neighbour not in seen:
+                    seen.add(neighbour)
+                    stack.append(neighbour)
+        ends = [node for node in component if len(adjacency[node]) == 1]
+        if len(component) >= 4 and len(ends) == 2 and all(len(adjacency[node]) in (1, 2) for node in component):
+            a, b = ends[0], ends[1]
+            if endpoints[a]['path_id'] != endpoints[b]['path_id'] and math.dist(endpoints[a]['point'], endpoints[b]['point']) <= tolerance:
+                chains.append((component, a, b))
+    return chains
 
 
 def _endpoint_graph(endpoints, pairs):
@@ -134,41 +186,40 @@ def _dedupe_ring(ring, epsilon):
     return result
 
 
-def source_contour_fragments(paths, member_ids, polygon, epsilon):
+def source_contour_fragments(paths, member_ids, polygon, epsilon, *, path_index=None):
     """单笔与多笔候选共用的源片段提取；只在成员笔画上取完整原段。"""
-    polygon_bounds = polygon.bounds
-    fragments = []
-    for source in paths:
-        for index, (a, b) in enumerate(zip(source['points'], source['points'][1:])):
-            selected = ([(0., 1.)] if source['id'] in member_ids and math.dist(a, b) > epsilon
-                        else interval_parts(a, b, polygon, epsilon, polygon_bounds))
-            for t0, t1 in selected:
-                fragments.append({'path_id': source['id'], 'segment_index': index, 't0': t0, 't1': t1,
-                                  'a': [a[k] + (b[k] - a[k]) * t0 for k in (0, 1)],
-                                  'b': [a[k] + (b[k] - a[k]) * t1 for k in (0, 1)],
-                                  'style': source['segment_styles'][index],
-                                  'assignment': 'geometric_region_ambiguous'})
-    return fragments
+    index = path_index if path_index is not None else PathSpatialIndex(paths)
+    return collect_region_fragments(index, member_ids, polygon, epsilon)
 
 
-def discover_multi_stroke_alternatives(paths, excluded_path_ids, epsilon, params):
+def discover_multi_stroke_alternatives(paths, excluded_path_ids, epsilon, params, *, skip_identities=frozenset(), path_index=None):
     """返回 (候选, 多边形) 列表；不生成任何合成 path 或 fragment。"""
     tolerance = params['multi_stroke_join_tolerance_mm'] + epsilon
+    tiers = params.get('multi_stroke_join_tiers_mm')
+    allow_self_closing = bool(params.get('allow_self_closing_chains', False))
     paths_by_id = {path['id']: path for path in paths}
     path_order = {path['id']: index for index, path in enumerate(paths)}
+    index = path_index if path_index is not None else PathSpatialIndex(paths)
     endpoints = _endpoints(paths, excluded_path_ids)
-    pairs = _unique_endpoint_pairs(endpoints, tolerance)
+    pairs = _tiered_endpoint_pairs(endpoints, tiers, epsilon) if tiers else _unique_endpoint_pairs(endpoints, tolerance)
     adjacency, path_ends = _endpoint_graph(endpoints, pairs)
+    tasks = [(component, pairs, False) for component in _cycles(adjacency)]
+    if allow_self_closing:
+        tasks.extend((component, {**pairs, a: b, b: a}, True) for component, a, b in _self_closing_chains(adjacency, endpoints, tolerance))
     alternatives = []
-    for component in _cycles(adjacency):
-        ordered = _walk_cycle(min(component), endpoints, pairs, path_ends)
+    for component, cycle_pairs, is_self_closing in tasks:
+        ordered = _walk_cycle(min(component), endpoints, cycle_pairs, path_ends)
         if ordered is None or len(ordered) != len(component) // 2:
             continue
         member_ids = sorted(step['path_id'] for step in ordered)
         if len(member_ids) < 2 or len(set(member_ids)) != len(member_ids):
             continue
+        if frozenset(member_ids) in skip_identities:
+            continue
         ring, seams = _ring_for_cycle(ordered, paths_by_id)
-        if not seams or max(seams) <= epsilon:
+        if not seams:
+            continue
+        if not is_self_closing and max(seams) <= epsilon:
             continue
         if any(seam > tolerance for seam in seams):
             continue
@@ -183,7 +234,7 @@ def discover_multi_stroke_alternatives(paths, excluded_path_ids, epsilon, params
         candidate = {'id': 'SJ-' + min(member_ids, key=path_order.__getitem__),
                      'status': 'independent_source_contour_needs_review',
                      'bounds': bounds_of_points(ring), 'outer': polygon_coords(polygon),
-                     'fragments': source_contour_fragments(paths, set(member_ids), polygon, epsilon),
+                     'fragments': source_contour_fragments(paths, set(member_ids), polygon, epsilon, path_index=index),
                      'source_closed_path_ids': member_ids, 'semantic_piece_verified': False,
                      'content_complete_for_region': True,
                      'issues': [{'code': JOINED_ISSUE, 'seam_count': len(seams),

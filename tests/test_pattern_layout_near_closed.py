@@ -199,5 +199,88 @@ class MultiStrokeNearClosedContourTests(unittest.TestCase):
                              for candidate in result['pieces']))
 
 
+class RelaxedModeNearClosedContourTests(unittest.TestCase):
+    def test_0_625mm_gap_recovers_in_relaxed_1mm_mode_only(self):
+        # 两段 100mm×60mm 矩形，一端留 0.625mm (25 绘图单位) 断口
+        raw = b'IN;SP1;PA;PU0,0;PD4000,0,4000,2375;PU4000,2400;PD0,2400,0,0;PU;PG;'
+        strict_res = recognize_source(raw, recognition_mode='strict')
+        self.assertFalse(any(c['id'].startswith('SJ') for c in strict_res['pieces']))
+
+        relaxed_res = recognize_source(raw, recognition_mode='relaxed')
+        sjw = next((c for c in relaxed_res['pieces'] if c['id'].startswith('SJW-')), None)
+        self.assertIsNotNone(sjw)
+        self.assertEqual(sjw['status'], INDEPENDENT_STATUS)
+        self.assertEqual(set(sjw['source_closed_path_ids']), {'shape-1', 'shape-2'})
+        issues = {i['code']: i for i in sjw['issues']}
+        self.assertEqual(issues['relaxed_stroke_join_needs_review']['tolerance_mm'], 1.0)
+        self.assertAlmostEqual(issues[JOINED_ISSUE]['max_seam_mm'], .625, places=3)
+
+        # 导出仍然严格保持原线段，不补线
+        doc = {
+            'schema_version': 1,
+            'source_sha256': relaxed_res['source']['sha256'],
+            'candidates': [sjw],
+            'placements': [{'piece_id': sjw['id'], 'x': 0, 'y': 0}],
+            'acknowledged_source_warnings': list(relaxed_res['source']['warnings']),
+        }
+        produced = [path_points(shape) for shape in path_shapes(export_project(raw, doc))]
+        self.assertEqual(len(produced), 2)
+        self.assertFalse(has_segment(produced, (4000, 2375), (4000, 2400)))
+
+    def test_tiered_pairing_preserves_0_025mm_seam_near_0_375mm_neighbor(self):
+        # 上半段与下半段之间存在 0.025mm (1 unit) 与 0.125mm (5 units) 断口；
+        # 左侧顶点 0.375mm (15 units) 处紧邻另一块条带线段。分层配对不得被相邻干扰线拆散。
+        raw = (
+            b'IN;SP1;PA;'
+            b'PU0,0;PD4000,0,4000,2395;'
+            b'PU4000,2400;PD0,2400,0,1;'
+            b'PU-15,0;PD-15,4000;PU;PG;'
+        )
+        relaxed_res = recognize_source(raw, recognition_mode='relaxed')
+        sjw = next(
+            (c for c in relaxed_res['pieces']
+             if c['id'].startswith('SJW-') and set(c.get('source_closed_path_ids', [])) == {'shape-1', 'shape-2'}),
+            None,
+        )
+        self.assertIsNotNone(sjw)
+        self.assertNotIn('shape-3', sjw['source_closed_path_ids'])
+
+    def test_self_closing_chain_recovers_shared_vertex_outer_contour(self):
+        # shape-5 + shape-6 在 (0,1200) 处与左侧小角及内部横线 shape-7 共点，
+        # 严格模式因共点歧义无法形成 SJ-* 且主壳拆成两块辅助；宽松模式局部自闭合后完整还原并带出内部线 shape-7。
+        raw = (
+            b'IN;SP1;PA;'
+            b'PU0,1200;PD200,400,4000,400,4000,1400;'
+            b'PU4000,1400;PD4000,2400,200,2400,0,1250;'
+            b'PU0,1250;PD0,1200;'
+            b'PU400,1400;PD3600,1400;'
+            b'PU0,1200;PD0,-400,-800,-400,-800,2800,0,2800;'
+            b'PU0,2800;PD0,1200;'
+            b'PU-800,1200;PD0,1200;'
+            b'PU;PG;'
+        )
+        strict_res = recognize_source(raw, recognition_mode='strict')
+        self.assertFalse(any(
+            c['id'].startswith('SJ') and set(c.get('source_closed_path_ids', [])) == {'shape-5', 'shape-6'}
+            for c in strict_res['pieces']
+        ))
+
+        relaxed_res = recognize_source(raw, recognition_mode='relaxed')
+        sjw = next(
+            (c for c in relaxed_res['pieces']
+             if c['id'].startswith('SJW-') and set(c.get('source_closed_path_ids', [])) == {'shape-5', 'shape-6'}),
+            None,
+        )
+        self.assertIsNotNone(sjw)
+        frag_paths = {f['path_id'] for f in sjw['fragments']}
+        self.assertIn('shape-7', frag_paths, '自闭合外框必须保留域内线条')
+
+    def test_1_2mm_gap_stays_rejected_in_relaxed_1mm_mode(self):
+        # 1.2mm (48 units) 超出 1.0mm 宽松上限，仍不拼合
+        raw = b'IN;SP1;PA;PU0,0;PD4000,0,4000,2352;PU4000,2400;PD0,2400,0,0;PU;PG;'
+        relaxed_res = recognize_source(raw, recognition_mode='relaxed')
+        self.assertFalse(any(c['id'].startswith('SJ') for c in relaxed_res['pieces']))
+
+
 if __name__ == '__main__':
     unittest.main()

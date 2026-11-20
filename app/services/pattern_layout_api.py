@@ -7,10 +7,11 @@ import copy
 import hashlib
 import math
 from shapely.geometry import LineString, Polygon, Point
-from shapely import make_valid
+from shapely import make_valid, prepare
 from shapely.ops import unary_union
 from .pattern_layout.parse_source import layout_parse_flags, parse
 from .pattern_layout.closed_loop import build_geometry, interval_parts, bounds_of_points, PARAMS
+from .pattern_layout.fragment_index import PathSpatialIndex
 from .pattern_layout.independent_shells import report_progress
 from .pattern_layout.near_closed_strokes import discover_multi_stroke_alternatives, source_contour_fragments
 from .pattern_layout.short_stroke_tips import short_tip_outline
@@ -40,7 +41,7 @@ def source_paths(raw, *, apply_page_offsets=True, apply_command_boundaries=True,
     return parsed, paths
 
 
-def recognize_source(raw, name='source.plt', *, include_full_support_audit=True, on_progress=None, recognition_mode='strict'):
+def recognize_source(raw, name='source.plt', *, include_full_support_audit=True, include_research_audits=True, on_progress=None, recognition_mode='strict'):
     if recognition_mode not in ('strict', 'relaxed'):
         raise ValueError('未知识别模式')
     report_progress(on_progress, 'parsing', 0, 1)
@@ -48,21 +49,27 @@ def recognize_source(raw, name='source.plt', *, include_full_support_audit=True,
     report_progress(on_progress, 'parsing', 1, 1)
     m = parsed['metrics']
     units = m['units_per_inch']/25.4
+    path_index = PathSpatialIndex(paths)
     result = build_geometry(paths, m['width_mm'], m['height_mm'], units,
-                            include_full_support_audit=include_full_support_audit,on_progress=on_progress)
-    result['v5_layout_marker_audit'] = classify_layout_markers(result, paths, numeric_epsilon_mm=PARAMS['numeric_epsilon_plotter_units']/units,
-                                                            min_span_to_symbol_ratio=PARAMS['layout_marker_min_span_to_symbol_ratio'], apply=True)
-    # Keep the original experimental grouping intact for inspect/restore. A nested
-    # loop or large rectangle may be a real piece; its full geometric alternative
-    # includes exact clipped interior intervals, not an incomplete support outline.
-    result['experimental_grouping'] = copy.deepcopy({'pieces': result['pieces'], 'auxiliary': result['auxiliary']})
+                            include_full_support_audit=include_full_support_audit,
+                            include_research_audits=include_research_audits,
+                            on_progress=on_progress,
+                            path_index=path_index)
+    marker_audit = classify_layout_markers(result, paths, numeric_epsilon_mm=PARAMS['numeric_epsilon_plotter_units']/units,
+                                           min_span_to_symbol_ratio=PARAMS['layout_marker_min_span_to_symbol_ratio'],
+                                           apply=True, include_audit=include_research_audits)
+    if include_research_audits:
+        result['v5_layout_marker_audit'] = marker_audit
+        # Keep the original experimental grouping intact for inspect/restore. A nested
+        # loop or large rectangle may be a real piece; its full geometric alternative
+        # includes exact clipped interior intervals, not an incomplete support outline.
+        result['experimental_grouping'] = copy.deepcopy({'pieces': result['pieces'], 'auxiliary': result['auxiliary']})
     eps = PARAMS['numeric_epsilon_plotter_units']/units
     alternatives = []
     alternative_polys = {}
     report_progress(on_progress, 'alternatives', 0, len(paths))
-    for path_index, path in enumerate(paths):
-        report_progress(on_progress, 'alternatives', path_index, len(paths))
-        line = LineString(path['points'])
+    for path_index_pos, path in enumerate(paths):
+        report_progress(on_progress, 'alternatives', path_index_pos, len(paths))
         if len(path['points'])<4 or math.dist(path['points'][0],path['points'][-1])>PARAMS['near_closed_tolerance_mm']:
             continue
         original_polygon=Polygon(path['points'])
@@ -70,7 +77,7 @@ def recognize_source(raw, name='source.plt', *, include_full_support_audit=True,
         def polygon_components(geometry):
             if geometry.geom_type=='Polygon':return [geometry]
             return [p for part in getattr(geometry,'geoms',()) for p in polygon_components(part)]
-        poly=unary_union(polygon_components(repaired));poly_bounds=poly.bounds
+        poly=unary_union(polygon_components(repaired))
         if poly.is_empty or poly.area<=eps*eps:continue
         if poly.area<PARAMS['min_candidate_area_mm2']:
             result['small_candidate_filter']['ignored_source_contour_count']+=1
@@ -78,14 +85,7 @@ def recognize_source(raw, name='source.plt', *, include_full_support_audit=True,
         contour_issues=[] if original_polygon.is_valid else [{'code':'source_self_intersection_region_ambiguous'}]
         if path['points'][0]!=path['points'][-1]:
             contour_issues=[{'code':'source_path_not_exactly_closed','gap_mm':math.dist(path['points'][0],path['points'][-1])}]+contour_issues
-        fragments = []
-        for source in paths:
-            for index, (a, b) in enumerate(zip(source['points'], source['points'][1:])):
-                selected=[(0.,1.)] if source['id']==path['id'] and math.dist(a,b)>eps else interval_parts(a,b,poly,eps,poly_bounds)
-                for t0, t1 in selected:
-                    fragments.append({'path_id': source['id'], 'segment_index': index, 't0': t0, 't1': t1,
-                                      'a': [a[k]+(b[k]-a[k])*t0 for k in (0,1)], 'b': [a[k]+(b[k]-a[k])*t1 for k in (0,1)],
-                                      'style': source['segment_styles'][index], 'assignment': 'geometric_region_ambiguous'})
+        fragments = source_contour_fragments(paths, {path['id']}, poly, eps, path_index=path_index)
         alternatives.append({'id': 'S-'+path['id'], 'status': 'independent_source_contour_needs_review',
                              'bounds': bounds_of_points(path['points']), 'outer': path['points'], 'fragments': fragments,
                              'source_closed_path_ids': [path['id']], 'semantic_piece_verified': False,
@@ -118,29 +118,44 @@ def recognize_source(raw, name='source.plt', *, include_full_support_audit=True,
         result['auxiliary'].append(candidate)
     moved = {id(candidate) for candidate, _ in frame_candidates}
     result['pieces'].extend(candidate for candidate in alternatives if id(candidate) not in moved)
-    result['source_contour_frame_audit'] = {'frame_candidate_ids': [candidate['id'] for candidate, _ in frame_candidates],
-                                            'min_envelope_fill': PARAMS['frame_min_envelope_fill'], 'boundary_fraction': PARAMS['frame_boundary_fraction'],
-                                            'witness_area_mm2': PARAMS['frame_body_witness_area_mm2']}
+    if include_research_audits:
+        result['source_contour_frame_audit'] = {'frame_candidate_ids': [candidate['id'] for candidate, _ in frame_candidates],
+                                                'min_envelope_fill': PARAMS['frame_min_envelope_fill'], 'boundary_fraction': PARAMS['frame_boundary_fraction'],
+                                                'witness_area_mm2': PARAMS['frame_body_witness_area_mm2']}
     # 多笔备选独立追加；不重排、合并或替换既有候选和原路径。
     excluded = {path_id for candidate in alternatives for path_id in candidate.get('source_closed_path_ids', [])}
     strict_params = {**PARAMS, 'multi_stroke_join_tolerance_mm': .1}
-    joined = discover_multi_stroke_alternatives(paths, excluded, eps, strict_params)
+    joined = discover_multi_stroke_alternatives(paths, excluded, eps, strict_params, path_index=path_index)
     if recognition_mode == 'relaxed':
         members = {frozenset(candidate['source_closed_path_ids']) for candidate, _ in joined}
-        relaxed_params = {**PARAMS, 'multi_stroke_join_tolerance_mm': .5}
-        for candidate, poly in discover_multi_stroke_alternatives(paths, excluded, eps, relaxed_params):
+        existing_polys = [poly for _, poly in joined]
+        for existing in result['pieces']:
+            outer = existing.get('outer')
+            if isinstance(outer, list) and len(outer) >= 3:
+                existing_poly = Polygon(outer)
+                if not existing_poly.is_empty and existing_poly.is_valid and existing_poly.area > 0:
+                    existing_polys.append(existing_poly)
+        relaxed_params = {**PARAMS, 'multi_stroke_join_tolerance_mm': 1.0, 'multi_stroke_join_tiers_mm': (.1, .5, 1.0), 'allow_self_closing_chains': True}
+        for candidate, poly in discover_multi_stroke_alternatives(paths, excluded, eps, relaxed_params, skip_identities=members, path_index=path_index):
             identity = frozenset(candidate['source_closed_path_ids'])
             if identity in members:
                 continue
+            join_issue = next((issue for issue in candidate.get('issues', []) if issue.get('code') == 'source_strokes_joined_for_recognition'), None)
+            if join_issue and join_issue.get('max_seam_mm', 0) <= eps:
+                if any(abs(existing_poly.area - poly.area) <= 0.02 * poly.area
+                       and existing_poly.symmetric_difference(poly).area < 0.01 * poly.area
+                       for existing_poly in existing_polys):
+                    continue
             # 宽松新增轮廓使用独立身份，不覆盖严格模式中的同名裁片。
             candidate['id'] = candidate['id'].replace('SJ-', 'SJW-', 1)
-            candidate['issues'].insert(0, {'code': 'relaxed_stroke_join_needs_review', 'tolerance_mm': .5})
+            candidate['issues'].insert(0, {'code': 'relaxed_stroke_join_needs_review', 'tolerance_mm': 1.0})
             joined.append((candidate, poly))
             members.add(identity)
+            existing_polys.append(poly)
     result['pieces'].extend(candidate for candidate, _ in joined)
     # 兼容短端线作为新增备选追加，已有候选的分类、顺序与原段保持。
     def add_source_alternative(path, poly, outer, contour_issues):
-        fragments = source_contour_fragments(paths, {path['id']}, poly, eps)
+        fragments = source_contour_fragments(paths, {path['id']}, poly, eps, path_index=path_index)
         candidate_id = 'S-' + path['id']
         alternatives.append({'id': candidate_id, 'status': 'independent_source_contour_needs_review',
                              'bounds': bounds_of_points(path['points']), 'outer': outer, 'fragments': fragments,
@@ -173,12 +188,28 @@ def recognize_source(raw, name='source.plt', *, include_full_support_audit=True,
                           'engine_version': ENGINE_VERSION,
                           'algorithm_parameters': PARAMS, 'semantic_verified': False, 'runtime_version': runtime_version(),
                           'recognition_mode': recognition_mode,
-                          'multi_stroke_join_tolerance_mm': .5 if recognition_mode == 'relaxed' else .1},
+                          'multi_stroke_join_tolerance_mm': 1.0 if recognition_mode == 'relaxed' else .1},
                   non_path_shapes=[s for s in parsed['shapes'] if 'points' not in s])
     result['source'].update(layout_parse_flags(parsed))
+    text_points = [
+        (s['id'], tx, ty, Point(tx, ty))
+        for s in result['non_path_shapes'] if s['type'] == 'text'
+        for tx, ty in [((s['point']['x'] - m['min_x']) / units, (m['max_y'] - s['point']['y']) / units)]
+    ]
     for candidate in result['pieces']:
+        if not text_points or not candidate.get('outer'):
+            candidate['text_ids'] = []
+            continue
         poly = make_valid(Polygon(candidate['outer']))
-        candidate['text_ids'] = [s['id'] for s in result['non_path_shapes'] if s['type']=='text' and poly.covers(Point((s['point']['x']-m['min_x'])/units, (m['max_y']-s['point']['y'])/units))]
+        if poly.is_empty:
+            candidate['text_ids'] = []
+            continue
+        x0, y0, x1, y1 = poly.bounds
+        prepare(poly)
+        candidate['text_ids'] = [
+            tid for tid, tx, ty, pt in text_points
+            if x0 <= tx <= x1 and y0 <= ty <= y1 and poly.covers(pt)
+        ]
     report_progress(on_progress, 'alternatives', len(paths), len(paths))
     return result
 
@@ -632,6 +663,201 @@ def export_project(source_bytes, document):
             if any(ord(ch)<32 or ch in ';\x03' for ch in txt): raise PatternLayoutExportError('label_control_not_supported')
             p=transform([(label['point']['x']-m['min_x'])/units,(m['max_y']-label['point']['y'])/units])
             output.extend([f'SP{label["pen"]};','PU'+','.join(hpgl_decimal(v) for v in p)+';', 'LB'+txt+'\x03'])
+            expected_text.append({'point':p,'pen':label['pen'],'text':txt})
+    if not expected: raise PatternLayoutExportError('no_selected_fragments')
+    result=''.join(output).encode('utf-8')
+    from .pattern_layout_verify import verify_export
+    verify_export(result,expected,expected_text)
+    return result
+
+
+def export_multi_source_project(sources_by_id, document):
+    """Export exact referenced intervals from multiple sources into one standalone HPGL PLT."""
+    if not isinstance(sources_by_id, dict) or not sources_by_id or not isinstance(document, dict):
+        raise PatternLayoutExportError('invalid_source_identity')
+    schema=document.get('schema_version')
+    source_specs=document.get('sources')
+    if isinstance(schema,bool) or schema not in (1,2,3) or not isinstance(source_specs,list) or not source_specs:
+        raise PatternLayoutExportError('invalid_source_identity')
+    declared={}
+    for spec in source_specs:
+        if not isinstance(spec,dict): raise PatternLayoutExportError('invalid_source_identity')
+        sid=spec.get('id')
+        if not isinstance(sid,str) or not sid or sid in declared:
+            raise PatternLayoutExportError('invalid_source_identity')
+        raw=sources_by_id.get(sid)
+        if not isinstance(raw,(bytes,bytearray)):
+            raise PatternLayoutExportError('invalid_source_identity')
+        raw_bytes=bytes(raw)
+        if hashlib.sha256(raw_bytes).hexdigest()!=spec.get('sha256'):
+            raise PatternLayoutExportError('invalid_source_identity')
+        declared[sid]=(spec,raw_bytes)
+    placements=document.get('placements',[])
+    if not isinstance(placements,list):
+        raise PatternLayoutExportError('invalid_numeric_value')
+    if schema==1:
+        fabric=document.get('fabric')
+        if isinstance(fabric,dict) and 'lay_mode' in fabric:
+            _fold_error()
+        if any(isinstance(placement,dict) and ('cut_mode' in placement or 'fold_edge' in placement) for placement in placements):
+            _fold_error()
+        lay_mode=None
+        fold_side=_fabric_fold_side(document,schema)
+    else:
+        lay_mode=_fabric_lay_mode(document)
+        fold_side=_fabric_fold_side(document,schema)
+        if lay_mode=='folded' and fold_side=='bottom' and schema!=3:_fold_error()
+    raw_candidates=document.get('candidates',[])
+    if not isinstance(raw_candidates,list):
+        raise PatternLayoutExportError('invalid_source_fragment')
+    candidates={}
+    for candidate in raw_candidates:
+        if not isinstance(candidate,dict) or not isinstance(candidate.get('id'),str) or not candidate['id'] or candidate['id'] in candidates:
+            raise PatternLayoutExportError('invalid_source_fragment')
+        candidates[candidate['id']]=candidate
+    used_source_ids=set()
+    for placement in placements:
+        if not isinstance(placement,dict):
+            raise PatternLayoutExportError('invalid_numeric_value')
+        candidate=candidates.get(placement.get('piece_id'))
+        if candidate is None:
+            raise PatternLayoutExportError('invalid_source_fragment')
+        sid=candidate.get('source_id')
+        if not isinstance(sid,str) or sid not in declared:
+            raise PatternLayoutExportError('invalid_source_fragment')
+        used_source_ids.add(sid)
+    from .plt_parser import DEFAULT_UNITS_PER_INCH, curve_approximation_warning
+    parsed_sources={}
+    for sid in sorted(used_source_ids):
+        spec,raw_bytes=declared[sid]
+        flags=layout_parse_flags(spec.get('source_metadata'))
+        flags.update(layout_parse_flags(spec))
+        parsed,paths=source_paths(
+            raw_bytes,
+            apply_page_offsets=flags.get('page_x_offsets_applied',False),
+            apply_command_boundaries=flags.get('layout_command_boundaries_applied',False),
+            command_boundaries_version=flags.get('layout_command_boundaries_version',1),
+        )
+        acknowledged=spec.get('acknowledged_source_warnings',[])
+        if not isinstance(acknowledged,list): acknowledged=[]
+        unconfirmed=[];unsupported=[]
+        for warning in parsed['warnings']:
+            if '绘图速度 VS' in warning or 'LB 文字按固定 8pt 兼容显示' in warning:continue
+            if ('已跳过未支持' in warning or '已跳过无法识别' in warning
+                    or warning == curve_approximation_warning(.05)):
+                if warning not in acknowledged:unconfirmed.append(warning)
+            else:unsupported.append(warning)
+        if unsupported:raise PatternLayoutExportError('source_semantics_not_faithful')
+        if unconfirmed:raise PatternLayoutExportError('source_warning_confirmation_required')
+        m=parsed['metrics']; units=m['units_per_inch']/25.4
+        parsed_sources[sid]={
+            'metrics':m,
+            'units':units,
+            'lookup':{p['id']:p for p in paths},
+            'phase_prefix':source_phase_prefixes(paths),
+            'text_by_id':{s['id']:s for s in parsed['shapes'] if s['type']=='text'},
+        }
+    out_units=DEFAULT_UNITS_PER_INCH/25.4
+    output=['IN;','PA;']
+    expected=[]
+    expected_text=[]
+    for placement in placements:
+        candidate=candidates[placement['piece_id']]
+        src_ctx=parsed_sources[candidate['source_id']]
+        m=src_ctx['metrics']; units=src_ctx['units']
+        lookup=src_ctx['lookup']; phase_prefix=src_ctx['phase_prefix']; text_by_id=src_ctx['text_by_id']
+        angle=finite(placement.get('rotation_deg',0),'rotation_deg')
+        rad=math.radians(angle); c,s=math.cos(rad),math.sin(rad)
+        mirror=placement.get('mirror_x',False)
+        if not isinstance(mirror,bool): raise PatternLayoutExportError('invalid_numeric_value')
+        anchor=placement.get('anchor',{'x':0,'y':0})
+        ax,ay=finite(anchor['x'],'anchor.x'),finite(anchor['y'],'anchor.y')
+        dx,dy=finite(placement['x'],'x'),finite(placement['y'],'y')
+        def layout_point(p):
+            x,y=p[0]-ax,p[1]-ay
+            if mirror: x=-x
+            return c*x-s*y+dx, s*x+c*y+dy
+        def transform(p):
+            layout=layout_point(p)
+            return [layout[0]*out_units,-layout[1]*out_units]
+        cut_mode=_placement_cut_mode(placement,lay_mode,schema)
+        fold=None
+        if placement.get('fold_edge') is not None:
+            fold=_validate_fold_edge(placement['fold_edge'],candidate,lookup)
+        export_fragments=_fold_export_fragments(candidate,cut_mode,fold)
+        if cut_mode=='on_fold':
+            fold_y=0
+            if fold_side=='bottom':
+                fold_y=_fold_number(document['fabric']['width_mm'])/2
+            for edge_point in (fold['a'],fold['b']):
+                if abs(layout_point(edge_point)[1]-fold_y)>fold['tol']:_fold_error()
+            for fragment,_chain,reflected in export_fragments:
+                path=lookup.get(fragment['path_id'])
+                for t in (fragment['t0'],fragment['t1']):
+                    y=layout_point(_fold_export_point(path,fragment['segment_index'],t,reflected,fold['axis']))[1]
+                    if fold_side=='top':
+                        if y<-fold['tol']:_fold_error()
+                    elif y>fold_y+fold['tol']:_fold_error()
+        previous=None
+        for fragment,chain,reflected in export_fragments:
+            path=lookup.get(fragment['path_id'])
+            index=fragment['segment_index']
+            if path is None or isinstance(index,bool) or not isinstance(index,int) or not 0<=index<len(path['points'])-1:
+                raise PatternLayoutExportError('invalid_source_fragment')
+            t0,t1=finite(fragment['t0'],'t0'),finite(fragment['t1'],'t1')
+            if not 0<=t0<t1<=1: raise PatternLayoutExportError('invalid_source_fragment')
+            a,b=path['points'][index:index+2]
+            pa=transform(_fold_export_point(path,index,t0,reflected,fold['axis'] if fold is not None else None))
+            pb=transform(_fold_export_point(path,index,t1,reflected,fold['axis'] if fold is not None else None))
+            style=path['segment_styles'][index]
+            lt=style['lt_argument'] or ''
+            key=(path['id'],index,t1,lt,style.get('lt_generation'),style.get('line_width_units',path.get('line_width_units')),chain)
+            continuous=previous is not None and previous[6]==chain and previous[0]==path['id'] and previous[3]==lt and previous[4]==style.get('lt_generation') and ((previous[1]==index and previous[2]==t0) or (previous[1]+1==index and previous[2]==1 and t0==0))
+            if lt:
+                try: lt_values=[float(v) for v in lt.replace(',',' ').split()]
+                except ValueError: lt_values=[]
+                if len(lt_values)==3 and lt_values[0]==2 and lt_values[1]>0 and lt_values[2]==1:
+                    period=lt_values[1]; half=period/2
+                    length=math.dist(a,b); prefix=phase_prefix[path['id']][index]
+                    begin,end=prefix+t0*length,prefix+t1*length
+                    cycle=math.floor(begin/period)
+                    while cycle*period<end:
+                        lo,hi=max(begin,cycle*period),min(end,cycle*period+half)
+                        if hi>lo and length>0:
+                            u0,u1=(lo-prefix)/length,(hi-prefix)/length
+                            axis=fold['axis'] if fold is not None else None
+                            da=transform(_fold_export_point(path,index,u0,reflected,axis))
+                            db=transform(_fold_export_point(path,index,u1,reflected,axis))
+                            output.extend(['PU;','IN;','PA;',f'SP{path["pen"]};','LT'+lt+';'])
+                            width=style.get('line_width_units',path.get('line_width_units'))
+                            if width is not None: output.append('PW'+hpgl_decimal(width)+';')
+                            output.extend(['PU'+','.join(hpgl_decimal(v) for v in da)+';','PD'+','.join(hpgl_decimal(v) for v in db)+';'])
+                            expected.append({'a':da,'b':db,'pen':path['pen'],'lt':lt,'width':width})
+                        cycle+=1
+                    previous=None
+                    continue
+                if not continuous and (index!=0 or t0!=0):
+                    raise PatternLayoutExportError('line_type_phase_not_faithful')
+            if not continuous:
+                output.extend(['PU;','IN;','PA;',f'SP{path["pen"]};','LT'+lt+';'])
+                width=style.get('line_width_units',path.get('line_width_units'))
+                if width is not None: output.append('PW'+hpgl_decimal(width)+';')
+                output.append('PU'+','.join(hpgl_decimal(v) for v in pa)+';')
+            if continuous and previous[5]!=style.get('line_width_units',path.get('line_width_units')):
+                width=style.get('line_width_units',path.get('line_width_units'))
+                if width is None:raise PatternLayoutExportError('source_semantics_not_faithful')
+                output.append('PW'+hpgl_decimal(width)+';')
+            output.append('PD'+','.join(hpgl_decimal(v) for v in pb)+';')
+            expected.append({'a':pa,'b':pb,'pen':path['pen'],'lt':lt,'width':style.get('line_width_units',path.get('line_width_units'))})
+            previous=key
+        output.append('PU;')
+        for text_id in candidate.get('text_ids',[]):
+            if text_id not in text_by_id: raise PatternLayoutExportError('invalid_source_fragment')
+            if mirror or angle%360: raise PatternLayoutExportError('label_pose_not_faithful')
+            label=text_by_id[text_id]; txt=label['text']
+            if any(ord(ch)<32 or ch in ';\x03' for ch in txt): raise PatternLayoutExportError('label_control_not_supported')
+            p=transform([(label['point']['x']-m['min_x'])/units,(m['max_y']-label['point']['y'])/units])
+            output.extend([f'SP{label["pen"]};','PU'+','.join(hpgl_decimal(v) for v in p)+';','LB'+txt+'\x03'])
             expected_text.append({'point':p,'pen':label['pen'],'text':txt})
     if not expected: raise PatternLayoutExportError('no_selected_fragments')
     result=''.join(output).encode('utf-8')

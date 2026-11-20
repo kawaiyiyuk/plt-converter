@@ -44,7 +44,7 @@ class LenientProjectionTests(unittest.TestCase):
         compatible = parse_plt(source, projection=True, max_chord_error_mm=0.049)
         self.assertEqual(strict, compatible)
         with self.assertRaisesRegex(ValueError, '空字符'):
-            parse_plt('IN;PD100,100;\x00', projection=True)
+            parse_plt('IN;PD10\x000,100;', projection=True)
         defaults = parse_plt('IN;PW;VS;PD100,100;', projection=True)
         self.assertFalse(any('数量' in w for w in defaults['warnings']))
 
