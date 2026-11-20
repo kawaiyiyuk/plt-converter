@@ -209,20 +209,24 @@ class ProjectionPltTests(unittest.TestCase):
             response = self.upload(source, 'x.plt')
             self.assertEqual(response.status_code, 201, response.get_json())
             self.assertTrue(response.get_json()['rendering_warnings'])
+        last_document = response.get_json()['document_id']
         for source in (b'IN;PD1e,1;', b'IN;PDinf,inf;'):
             response = self.upload(source, 'empty.plt')
             self.assertEqual(response.status_code, 400, response.get_json())
-        self.assert_empty()
+        self.assertIsNotNone(self.metadata(last_document))
+        self.assertFalse(list((self.ledger.root / 'staging').iterdir()))
 
     def test_sp0_does_not_add_phantom_geometry_and_large_arc_rejects(self):
         response = self.upload(b'IN;PD4000,2000;SP0;PD9000,9000;CI1000;LBhidden\x03;', 'x.plt')
         self.assertEqual(response.status_code, 201, response.get_json())
         self.assertAlmostEqual(response.get_json()['width_mm'], 100, places=3)
         self.assertAlmostEqual(response.get_json()['height_mm'], 50, places=3)
+        last_document = response.get_json()['document_id']
         for command in ('PU1e308,0;CI1e308', 'PU1e308,0;PD;AA0,0,90', 'PU1,0;PD;AA0,0,1e308'):
             response = self.upload(('IN;' + command + ';').encode(), 'x.plt')
             self.assertEqual(response.status_code, 400, response.get_json())
-        self.assert_empty()
+        self.assertIsNotNone(self.metadata(last_document))
+        self.assertFalse(list((self.ledger.root / 'staging').iterdir()))
 
     def test_plt_real_supervised_timeout_kills_reaps_and_releases_derived(self):
         import subprocess

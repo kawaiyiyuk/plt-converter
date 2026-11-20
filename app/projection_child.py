@@ -10,6 +10,8 @@ def inspect(source):
     from .projection import PT_PER_MM
     fitz = load_fitz()
     with open_pdf_document(source, fitz) as document:
+        if not document.is_pdf:
+            raise ValueError('文件内容不是 PDF')
         if document.is_encrypted or document.needs_pass or document.metadata.get('encryption'):
             raise ValueError('不支持加密 PDF，请先解除加密')
         if not 1 <= document.page_count <= MAX_PDF_PAGES:

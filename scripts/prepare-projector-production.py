@@ -25,6 +25,8 @@ ENV_FIELDS = {'PROJECTOR_' + name for name in BUDGETS} | {
     'PROJECTOR_WX_BACKEND_URL', 'PROJECTOR_PUBLIC_BASE_URL',
 }
 
+OPTIONAL_ENV_FIELDS = {'PROJECTOR_PDF_VALIDATION_KEY'}
+
 class Invalid(ValueError):
     pass
 
@@ -100,9 +102,12 @@ def https_url(key, value):
 
 def prepare(envpath):
     policy_fields, policy_class = schema()
-    env = parse_file(envpath, ENV_FIELDS)
+    env = parse_file(envpath, ENV_FIELDS | OPTIONAL_ENV_FIELDS)
     if any(key.startswith('PROJECTOR_') for key in os.environ):
         raise Invalid('Unset shell PROJECTOR_* variables before offline checking')
+    key = env.get('PROJECTOR_PDF_VALIDATION_KEY', '')
+    if key and not re.fullmatch(r'[0-9a-f]{64}', key):
+        raise Invalid('PROJECTOR_PDF_VALIDATION_KEY must be 64 lowercase hex digits')
     missing = sorted(key for key in ENV_FIELDS if pending(env.get(key)))
     if missing:
         return {'status': 'incomplete', 'missing_fields': missing}

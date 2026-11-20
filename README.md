@@ -138,7 +138,12 @@ POST 返回 HTTP 202 `{analysis_id,status:"analyzing",phase:"queued"}`；同模�
 
 本地投影专项：`.venv/bin/python -m unittest discover -s tests -p 'test_projection*.py'`；部署模板另用 `.venv/bin/python -m unittest discover -s tests -p 'test_projector_manifests.py'`（使用测试用本地 Unix socket 与 mock Docker CLI，不连接真实 Docker）；新独立镜像从批准的 immutable 旧基线只增加任务 COPY allowlist；旧 factory 撤回本任务 projection 注册，投影仅由 `run_projection:app` 提供。逐文件核对其他转换源码和依赖保持，不重建当前工作区的旧转换镜像。
 
-本轮 B0–B8 行为变化（以当前实现为准）：B0 单账户单文档，新上传先删除该账户旧文档并撤掉其仍在排队的分析，旧会话立即 404 且不能复活。B1 解析名额在收完请求体后才占用：慢速上传只先预留 staging 空间，收 body 期间不占 global parser；body 收完后 parser 忙返回 429 并释放 staging 与 lease。B2 切换 `metadata_mode` 会换新 analysis_id 并移除旧排队任务，且每账户同时最多 1 个分析，已有分析进行中再提交返回 429 `projection_analysis_owner_busy`。B5 并发与异常不返回 500：并发删除后的 lease／生成号不匹配返回 404（`projection_not_found`）或 409（`projection_lease_lost`／`projection_result_stale`），Redis／RQ 故障返回 503 `projection_worker_unavailable` 并带 `Retry-After`。B6 分析状态变化不再提升会话版本：分析失败、改模式与迟到状态只更新分析字段，进行中的取图 lease 不被判 stale，只有真正应用排版（POST layout）才提升版本。B7 子进程只有显式 ValueError 文案原样返回客户端（`error.json` 带 `public: true`，最多截断 500 字），其余含 MuPDF／内部 traceback 一律换成固定中文文案并只写日志。B8 非旋转拼版只在跨页接缝的重叠像素窄条做透明合成以保留两侧墨迹，其余像素保持 MuPDF 原色字节。
+本轮 B0–B8 行为变化（以当前实现为准）：B0 单账户单文档，2026-11-20 起在新文档成功提交时才替换仍活动的旧文档并撤掉其排队分析。空请求、格式或解析失败及预算不足时，已活动的旧文档和较早的在途上传保持可用；较新的上传成功提交才取消更早的在途请求。新旧文件在替换期间同时占用现有资源预算。B1 解析名额在收完请求体后才占用：慢速上传只先预留 staging 空间，收 body 期间不占 global parser；body 收完后 parser 忙返回 429 并释放 staging 与 lease。B2 切换 `metadata_mode` 会换新 analysis_id 并移除旧排队任务，且每账户同时最多 1 个分析，已有分析进行中再提交返回 429 `projection_analysis_owner_busy`。B5 并发与异常不返回 500：并发删除后的 lease／生成号不匹配返回 404（`projection_not_found`）或 409（`projection_lease_lost`／`projection_result_stale`），Redis／RQ 故障返回 503 `projection_worker_unavailable` 并带 `Retry-After`。B6 分析状态变化不再提升会话版本：分析失败、改模式与迟到状态只更新分析字段，进行中的取图 lease 不被判 stale，只有真正应用排版（POST layout）才提升版本。B7 子进程只有显式 ValueError 文案原样返回客户端（`error.json` 带 `public: true`，最多截断 500 字），其余含 MuPDF／内部 traceback 一律换成固定中文文案并只写日志。B8 非旋转拼版只在跨页接缝的重叠像素窄条做透明合成以保留两侧墨迹，其余像素保持 MuPDF 原色字节。
+
+### PDF 附件保存校验
+
+业务后台验证用户和纸样归属后，对用户编号、签发时间和原件 SHA-256 签发 60 秒请求凭证。投影 API 校验签名和实际文件字节，无需回调后台验证用户。部署 PDF 附件保存时须在业务后台配置 `PATTERN_PDF_VALIDATION_KEY`，投影 API 配置相同的 `PROJECTOR_PDF_VALIDATION_KEY`。使用独立的 32 字节随机密钥，以 64 位小写十六进制表示。两端主机时钟须同步。密钥只注入运行时，投影 worker 和解析子进程不读取该配置。缺少或不匹配时 PDF 附件校验会提示暂不可用，普通投影仍沿用原有身份验证。部署时先核对两端运行配置并完成一份实际 PDF 保存冒烟。
+
 
 ## Docker
 

@@ -2,6 +2,7 @@
 from concurrent.futures import Future
 from decimal import Decimal, InvalidOperation
 import hashlib
+import hmac
 from http.client import HTTPException
 import threading
 import json
@@ -42,7 +43,7 @@ def owned(document_id, owner):
     if not ID_PATTERN.fullmatch(document_id):
         raise ProjectionRejected('projection_not_found','投影文件不存在或已过期',404,0)
     meta = store().load(document_id, owner)
-    if meta is None:
+    if meta is None or (meta.get('source_usage') == 'pattern_attachment' and getattr(g, 'projection_client_scope', None) != 'wx_mini_program'):
         raise ProjectionRejected('projection_not_found','投影文件不存在或已过期，请重新选择文件',404,0)
     return meta
 
@@ -50,6 +51,13 @@ def owned(document_id, owner):
 IDENTITY_MAX_INFLIGHT = 2
 _identity_flights = {}
 _identity_flights_lock = threading.Lock()
+
+
+def _request_owner(identity):
+    if has_request_context():
+        g.projection_client_scope = getattr(identity, 'client_scope', None)
+    # Only the plain owner key crosses the RQ serialization boundary.
+    return str(identity)
 
 
 def identify_user(authorization):
@@ -63,7 +71,7 @@ def identify_user(authorization):
     resolve = (lambda: _identify_layout_user(layout_token)) if layout_token else (lambda: _identify_user(authorization))
     credential = authorization or ('Layout ' + layout_token if layout_token else '')
     if not credential:
-        return resolve()
+        return _request_owner(resolve())
     key = hashlib.sha256(credential.encode('utf-8')).digest()
     with _identity_flights_lock:
         future = _identity_flights.get(key)
@@ -73,7 +81,7 @@ def identify_user(authorization):
                 raise ProjectionRejected('projection_identity_busy', '身份验证服务繁忙，请1秒后重试', 503, 1)
             future = _identity_flights[key] = Future()
     if not leader:
-        return future.result()
+        return _request_owner(future.result())
     try:
         owner = resolve()
     except BaseException as error:
@@ -85,7 +93,7 @@ def identify_user(authorization):
         with _identity_flights_lock:
             _identity_flights.pop(key, None)
         future.set_result(owner)
-        return owner
+        return _request_owner(owner)
 
 
 def _identify_layout_user(token):
@@ -99,6 +107,13 @@ def _identify_user(authorization):
     return _validate_identity('/api/v1/points/conversion/identity', {'Authorization': authorization})
 
 
+class ProjectionIdentity(str):
+    def __new__(cls, owner, scope):
+        value = super().__new__(cls, owner)
+        value.client_scope = scope
+        return value
+
+
 def _validate_identity(path, headers, method='POST'):
     try:
         status, body = identity_request(path, {}, headers, **({'method': method} if method != 'POST' else {}))
@@ -110,7 +125,7 @@ def _validate_identity(path, headers, method='POST'):
         if (not isinstance(data, dict) or type(data.get('user_id')) not in (str, int)
                 or not data['user_id']):
             raise ValueError('invalid identity response')
-        return f"user:{data['user_id']}"
+        return ProjectionIdentity(f"user:{data['user_id']}", data.get('client_scope') if method == 'POST' else None)
     except BillingRejected as error:
         if error.status_code in (401, 403):
             raise
@@ -130,11 +145,76 @@ def identity_error(error):
     return jsonify({'error':str(error)}),error.status_code
 
 
+_PDF_VALIDATION_PROOF = re.compile(
+    r'v1:([1-9][0-9]{0,18}):([1-9][0-9]{0,10}):([0-9a-f]{64}):([0-9a-f]{64})'
+)
+
+
+def _pdf_validation_proof():
+    secret = current_app.config.get('PROJECTOR_PDF_VALIDATION_KEY', '')
+    if not isinstance(secret, str) or not re.fullmatch(r'[0-9a-f]{64}', secret):
+        raise ProjectionRejected('projection_pdf_validation_unconfigured', 'PDF 校验服务暂未配置', 503, 0)
+    proof = request.headers.get('X-Pattern-PDF-Validation', '')
+    match = _PDF_VALIDATION_PROOF.fullmatch(proof)
+    if match is None:
+        raise ProjectionRejected('projection_pdf_validation_proof_invalid', 'PDF 校验请求未授权', 403, 0)
+    user_id, issued_at, digest, signature = match.groups()
+    age = int(time.time()) - int(issued_at)
+    signed_fields = proof.rsplit(':', 1)[0]
+    expected = hmac.new(
+        bytes.fromhex(secret), f'pattern-pdf-validation:{signed_fields}'.encode('ascii'), hashlib.sha256,
+    ).hexdigest()
+    if age < -5 or age > 60 or not hmac.compare_digest(expected, signature):
+        raise ProjectionRejected('projection_pdf_validation_proof_invalid', 'PDF 校验请求未授权', 403, 0)
+    return user_id, digest
+
+
+@projection_bp.post('/validate')
+def validate_pdf_attachment():
+    from .projection_runtime import run
+    user_id, expected_digest = _pdf_validation_proof()
+    ledger = store()
+    ledger.reconcile()
+    # The business service has already authenticated the mini-program user.
+    # Only signed user and content data cross this boundary, avoiding an HTTP
+    # call back into the same worker that is waiting on preflight.
+    validation_owner = f'validate:user:{user_id}'
+    ledger.rate(validation_owner, '', 'validation')
+    if request.content_length is not None and request.content_length > MAX_BODY:
+        raise ProjectionRejected('projection_upload_too_large', '上传文件不能超过20MB', 413, 0)
+    lease = ledger.reserve(validation_owner, 'upload', defer_supersede=True)
+    folder = ledger.lease_path(lease)
+    streams = []
+    try:
+        folder.mkdir(mode=0o700)
+        path = folder / 'source.pdf'
+        g.projection_upload = {'path': path, 'parts': 0, 'streams': streams}
+        upload = request.files.get('file')
+        if upload is None or not upload.filename or not upload.filename.lower().endswith('.pdf') or len(request.files) != 1:
+            return jsonify(error='请选择一个 PDF 文件'), 400
+        upload.stream.flush()
+        with path.open('rb') as received:
+            actual_digest = hashlib.file_digest(received, 'sha256').hexdigest()
+        if not hmac.compare_digest(actual_digest, expected_digest):
+            raise ProjectionRejected('projection_pdf_validation_proof_invalid', 'PDF 校验请求与文件不匹配', 403, 0)
+        ledger.begin_parse(lease)
+        meta = run(ledger, lease, 'parse', path)
+        return jsonify(page_count=meta['page_count'])
+    finally:
+        for stream in streams:
+            stream.close()
+        ledger.release(lease)
+        g.pop('projection_upload', None)
+
+
 @projection_bp.post('/documents')
-def upload_document():
+@projection_bp.post('/attachment-documents', defaults={'source_usage': 'pattern_attachment'})
+def upload_document(source_usage=''):
     from .projection_runtime import run
     from .projection_layout import discard_analysis_job
     owner = identify_user(request.headers.get('Authorization'))
+    if source_usage and getattr(g, 'projection_client_scope', None) != 'wx_mini_program':
+        raise ProjectionRejected('projection_scope_required', '请在小程序中投影 PDF 附件', 403, 0)
     ledger = store()
     ledger.reconcile()
     rate_ip = upload_rate_limit_ip(request.remote_addr, request.headers.get('X-Forwarded-For'),
@@ -142,14 +222,8 @@ def upload_document():
     ledger.rate(owner, rate_ip, 'upload')
     if request.content_length is not None and request.content_length > MAX_BODY:
         raise ProjectionRejected('projection_upload_too_large','上传文件不能超过20MB',413,0)
-    # One live pattern per account: a new upload retires the owner's previous
-    # document before reserving, so stale sessions never keep capacity. A
-    # retired document's queued analysis is removed from the RQ queue too.
-    # complete_upload retires any document that finished parsing while this
-    # upload was in flight and returns those queued analysis ids as well.
-    for analysis_id in ledger.delete_all(owner):
-        discard_analysis_job(analysis_id)
-    lease = ledger.reserve(owner,'upload')
+    # Keep the current document usable until the replacement commits.
+    lease = ledger.reserve(owner, 'upload', replacing=True, defer_supersede=True)
     folder = ledger.lease_path(lease)
     streams = []
     try:
@@ -165,6 +239,8 @@ def upload_document():
         extension = Path(original_filename).suffix.lower()
         if extension not in ('.pdf', '.plt', '.hpgl'):
             return jsonify(error='只支持 .pdf、.plt 或 .hpgl 文件'),415
+        if source_usage and extension != '.pdf':
+            return jsonify(error='仅支持 PDF 附件'), 415
         is_plt = extension in ('.plt', '.hpgl')
         source_format = 'plt' if is_plt else 'pdf'
         if request.form.get('source_format') not in (None, '', source_format):
@@ -186,7 +262,7 @@ def upload_document():
             if error.code == 'projection_result_stale' and ledger.upload_superseded(lease):
                 raise ProjectionRejected('projection_upload_superseded','已选择更新的纸样，本次上传已取消',409,0)
             raise
-        meta.update(owner=owner,expires_at=time.time()+TTL_SECONDS,
+        meta.update(source_usage=source_usage, owner=owner,expires_at=time.time()+TTL_SECONDS,
                     filename=safe_uploaded_filename(original_filename))
         # Close every body writer before rename/release (Windows compatibility
         # and parse/413 failure FD accounting).
@@ -195,7 +271,7 @@ def upload_document():
             path.unlink()  # Original PLT is no longer needed after successful preparation.
             path = folder / 'derived.pdf'
         discarded = []
-        document_id = ledger.complete_upload(lease,owner,path,meta,discarded)
+        document_id = ledger.complete_upload(lease,owner,path,meta,discarded,completed_only=True)
         for analysis_id in discarded:
             discard_analysis_job(analysis_id)
         return jsonify({key:meta[key] for key in ('filename','page_count','pages','width_mm','height_mm','requires_metadata_choice')} |
@@ -614,6 +690,7 @@ def get_tile(document_id):
 @projection_bp.post('/documents/<document_id>/renew')
 def renew_document(document_id):
     owner = identify_user(request.headers.get('Authorization'))
+    owned(document_id, owner)
     if not ID_PATTERN.fullmatch(document_id) or not store().renew(document_id,owner):
         raise ProjectionRejected('projection_not_found','投影文件不存在或已过期',404,0)
     return jsonify(document_id=document_id,expires_in=TTL_SECONDS,rotation_supported=True,session_summary_supported=True)
@@ -780,6 +857,7 @@ def download_scene_bundle(document_id,revision):
     owner=identify_user(request.headers.get('Authorization'))
     if not ID_PATTERN.fullmatch(document_id) or not ID_PATTERN.fullmatch(revision):
         raise ProjectionRejected('projection_not_found','投影文件不存在或已过期',404,0)
+    owned(document_id, owner)
     ledger=store()
     file,lease,bundle=ledger.scene_open(document_id,owner,revision)
     closed=False

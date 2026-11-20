@@ -77,6 +77,7 @@ def create_projection_app(configuration=None):
         raise ValueError('PROJECTOR_ENABLED must be 0 or 1')
     app.config.update(MAX_CONTENT_LENGTH=MAX_BODY, PLT_MAX_UPLOAD_BYTES=MAX_SOURCE,
                       PLT_MAX_UPLOAD_MB=20, PROJECTOR_ENABLED=(enabled == '1'))
+    app.config['PROJECTOR_PDF_VALIDATION_KEY'] = configuration.get('PROJECTOR_PDF_VALIDATION_KEY', '').strip()
     app.config['PROJECTOR_TRUSTED_PROXY_CIDRS'] = parse_trusted_proxy_cidrs(
         configuration.get('PROJECTOR_TRUSTED_PROXY_CIDRS', ''))
     if enabled == '1':
