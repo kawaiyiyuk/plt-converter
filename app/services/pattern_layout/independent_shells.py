@@ -4,6 +4,7 @@ from functools import lru_cache
 from shapely import STRtree, prepare
 from shapely.geometry import LineString,Polygon,Point,GeometryCollection,box
 from shapely.ops import unary_union,polygonize_full
+from .network_components import ScenarioNetworkCache, partition_network
 from .scenario_coverage import ScenarioCoverage
 
 def polygon_parts(g):return [p for p in getattr(g,'geoms',[g]) if p.geom_type=='Polygon' and not p.is_empty]
@@ -17,14 +18,39 @@ def shell_of_network(lines,region,eps,delta,area_epsilon):
         missing=region.difference(p).area;outside=p.difference(region.buffer(delta)).area
         if missing<=area_epsilon and outside<=area_epsilon:witness.append({'area_mm2':p.area,'missing_area_mm2':missing,'outside_near_band_area_mm2':outside})
     return {'complete':bool(witness),'valid_shells':witness,'invalid_ring_count':len(invalid.geoms),'missing_area_mm2':region.difference(fill).area}
-def support_refs(poly,paths,eps):
-    refs=[];band=poly.boundary.buffer(eps);minx,miny,maxx,maxy=band.bounds
+def support_refs(poly,paths,eps,*,path_index=None):
+    refs=[];band=poly.boundary.buffer(eps)
+    if band.is_empty:
+        return refs
+    minx,miny,maxx,maxy=band.bounds
+    prepare(band)
+    if path_index is not None:
+        for idx in path_index.query_path_indices((minx,miny,maxx,maxy)):
+            source=path_index.paths[idx];dist=0.
+            points=source['points'];styles=source.get('segment_styles',());lengths=path_index.seg_lengths[idx]
+            for si,(a,b) in enumerate(zip(points,points[1:])):
+                length=lengths[si]
+                if length<=eps:continue
+                if max(a[0],b[0])<minx or min(a[0],b[0])>maxx or max(a[1],b[1])<miny or min(a[1],b[1])>maxy:
+                    dist+=length;continue
+                line=LineString([a,b])
+                if band.disjoint(line):
+                    dist+=length;continue
+                hit=line.intersection(band)
+                for g in getattr(hit,'geoms',[hit]):
+                    if g.geom_type!='LineString' or g.length<=eps:continue
+                    ts=[line.project(Point(v))/length for v in g.coords];t0=max(0,min(ts));t1=min(1,max(ts))
+                    refs.append({'path_id':source['id'],'segment_index':si,'t0':t0,'t1':t1,'a':[a[k]+(b[k]-a[k])*t0 for k in (0,1)],'b':[a[k]+(b[k]-a[k])*t1 for k in (0,1)],'style':styles[si] if si<len(styles) else None,'distance_from_path_start_mm':dist+t0*length,'assignment':'source_boundary_observation'})
+                dist+=length
+        return refs
     for source in paths:
         dist=0.
         for si,(a,b) in enumerate(zip(source['points'],source['points'][1:])):
             line=LineString([a,b]);length=line.length
             if length<=eps:continue
             if max(a[0],b[0])<minx or min(a[0],b[0])>maxx or max(a[1],b[1])<miny or min(a[1],b[1])>maxy:
+                dist+=length;continue
+            if band.disjoint(line):
                 dist+=length;continue
             hit=line.intersection(band)
             for g in getattr(hit,'geoms',[hit]):
@@ -86,9 +112,13 @@ def _borrowed_root_edge_check(roots, eps):
     return borrows_edge
 
 
-def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=True,on_progress=None):
+def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=True,include_research_audits=True,on_progress=None,path_index=None):
     report_progress(on_progress, 'outlines', 0, len(paths) + 1)
-    lines={p['id']:LineString(p['points']) for p in paths if len(p['points'])>=2};available={id:l for id,l in lines.items() if id not in frame_ids};known=list(original);records=[];alternatives=[];nextid=max([int(l['id'][1:]) for l in original]+[0])+1
+    if path_index is not None:
+        lines={p['id']:path_index.lines[idx] for idx,p in enumerate(paths) if path_index.lines[idx] is not None}
+    else:
+        lines={p['id']:LineString(p['points']) for p in paths if len(p['points'])>=2}
+    available={id:l for id,l in lines.items() if id not in frame_ids};known=list(original);records=[];alternatives=[];nextid=max([int(l['id'][1:]) for l in original]+[0])+1
     records_by_bounds = {}
     def append_record(record, bounds):
         records.append(record)
@@ -127,30 +157,68 @@ def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=Tr
     report_progress(on_progress, 'outlines', len(paths), len(paths) + 1)
     original_roots=[r for r in records if not any(nearby_contains(s['poly'],r['poly'],params) for s in records if s is not r)]
     root_anchor_ids={id for r in original_roots for id in r['source_ids']}
-    net=unary_union(list(available.values()));faces,cuts,dangles,invalid=polygonize_full(net);atomic=[]
+    path_ids = tuple(available)
+    path_tree = STRtree(list(available.values()))
+    non_forest_comps, forest_pids, forest_dangle_count, non_forest_pids = partition_network(
+        available, path_ids, path_tree, count_forest_dangles=include_research_audits
+    )
+    if non_forest_pids:
+        net=unary_union([available[pid] for pid in non_forest_pids])
+        faces,cuts,dangles,invalid=polygonize_full(net)
+    else:
+        net=GeometryCollection()
+        faces=cuts=dangles=invalid=GeometryCollection()
+    total_dangle_count = len(dangles.geoms) + forest_dangle_count
+    atomic=[]
     # EPS不变：缓存每条真实原path的buffer，再union；不buffer noded union来决定源支持。
     path_covers={pid:line.buffer(eps) for pid,line in available.items()};path_bounds={pid:line.bounds for pid,line in available.items()};path_lengths={pid:line.length for pid,line in available.items()};coverage_audit=[]
     # 这项独立链证书要求所有周边由完整的非借用原path支持；没有面积门槛。
-    path_ids = tuple(available)
-    path_tree = STRtree(list(available.values()))
+    _support_base_cache = {}
+    _support_result_cache = {}
 
     def complete_path_support(poly,exclude=frozenset()):
-        boundary = poly.boundary
-        band = boundary.buffer(eps)
-        bx0, by0, bx1, by1 = band.bounds
-        xmin, ymin, xmax, ymax = bx0-eps, by0-eps, bx1+eps, by1+eps
-        ids = []
-        # 索引只筛掉包围盒不相交的路径，后续条件和原路径顺序保持一致。
-        for index in sorted(path_tree.query(box(xmin, ymin, xmax, ymax))):
-            pid = path_ids[index]
-            x0, y0, x1, y1 = path_bounds[pid]
-            if (pid not in exclude and path_lengths[pid]>eps
-                    and x0>=xmin and y0>=ymin and x1<=xmax and y1<=ymax
-                    and available[pid].difference(band).length<=eps):
-                ids.append(pid)
-        cover = unary_union([path_covers[pid] for pid in ids])
-        missing = boundary.difference(cover).length
-        return missing<=eps,ids,missing
+        wkb = poly.wkb
+        base = _support_base_cache.get(wkb)
+        if base is None:
+            boundary = poly.boundary
+            band = boundary.buffer(eps)
+            if band.is_empty:
+                # 微小闭面的缓冲区可能为空。没有路径可查询，仍按原容差核对未覆盖周长。
+                missing = boundary.length
+                base = ((), missing <= eps, missing)
+                _support_base_cache[wkb] = base
+                return base[1], [], base[2]
+            bx0, by0, bx1, by1 = band.bounds
+            xmin, ymin, xmax, ymax = bx0-eps, by0-eps, bx1+eps, by1+eps
+            all_ids = []
+            # 索引只筛掉包围盒不相交的路径，后续条件和原路径顺序保持一致。
+            for index in sorted(path_tree.query(box(xmin, ymin, xmax, ymax))):
+                pid = path_ids[index]
+                x0, y0, x1, y1 = path_bounds[pid]
+                if (path_lengths[pid]>eps
+                        and x0>=xmin and y0>=ymin and x1<=xmax and y1<=ymax
+                        and available[pid].difference(band).length<=eps):
+                    all_ids.append(pid)
+            all_ids_tuple = tuple(all_ids)
+            cover = unary_union([path_covers[pid] for pid in all_ids_tuple])
+            missing = boundary.difference(cover).length
+            base = (all_ids_tuple, missing<=eps, missing)
+            _support_base_cache[wkb] = base
+        all_ids_tuple, base_valid, base_missing = base
+        if not all_ids_tuple:
+            return base_valid, [], base_missing
+        filtered_excluded = frozenset(pid for pid in all_ids_tuple if pid in exclude)
+        if not filtered_excluded:
+            return base_valid, list(all_ids_tuple), base_missing
+        res_key = (wkb, filtered_excluded)
+        cached_res = _support_result_cache.get(res_key)
+        if cached_res is None:
+            ids = [pid for pid in all_ids_tuple if pid not in filtered_excluded]
+            cover = unary_union([path_covers[pid] for pid in ids])
+            missing = poly.boundary.difference(cover).length
+            cached_res = (missing <= eps, tuple(ids), missing)
+            _support_result_cache[res_key] = cached_res
+        return cached_res[0], list(cached_res[1]), cached_res[2]
     for index,f in enumerate(faces.geoms):
         poly=Polygon(f.exterior);valid,ids,missing=complete_path_support(poly);entry={'face_index':index,'poly':poly,'independent_complete_paths':valid,'complete_boundary_source_path_ids':ids,'unsupported_by_complete_paths_length_mm':missing};atomic.append(entry)
         if valid:add(poly,'multi_path_polygonized_shell',{'kind':'complete_original_paths_close_boundary','source_path_ids':ids,'atomic_face_index':index})
@@ -161,45 +229,61 @@ def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=Tr
     report_progress(on_progress, 'scenarios', 0, len(scenarios))
     scenario_coverage = ScenarioCoverage(path_covers, eps)
     borrows_edge = _borrowed_root_edge_check(original_roots, eps)
+    scenario_network = ScenarioNetworkCache(
+        available, path_ids, path_tree, non_forest_comps, non_forest_pids, faces, invalid, eps
+    )
+    all_source_filled = unary_union([Polygon(f.exterior) for f in faces.geoms])
     for scenario_index, (name,excluded) in enumerate(scenarios):
         if excluded:
             work = {pid:line for pid,line in available.items() if pid not in excluded}
-            n = unary_union(list(work.values()))
-            pg, _, _, bad = polygonize_full(n)
+            filled, bad_count = scenario_network.scenario_filled_and_invalid(excluded)
+            legacy_cover = unary_union(list(work.values())).buffer(eps) if include_full_support_audit else None
         else:
-            work, n, pg, bad = available, net, faces, invalid
-        filled = unary_union([Polygon(f.exterior) for f in pg.geoms])
+            work = available
+            filled = all_source_filled
+            bad_count = len(invalid.geoms)
+            if include_full_support_audit:
+                full_n = unary_union(list(available.values())) if forest_pids else net
+                legacy_cover = full_n.buffer(eps)
+            else:
+                legacy_cover = None
         count = 0
         uncovered_length = scenario_coverage.for_paths(work, excluded)
         # 旧覆盖对照和全网路径清单用于调试，不参与闭壳判定。
-        legacy_cover = n.buffer(eps) if include_full_support_audit else None
         if legacy_cover is not None:
             prepare(legacy_cover)
         for poly in polygon_parts(filled):
             boundary = poly.boundary
             support_gap = uncovered_length(boundary)
-            support_record = {'scenario':name,'epsilon_mm':eps,'method':'per_original_path_buffer_then_union',
-                              'source_path_count':len(work),'boundary_length_mm':poly.length,
-                              'supported_missing_length_mm':support_gap}
-            if legacy_cover is not None:
-                legacy_gap = 0.0 if legacy_cover.covers(boundary) else boundary.difference(legacy_cover).length
-                support_record['legacy_union_then_buffer_missing_length_mm'] = legacy_gap
-            support_record.update(raw_polygonization_closed=True,source_points_modified=False,buffer_used_to_create_shell=False)
-            coverage_audit.append(support_record)
+            if include_research_audits or include_full_support_audit:
+                support_record = {'scenario':name,'epsilon_mm':eps,'method':'per_original_path_buffer_then_union',
+                                  'source_path_count':len(work),'boundary_length_mm':poly.length,
+                                  'supported_missing_length_mm':support_gap}
+                if legacy_cover is not None:
+                    legacy_gap = 0.0 if legacy_cover.covers(boundary) else boundary.difference(legacy_cover).length
+                    support_record['legacy_union_then_buffer_missing_length_mm'] = legacy_gap
+                support_record.update(raw_polygonization_closed=True,source_points_modified=False,buffer_used_to_create_shell=False)
+                coverage_audit.append(support_record)
+            else:
+                support_record = None
             if support_gap>eps:continue
             valid,ids,missing=complete_path_support(poly,excluded)
             # 未排除任何锚时只放行完整原path链支持的壳；其他只作混合观察。
             if not excluded and not valid:continue
             # 剩余壳若仍借多个现有独立outer作外围，不因换场景就整体放行。
             if borrows_edge(poly, excluded):continue
-            proof = {'kind':'independent_network_after_anchor_exclusion' if excluded else 'complete_original_paths_close_boundary',
-                     'excluded_source_path_ids':sorted(excluded)}
-            if include_full_support_audit:
-                proof['source_network_path_ids'] = sorted(work)
-            proof.update(boundary_source_supported=True,source_support_audit=support_record,no_new_connecting_edge=True)
+            if include_research_audits:
+                proof = {'kind':'independent_network_after_anchor_exclusion' if excluded else 'complete_original_paths_close_boundary',
+                         'excluded_source_path_ids':sorted(excluded)}
+                if include_full_support_audit:
+                    proof['source_network_path_ids'] = sorted(work)
+                proof.update(boundary_source_supported=True,source_support_audit=support_record,no_new_connecting_edge=True)
+            else:
+                proof = {'kind':'independent_network_after_anchor_exclusion' if excluded else 'complete_original_paths_close_boundary'}
             add(poly,'multi_path_polygonized_shell',proof)
             count += 1
-        scenario_audit.append({'scenario':name,'excluded_source_path_ids':sorted(excluded),'proposed_shells':count,'invalid_rings':len(bad.geoms)})
+        if include_research_audits or include_full_support_audit:
+            scenario_audit.append({'scenario':name,'excluded_source_path_ids':sorted(excluded),'proposed_shells':count,'invalid_rings':bad_count})
         report_progress(on_progress, 'scenarios', scenario_index + 1, len(scenarios))
     # 若一个外围实际上是多个已独立闭壳的组合，保备用而非吞并；内环完全内含不算这种证据。
     independent=list(records);active=[]
@@ -218,21 +302,53 @@ def discover(paths,original,frame_ids,params,eps,*,include_full_support_audit=Tr
         if any(a['poly'].equals(poly) for a in alt_buckets.get(key,[])):continue
         item={'poly':poly,'source_ids':[],'kind':'source_backed_closed_face_needs_review','id':f'FACE{f["face_index"]:04d}','reason':'source_support_dependency','proof_level':'source_backed_but_independent_ownership_unproved','proofs':[{'kind':'atomic_face_boundary_only','face_index':f['face_index'],'complete_path_boundary':f['independent_complete_paths']}]}
         alternatives.append(item);alt_buckets.setdefault(key,[]).append(item)
-    return active,alternatives,{'source_support_coverage_audit':coverage_audit,'source_support_method':'per_original_path_buffer_then_union','source_support_epsilon_mm':eps,'scenario_audit':scenario_audit,'atomic_faces':[{'face_index':f['face_index'],'outer':[list(p) for p in f['poly'].exterior.coords],'area_mm2':f['poly'].area,'independent_complete_paths':f['independent_complete_paths'],'complete_boundary_source_path_ids':f['complete_boundary_source_path_ids']} for f in atomic],'atomic_face_count':len(atomic),'cut_count':len(cuts.geoms),'dangle_count':len(dangles.geoms),'invalid_ring_count':len(invalid.geoms)}
+    return active,alternatives,{'source_support_coverage_audit':coverage_audit,'source_support_method':'per_original_path_buffer_then_union','source_support_epsilon_mm':eps,'scenario_audit':scenario_audit,'atomic_faces':[{'face_index':f['face_index'],'outer':[list(p) for p in f['poly'].exterior.coords],'area_mm2':f['poly'].area,'independent_complete_paths':f['independent_complete_paths'],'complete_boundary_source_path_ids':f['complete_boundary_source_path_ids']} for f in atomic],'atomic_face_count':len(atomic),'cut_count':len(cuts.geoms),'dangle_count':total_dangle_count,'invalid_ring_count':len(invalid.geoms)}
 
-def whole_path_owners(paths,roots,families,loop_byid,units,eps,params):
-    lines={p['id']:LineString(p['points']) for p in paths if len(p['points'])>=2};delta=params['whole_path_near_band_plotter_units']/units;owners={};shared=[];audit=[];family_conflicts=[];closed_family_support={};shared_support={};regions={r['id']:r['poly'] for r in roots};family_paths={rid:{pid for lid in lids for pid in loop_byid[lid]['source_ids']} for rid,lids in families.items()};eligibility={}
-    boundary_bands={rid:p.boundary.buffer(eps) for rid,p in regions.items()};near_bands={rid:p.buffer(delta) for rid,p in regions.items()}
+def whole_path_owners(paths,roots,families,loop_byid,units,eps,params,*,path_index=None):
+    if path_index is not None:
+        lines={p['id']:path_index.lines[idx] for idx,p in enumerate(paths) if path_index.lines[idx] is not None}
+    else:
+        lines={p['id']:LineString(p['points']) for p in paths if len(p['points'])>=2}
+    delta=params['whole_path_near_band_plotter_units']/units;owners={};shared=[];audit=[];family_conflicts=[];closed_family_support={};shared_support={};regions={r['id']:r['poly'] for r in roots};family_paths={rid:{pid for lid in lids for pid in loop_byid[lid]['source_ids']} for rid,lids in families.items()};eligibility={}
+    region_bounds={rid:p.bounds for rid,p in regions.items()}
+    boundary_bands={rid:p.boundary.buffer(eps) for rid,p in regions.items()}
+    boundary_band_bounds={rid:b.bounds for rid,b in boundary_bands.items()}
+    near_bands={rid:p.buffer(delta) for rid,p in regions.items()}
+    near_band_bounds={rid:b.bounds for rid,b in near_bands.items()}
+    for geom in regions.values():prepare(geom)
+    for geom in boundary_bands.values():prepare(geom)
+    for geom in near_bands.values():prepare(geom)
+    path_family_list={pid:[rid for rid,ids in family_paths.items() if pid in ids] for pid in lines}
     for pid,line in lines.items():
-        common=[rid for rid,p in regions.items() if line.length>eps and line.difference(boundary_bands[rid]).length<=eps]
+        lx0,ly0,lx1,ly1=line.bounds;line_len=line.length
+        common=[]
+        if line_len>eps:
+            for rid,band in boundary_bands.items():
+                bx0,by0,bx1,by1=boundary_band_bounds[rid]
+                if lx1<bx0 or lx0>bx1 or ly1<by0 or ly0>by1:continue
+                if band.intersects(line) and (band.covers(line) or line.difference(band).length<=eps):common.append(rid)
         if len(common)>=2:shared.append(pid);shared_support[pid]=set(common);audit.append({'path_id':pid,'state':'protected_whole_boundary_shared','owner_loop_ids':common});continue
-        family_candidates=[rid for rid,ids in family_paths.items() if pid in ids]
+        family_candidates=path_family_list[pid]
         whole_original_closed=bool(line.is_valid and line.is_ring and Polygon(line).is_valid)
         if whole_original_closed and len(family_candidates)==1:
-            rid=family_candidates[0];owners[pid]=rid;closed_family_support[pid]=rid;audit.append({'path_id':pid,'state':'unique_original_closed_path_family_owner','owner_loop_id':rid,'family_loop_ids':family_candidates,'whole_original_closed_path':True,'source_closed_subpath_only':False,'inside_existing_whole_path_near_band':line.difference(regions[rid].buffer(delta)).length<=eps,'near_band_plotter_units':params['whole_path_near_band_plotter_units'],'near_band_mm':delta,'rule':'unique original whole closed path family identity; no coordinate/band change'});continue
+            rid=family_candidates[0];owners[pid]=rid;closed_family_support[pid]=rid;audit.append({'path_id':pid,'state':'unique_original_closed_path_family_owner','owner_loop_id':rid,'family_loop_ids':family_candidates,'whole_original_closed_path':True,'source_closed_subpath_only':False,'inside_existing_whole_path_near_band':line.difference(near_bands[rid]).length<=eps,'near_band_plotter_units':params['whole_path_near_band_plotter_units'],'near_band_mm':delta,'rule':'unique original whole closed path family identity; no coordinate/band change'});continue
         if whole_original_closed and len(family_candidates)>1:
             family_conflicts.append(pid);audit.append({'path_id':pid,'state':'original_closed_path_family_conflict','family_loop_ids':sorted(family_candidates),'whole_original_closed_path':True,'automatic_owner_chosen':False});continue
-        candidates=[rid for rid,p in regions.items() if line.length>eps and line.difference(near_bands[rid]).length<=eps and line.intersection(p).length>eps and not any(pid in refs and foreign!=rid for foreign,refs in family_paths.items())];eligibility[pid]=candidates
+        if line_len<=eps or len(family_candidates)>1:
+            eligibility[pid]=[]
+            continue
+        only_family=family_candidates[0] if family_candidates else None
+        candidates=[]
+        for rid,p in regions.items():
+            if only_family is not None and only_family!=rid:continue
+            rx0,ry0,rx1,ry1=near_band_bounds[rid]
+            if lx1<rx0 or lx0>rx1 or ly1<ry0 or ly0>ry1:continue
+            if p.contains_properly(line):
+                candidates.append(rid);continue
+            nb=near_bands[rid]
+            if (nb.covers(line) or line.difference(nb).length<=eps) and p.intersects(line) and line.intersection(p).length>eps:
+                candidates.append(rid)
+        eligibility[pid]=candidates
     def external_tail_subloop_proof(pid,region):
         # 只在原开放path内返回原顶点的真实子链上判证；该子链不能兜底保留片外余尾。
         line=lines[pid]
@@ -254,7 +370,8 @@ def whole_path_owners(paths,roots,families,loop_byid,units,eps,params):
             if subloop:per[rid]=subloop;subloop_blocks.append(rid);continue
             identity=pid in family_paths[rid] and line.is_ring
             if identity:structural.append(rid);per[rid]={'identity':True};continue
-            if line.intersection(region.boundary.buffer(eps)).length<=eps:continue
+            band=boundary_bands[rid]
+            if not band.intersects(line) or line.intersection(band).length<=eps:continue
             base=sorted(id for id in lines if id!=pid and (eligibility.get(id)==[rid] or closed_family_support.get(id)==rid or rid in shared_support.get(id,set())));key=(rid,tuple(base));before=shell_cache.get(key)
             if before is None:before=shell_of_network([lines[id] for id in base],region,eps,delta,params['structural_shell_area_epsilon_mm2']);shell_cache[key]=before
             after_key=(rid,tuple(sorted(base+[pid])))

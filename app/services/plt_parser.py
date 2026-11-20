@@ -124,6 +124,12 @@ def parse_plt(source, units_per_inch=DEFAULT_UNITS_PER_INCH, *, strict=False,
     if max_chord_error_mm is not None and (not math.isfinite(max_chord_error_mm) or max_chord_error_mm <= 0):
         raise ValueError('PLT 圆弧精度必须为正有限数值')
     text = decode_plt(source) if isinstance(source, (bytes, bytearray)) else str(source or '')
+    # Some plotters append a single NUL after the last semicolon.
+    if (not strict
+            and text.endswith('\x00')
+            and text.find('\x00') == len(text) - 1
+            and text[:-1].rstrip(' \t\r\n').endswith(';')):
+        text = text[:-1]
     if projection_semantics and '\x00' in text:
         raise ValueError('PLT 含无效空字符，无法保证投影图形完整')
     text = text.replace('\x00', '')

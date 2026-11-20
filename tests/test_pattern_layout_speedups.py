@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from shapely.geometry import LineString, box
+from shapely.geometry import LineString, Polygon, box
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
@@ -184,5 +184,32 @@ class PatternLayoutSpeedupTests(unittest.TestCase):
         self.assertEqual(len(independent),2)
         for piece in independent:
             self.assertEqual({f['path_id'] for f in piece['fragments']},{'shape-1','shape-2','shape-3'})
+
+    def test_empty_microscopic_boundary_buffer_keeps_other_candidates(self):
+        rectangle = b'IN;PU0,0;PD4000,0,4000,2400,0,2400,0,0;PU;'
+        tiny = (b'PU8000,1200;PD8000.00000001,1200,8000.00000001,1200.00000001,'
+                b'8000,1200.00000001,8000,1200;PU;')
+        reference = recognize_source(rectangle)
+        original_buffer = LineString.buffer
+
+        def buffer_with_empty_microscopic_ring(line, distance, *args, **kwargs):
+            # GEOS versions differ on whether a tiny ring has an empty positive buffer.
+            if line.is_ring and 0 < line.length <= distance:
+                return Polygon()
+            return original_buffer(line, distance, *args, **kwargs)
+
+        with patch.object(LineString, 'buffer', buffer_with_empty_microscopic_ring):
+            result = recognize_source(rectangle + tiny)
+
+        self.assertEqual(result['paths'][0], reference['paths'][0])
+        self.assertEqual(len(result['paths']), 2)
+        self.assertEqual(len(result['pieces']), len(reference['pieces']))
+        for actual, expected in zip(result['pieces'], reference['pieces']):
+            for field in ('id', 'status', 'outer', 'fragments'):
+                self.assertEqual(actual[field], expected[field])
+        faces = result['source_discovery_audit']['atomic_faces']
+        microscopic = [face for face in faces if 0 < face['area_mm2'] < 1e-18]
+        self.assertEqual(len(microscopic), 1)
+        self.assertEqual(microscopic[0]['complete_boundary_source_path_ids'], [])
 
 if __name__=='__main__':unittest.main()

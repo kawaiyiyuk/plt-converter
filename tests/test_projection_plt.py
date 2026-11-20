@@ -51,6 +51,18 @@ class ProjectionPltTests(unittest.TestCase):
         self.assertEqual(self.client.delete(f'{BASE}/{document_id}', headers={'Authorization': 'x'}).status_code, 204)
         self.assertFalse(source_path.exists())
 
+    def test_upload_ignores_one_nul_after_complete_commands(self):
+        clean = b'IN;SP1;PU0,0;PD4000,0,4000,2000,0,2000,0,0;PU;PG;\r\n'
+        reference = self.upload(clean, 'pattern.plt')
+        self.assertEqual(reference.status_code, 201, reference.get_json())
+        response = self.upload(clean + b'\x00', 'pattern.plt')
+        self.assertEqual(response.status_code, 201, response.get_json())
+        body = response.get_json()
+        self.assertEqual(body['page_count'], 1)
+        self.assertEqual(body['source_bounds_mm'], reference.get_json()['source_bounds_mm'])
+        self.assertEqual(body['rendering_warnings'], reference.get_json()['rendering_warnings'])
+        self.assertEqual(self.tile(body['document_id'], width_mm=100, height_mm=50, width_px=400, height_px=200).status_code, 200)
+
     def test_hpgl_and_degenerate_geometry_and_label_have_positive_page(self):
         for source in (b'IN;PU0,0;PD4000,0;', b'IN;PU0,0;PD0,4000;', b'IN;PU0,0;LBhello\x03;'):
             with self.subTest(source=source):

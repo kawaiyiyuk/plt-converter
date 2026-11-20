@@ -29,7 +29,7 @@ def is_rectangle(polygon,eps):
     return True
 
 
-def add_rectangle_alternatives(result):
+def add_rectangle_alternatives(result,*,include_research_audits=True):
     eps=PARAMETERS['numeric_epsilon_plotter_units']/result['source']['units_per_mm']
     paths={p['id']:p for p in result['paths']};rectangles=[];ignored_small_rectangles=[]
     for face in result['source_discovery_audit']['atomic_faces']:
@@ -45,53 +45,60 @@ def add_rectangle_alternatives(result):
         if any(line.difference(polygon.boundary).length>eps for line in source_lines):continue
         if polygon.boundary.difference(unary_union(source_lines)).length>eps:continue
         if any(polygon.equals(r['polygon']) and set(ids)==set(r['path_ids']) for r in rectangles):continue
-        rectangles.append({'polygon':polygon,'path_ids':sorted(ids),'face_index':face['face_index']})
+        rectangles.append({'polygon':polygon,'path_ids':sorted(ids),'face_index':face['face_index'],'bounds':polygon.bounds})
     originals=list(result['pieces']);variants=[];changes=[]
-    for original in originals:
-        if not original.get('outer') or not original.get('fragments'):continue
-        region=make_valid(Polygon(original['outer']))
-        for rectangle in rectangles:
-            polygon=rectangle['polygon'];ids=set(rectangle['path_ids'])
-            if ids.intersection(original.get('source_closed_path_ids',[])):continue
-            if region.equals(polygon) or not region.covers(polygon):continue
-            chosen=[f for f in original['fragments'] if f['path_id'] in ids]
-            # Only offer subtraction where the candidate has the complete
-            # independent rectangle. Never infer missing edges or remove the
-            # candidate's own outline. All non-rectangle fragments stay identical.
-            complete=True
-            for id in ids:
-                path=paths[id]
-                for index,(a,b) in enumerate(zip(path['points'],path['points'][1:])):
-                    if math.dist(a,b)<=eps:continue
-                    intervals=sorted((f['t0'],f['t1']) for f in chosen if f['path_id']==id and f['segment_index']==index)
-                    cursor=0.
-                    for lo,hi in intervals:
-                        if lo>cursor+1e-12:break
-                        cursor=max(cursor,hi)
-                    if cursor<1-1e-12:complete=False;break
-                if not complete:break
-            if not complete:continue
-            variant=dict(original)
-            variant.update(id=original['id']+'-omitrect-'+str(rectangle['face_index']),
-                           parent_candidate_id=original['id'],status='rectangle_line_alternative_needs_review',
-                           variant_label_cn='不带一组独立矩形框线（可能移除本片真实标记）',
-                           fragments=[f for f in original['fragments'] if f['path_id'] not in ids],
-                           excluded_rectangle={'source_path_ids':rectangle['path_ids'],'outer':face_outer(polygon)},
-                           issues=list(original.get('issues',[]))+[{'code':'may_remove_real_piece_internal_rectangle'}, {'code':'rectangle_nearby_annotations_preserved_not_semantically_classified'}],
-                           semantic_piece_verified=False)
-            variants.append(variant);changes.append({'candidate_id':variant['id'],'original_id':original['id'],'removed_path_ids':rectangle['path_ids'],'removed_fragment_count':len(chosen)})
+    if rectangles:
+        for original in originals:
+            outer_pts=original.get('outer')
+            if not outer_pts or not original.get('fragments'):continue
+            xs=[pt[0] for pt in outer_pts];ys=[pt[1] for pt in outer_pts]
+            ox0,oy0,ox1,oy1=min(xs),min(ys),max(xs),max(ys)
+            candidate_rects=[r for r in rectangles if r['bounds'][0]>=ox0-eps and r['bounds'][1]>=oy0-eps and r['bounds'][2]<=ox1+eps and r['bounds'][3]<=oy1+eps]
+            if not candidate_rects:continue
+            region=make_valid(Polygon(outer_pts))
+            for rectangle in candidate_rects:
+                polygon=rectangle['polygon'];ids=set(rectangle['path_ids'])
+                if ids.intersection(original.get('source_closed_path_ids',[])):continue
+                if region.equals(polygon) or not region.covers(polygon):continue
+                chosen=[f for f in original['fragments'] if f['path_id'] in ids]
+                # Only offer subtraction where the candidate has the complete
+                # independent rectangle. Never infer missing edges or remove the
+                # candidate's own outline. All non-rectangle fragments stay identical.
+                complete=True
+                for id in ids:
+                    path=paths[id]
+                    for index,(a,b) in enumerate(zip(path['points'],path['points'][1:])):
+                        if math.dist(a,b)<=eps:continue
+                        intervals=sorted((f['t0'],f['t1']) for f in chosen if f['path_id']==id and f['segment_index']==index)
+                        cursor=0.
+                        for lo,hi in intervals:
+                            if lo>cursor+1e-12:break
+                            cursor=max(cursor,hi)
+                        if cursor<1-1e-12:complete=False;break
+                    if not complete:break
+                if not complete:continue
+                variant=dict(original)
+                variant.update(id=original['id']+'-omitrect-'+str(rectangle['face_index']),
+                               parent_candidate_id=original['id'],status='rectangle_line_alternative_needs_review',
+                               variant_label_cn='不带一组独立矩形框线（可能移除本片真实标记）',
+                               fragments=[f for f in original['fragments'] if f['path_id'] not in ids],
+                               excluded_rectangle={'source_path_ids':rectangle['path_ids'],'outer':face_outer(polygon)},
+                               issues=list(original.get('issues',[]))+[{'code':'may_remove_real_piece_internal_rectangle'}, {'code':'rectangle_nearby_annotations_preserved_not_semantically_classified'}],
+                               semantic_piece_verified=False)
+                variants.append(variant);changes.append({'candidate_id':variant['id'],'original_id':original['id'],'removed_path_ids':rectangle['path_ids'],'removed_fragment_count':len(chosen)})
     result['pieces'].extend(variants)
-    result['rectangle_alternative_audit']={'parameters':PARAMETERS,'originals_modified':False,'variants':changes,'semantic_classification':False,'ignored_small_rectangle_count':len(ignored_small_rectangles)}
+    if include_research_audits:
+        result['rectangle_alternative_audit']={'parameters':PARAMETERS,'originals_modified':False,'variants':changes,'semantic_classification':False,'ignored_small_rectangle_count':len(ignored_small_rectangles)}
     return result
 
 
 def face_outer(polygon):return [list(p) for p in polygon.exterior.coords]
 
 
-def recognize_with_variants(raw,name='source.plt',*,include_full_support_audit=True,on_progress=None,recognition_mode='strict'):
+def recognize_with_variants(raw,name='source.plt',*,include_full_support_audit=True,include_research_audits=True,on_progress=None,recognition_mode='strict'):
     from .pattern_layout_api import recognize_source
-    result = recognize_source(raw,name,include_full_support_audit=include_full_support_audit,on_progress=on_progress,recognition_mode=recognition_mode)
+    result = recognize_source(raw,name,include_full_support_audit=include_full_support_audit,include_research_audits=include_research_audits,on_progress=on_progress,recognition_mode=recognition_mode)
     report_progress(on_progress, 'variants', 0, 1)
-    result = add_rectangle_alternatives(result)
+    result = add_rectangle_alternatives(result,include_research_audits=include_research_audits)
     report_progress(on_progress, 'variants', 1, 1)
     return result

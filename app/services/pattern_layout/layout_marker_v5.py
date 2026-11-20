@@ -113,8 +113,11 @@ def _source_certificate(piece, shape, paths, eps):
             if not _covered(line, shape['expected'], eps):
                 errors.append('participating_original_path_has_extra_line')
     # 不能漏掉候选内未被选入的十字/多余线；额外重合来源也需完整回指。
+    sx0, sy0, sx1, sy1 = shape['bounds']
     for pid, source in paths.items():
         for si, (a, b) in enumerate(zip(source['points'], source['points'][1:])):
+            if max(a[0], b[0]) < sx0 or min(a[0], b[0]) > sx1 or max(a[1], b[1]) < sy0 or min(a[1], b[1]) > sy1:
+                continue
             line = LineString([a, b])
             if line.length <= eps:
                 continue
@@ -185,7 +188,7 @@ def _rectangle_group(group, raw_bounds, eps, ratio):
 
 
 def classify_layout_markers(result, paths, *, numeric_epsilon_mm,
-                            min_span_to_symbol_ratio=DEFAULT_SPAN_TO_SYMBOL_RATIO, apply=True):
+                            min_span_to_symbol_ratio=DEFAULT_SPAN_TO_SYMBOL_RATIO, apply=True, include_audit=True):
     """最后执行：四角唯一组转auxiliary疑似标记，完整原candidate可恢复。
 
     20倍为AI自行假设，只是降低偶然排布风险，不证明四件小裁片不是裁片。
@@ -208,6 +211,39 @@ def classify_layout_markers(result, paths, *, numeric_epsilon_mm,
         raw_bounds = [min(xs), min(ys), max(xs), max(ys)]
     else:
         raw_bounds = None
+    if not include_audit:
+        eligible = []
+        for piece in pieces:
+            shape = _geometry(piece, eps)
+            if shape is None:
+                continue
+            cert = _source_certificate(piece, shape, sources, eps)
+            if cert['blocking_reasons']:
+                continue
+            if _shared_intervals(piece, pieces, eps, sources):
+                continue
+            if piece.get('issues'):
+                continue
+            shape['piece_id'] = piece['id']
+            eligible.append(shape)
+        groups = []
+        if raw_bounds and len(eligible) <= 32:
+            for group in itertools.combinations(eligible, 4):
+                proof = _rectangle_group(group, raw_bounds, eps, min_span_to_symbol_ratio)
+                if proof:
+                    groups.append(proof)
+        selected = set(groups[0]['piece_ids']) if len(groups) == 1 else set()
+        if apply and selected:
+            kept = []
+            for piece in pieces:
+                if piece['id'] in selected:
+                    auxiliary = dict(piece)
+                    auxiliary['status'] = 'suspected_layout_registration_marker'
+                    result['auxiliary'].append(auxiliary)
+                else:
+                    kept.append(piece)
+            result['pieces'] = kept
+        return None
     decisions = []
     eligible = []
     for piece in pieces:
