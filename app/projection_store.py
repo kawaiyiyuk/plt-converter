@@ -255,7 +255,7 @@ class Store(SceneStoreMixin):
                 updates.append((key,tokens-1,updated,expires))
             db.executemany('INSERT OR REPLACE INTO rates VALUES(?,?,?,?)', updates)
 
-    def reserve(self, owner, kind, document=None, generation=None):
+    def reserve(self, owner, kind, document=None, generation=None, replacing=False, defer_supersede=False):
         lease = secrets.token_hex(32)
         policy = self.policy
         with self.transaction() as db:
@@ -268,6 +268,10 @@ class Store(SceneStoreMixin):
                 # a second device cannot slip past the per-owner document limit.
                 # Superseded uploads (generation=-1) are unwinding and no longer
                 # hold a slot, so they are excluded here.
+                if replacing:
+                    # A committed document will be retired atomically only after
+                    # the new source has parsed and its session is durable.
+                    count -= db.execute("SELECT COUNT(*) FROM sessions WHERE owner=? AND state='active'", (owner,)).fetchone()[0]
                 count += db.execute(
                     "SELECT COUNT(*) FROM leases WHERE owner=? AND kind IN ('upload','upload-parse') "
                     "AND COALESCE(generation,0)!=-1", (owner,)).fetchone()[0]
@@ -306,7 +310,7 @@ class Store(SceneStoreMixin):
             db.execute('INSERT INTO leases(id,owner,kind,document,generation,budget,source_budget,pid,identity,supervisor,supervisor_identity,created) VALUES(?,?,?,?,?,?,?,NULL,NULL,?,?,?)',
                        (lease, owner, kind, document, generation, budget, source_budget,
                         os.getpid(), process_identity(os.getpid()), time.time()))
-            if kind == 'upload':
+            if kind == 'upload' and not defer_supersede:
                 # Last initiated upload wins: mark every other in-flight upload
                 # of this owner superseded in the same transaction. Their parse
                 # children are terminated by valid_lease within one poll and
@@ -456,7 +460,7 @@ class Store(SceneStoreMixin):
         with path.open('xb') as file:
             file.write(raw);file.flush();os.fsync(file.fileno())
 
-    def complete_upload(self, lease, owner, source, meta, discarded=None):
+    def complete_upload(self, lease, owner, source, meta, discarded=None, completed_only=False):
         """Promote a parsed upload to a live session.
 
         ``discarded`` marks a real client upload: the caller passes a list that
@@ -475,10 +479,9 @@ class Store(SceneStoreMixin):
                 if row is None:
                     raise ProjectionRejected('projection_upload_lost', '投影上传状态已失效', 503)
                 if discarded is not None:
-                    # Last initiated upload wins. A newer in-flight upload, or a
-                    # session reserved after this lease, supersedes it before any
-                    # bytes become visible.
-                    self._reject_superseded(db, owner, lease, row['created'], row['generation'])
+                    # Compare selection order with newer committed sessions.
+                    # Legacy callers may also reject newer in-flight uploads.
+                    self._reject_superseded(db, owner, lease, row['created'], row['generation'], completed_only)
                 size = Path(source).stat().st_size
                 derived = meta.get('source_format') == 'plt'
                 limit = row['derived_budget'] if derived else MAX_SOURCE
@@ -493,6 +496,12 @@ class Store(SceneStoreMixin):
                            (document, owner, meta['expires_at'], 'active', 0 if derived else size, metadata.name, allocation(size)+2*META_BOUND, size if derived else 0))
                 db.execute("UPDATE leases SET kind='upload_done',budget=?,source_budget=0,derived_budget=0 WHERE id=?",(2*META_BOUND+65536,lease))
                 if discarded is not None:
+                    if completed_only:
+                        # A successful newer source invalidates only older pending uploads.
+                        db.execute("UPDATE leases SET generation=-1 WHERE owner=? AND id!=? "
+                                   "AND kind IN ('upload','upload-parse') "
+                                   "AND (created<? OR (created=? AND id<?))",
+                                   (owner, lease, row['created'], row['created'], lease))
                     # Retire every other live document in the same transaction so
                     # a racing upload can never leave two active sessions.
                     pending = self._retire_others(db, owner, document, discarded)
@@ -523,16 +532,17 @@ class Store(SceneStoreMixin):
             row = db.execute('SELECT generation FROM leases WHERE id=?', (lease,)).fetchone()
             return row is None or row['generation'] == -1
 
-    def _reject_superseded(self, db, owner, lease, created, generation=None):
+    def _reject_superseded(self, db, owner, lease, created, generation=None, completed_only=False):
         if generation == -1:
             # reserve() already marked this upload superseded; it must never
             # become the online document.
             raise ProjectionRejected('projection_upload_superseded','已选择更新的纸样，本次上传已取消',409,0)
-        newer = db.execute(
-            "SELECT 1 FROM leases WHERE owner=? AND kind IN ('upload','upload-parse') AND id!=? "
-            "AND (created>? OR (created=? AND id>?)) LIMIT 1",
-            (owner, lease, created, created, lease)).fetchone()
-        superseded = newer is not None
+        superseded = False
+        if not completed_only:
+            superseded = db.execute(
+                "SELECT 1 FROM leases WHERE owner=? AND kind IN ('upload','upload-parse') AND id!=? "
+                "AND (created>? OR (created=? AND id>?)) LIMIT 1",
+                (owner, lease, created, created, lease)).fetchone() is not None
         if not superseded:
             for row in db.execute("SELECT meta FROM sessions WHERE owner=? AND state='active'", (owner,)).fetchall():
                 reserved = self._session_reservation(row['meta'])

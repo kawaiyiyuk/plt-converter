@@ -15,7 +15,7 @@ x-projector: &projector
   security_opt: [no-new-privileges:true]
   env_file:
     - ${PROJECTOR_POLICY_FILE:?explicit reviewed policy file required}
-  environment:
+  environment: &projector-environment
     # Projection-only search budget; do not change legacy converter image defaults.
     PDF_LAYOUT_OPTIMIZER_MAX_BLANK_CELLS: "8"
     PROJECTOR_ENABLED: ${PROJECTOR_ENABLED:-0}
@@ -36,6 +36,10 @@ x-projector: &projector
 services:
   projector-api:
     <<: *projector
+    environment:
+      <<: *projector-environment
+      # Shared only with the business backend. Never injected into the worker.
+      PROJECTOR_PDF_VALIDATION_KEY: ${PROJECTOR_PDF_VALIDATION_KEY:-}
     command: ["gunicorn", "--bind", "0.0.0.0:80", "--workers", "1", "--threads", "${PROJECTOR_HTTP_THREADS:?engineering thread budget required}", "--timeout", "${PROJECTOR_HTTP_TIMEOUT:?engineering HTTP timeout required}", "--worker-tmp-dir", "/run/projector", "--access-logfile", "-", "--error-logfile", "-", "run_projection:app"]
     ports:
       - "${PROJECTOR_BIND_ADDRESS:-127.0.0.1}:${PROJECTOR_BIND_PORT:-8092}:80"

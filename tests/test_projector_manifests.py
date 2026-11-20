@@ -70,6 +70,8 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(api['image'],worker['image'])
             images.append(api['image'])
             self.assertEqual(api['environment']['PROJECTOR_ENABLED'],'0')
+            self.assertEqual(api['environment']['PROJECTOR_PDF_VALIDATION_KEY'], '')
+            self.assertNotIn('PROJECTOR_PDF_VALIDATION_KEY', worker['environment'])
             self.assertEqual(api['environment']['PROJECTOR_TRUSTED_PROXY_CIDRS'],'')
             self.assertEqual(api['environment']['PROJECTOR_ROOT'],'/var/lib/projector')
             for service in (api, worker):
